@@ -158,6 +158,26 @@ def logs(follow: bool, lines: int) -> None:
         pass
 
 
+@cli.command()
+def devices() -> None:
+    """List available audio input devices."""
+    import sounddevice as sd
+
+    devs = sd.query_devices()
+    click.echo("Available input devices:\n")
+    click.echo(f"  {'ID':<4} {'Name':<45} {'Channels':<10} {'Sample Rate'}")
+    click.echo(f"  {'--':<4} {'----':<45} {'--------':<10} {'-----------'}")
+    for i, d in enumerate(devs):
+        if d["max_input_channels"] > 0:
+            default = " *" if i == sd.default.device[0] else ""
+            click.echo(
+                f"  {i:<4} {d['name']:<45} {d['max_input_channels']:<10} {d['default_samplerate']:.0f} Hz{default}"
+            )
+    click.echo("\n  * = system default")
+    click.echo("\n  Tip: For system audio capture, install BlackHole:")
+    click.echo("    brew install blackhole-2ch")
+
+
 AUDIO_VIDEO_EXTENSIONS = {
     ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".webm",
     ".mp4", ".mkv", ".avi", ".mov", ".aac", ".wma",
@@ -237,6 +257,188 @@ def transcribe(
             click.echo(f"  → {output_path}")
 
     click.echo(f"\nDone — {len(files)} file(s) transcribed.")
+
+
+@cli.command()
+@click.argument("output", default="recording.txt", type=click.Path())
+@click.option("--device", default=None, help="Audio device name or index (default: system default). Use 'devices' to list.")
+@click.option("--format", "formats", default="txt", help="Output formats, comma-separated: txt,srt,vtt,json.")
+@click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
+@click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
+@click.option("--chunk-silence", default=2.0, type=float, help="Seconds of silence to split chunks (default: 2.0).")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
+def record(
+    output: str,
+    device: str | None,
+    formats: str,
+    model: str,
+    language: str | None,
+    chunk_silence: float,
+    verbose: bool,
+) -> None:
+    """Record and transcribe a live meeting or long audio session.
+
+    Records continuously until Ctrl+C. Splits audio at natural pauses
+    and transcribes chunks in parallel for fast results.
+
+    \b
+    Examples:
+      whisper-daemon record                                   # → recording.txt
+      whisper-daemon record meeting.txt --format txt,srt
+      whisper-daemon record meeting.txt --device "BlackHole 2ch"
+      whisper-daemon record meeting.txt --device 3            # by device index
+    """
+    import concurrent.futures
+    import queue as queue_mod
+
+    from whisper_daemon.formats import FORMATTERS
+    from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
+    from whisper_daemon.transcriber import preload_model, transcribe as transcribe_audio
+
+    _setup_logging(verbose)
+
+    format_list = [f.strip().lower() for f in formats.split(",")]
+    for fmt in format_list:
+        if fmt not in FORMATTERS:
+            click.echo(f"Unknown format: {fmt}. Available: {', '.join(FORMATTERS)}")
+            raise SystemExit(1)
+
+    # Resolve device (allow numeric index)
+    resolved_device: str | int | None = device
+    if device is not None:
+        try:
+            resolved_device = int(device)
+        except ValueError:
+            resolved_device = device
+
+    output_path = Path(output)
+    output_stem = output_path.stem
+    output_dir = output_path.parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    click.echo(f"Model: {model}")
+    click.echo(f"Device: {device or 'system default'}")
+    click.echo(f"Chunk silence: {chunk_silence}s")
+    click.echo(f"Output: {output_path}")
+    click.echo()
+
+    preload_model(model)
+
+    chunk_queue: queue_mod.Queue[AudioChunk | None] = queue_mod.Queue()
+    recorder = MeetingRecorder(chunk_queue, device=resolved_device, chunk_silence=chunk_silence)
+
+    all_results: list[tuple[float, dict]] = []  # (start_time, result)
+    chunk_count = 0
+
+    click.echo("Recording... press Ctrl+C to stop.\n")
+    recorder.start()
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futures: dict[concurrent.futures.Future, float] = {}
+
+            while True:
+                try:
+                    chunk = chunk_queue.get(timeout=0.5)
+                except queue_mod.Empty:
+                    # Collect completed futures
+                    _collect_results(futures, all_results)
+                    continue
+
+                if chunk is None:
+                    break
+
+                chunk_count += 1
+                click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
+
+                future = pool.submit(transcribe_audio, chunk.audio, model)
+                futures[future] = chunk.start_time
+
+                _collect_results(futures, all_results)
+
+    except KeyboardInterrupt:
+        click.echo("\n\nStopping recording...")
+        recorder.stop()
+
+        # Drain remaining chunks from queue
+        while True:
+            try:
+                chunk = chunk_queue.get_nowait()
+            except queue_mod.Empty:
+                break
+            if chunk is None:
+                break
+            chunk_count += 1
+            click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
+            result_text = transcribe_audio(chunk.audio, model)
+            if result_text:
+                all_results.append((chunk.start_time, {"text": result_text, "segments": [], "language": ""}))
+
+        # Wait for pending futures
+        _collect_results(futures, all_results, wait=True)
+
+    if not all_results:
+        click.echo("No audio transcribed.")
+        return
+
+    merged = _merge_results(all_results)
+
+    for fmt in format_list:
+        ext_path = output_dir / f"{output_stem}.{fmt}"
+        content = FORMATTERS[fmt](merged)
+        ext_path.write_text(content, encoding="utf-8")
+        click.echo(f"  → {ext_path}")
+
+    total_duration = sum(r[0] for r in all_results) if not all_results else max(r[0] for r in all_results)
+    click.echo(f"\nDone — {chunk_count} chunks, {len(merged.get('segments', []))} segments.")
+
+
+def _collect_results(
+    futures: dict,
+    all_results: list[tuple[float, dict]],
+    wait: bool = False,
+) -> None:
+    """Collect completed transcription futures."""
+    if wait and futures:
+        concurrent_futures = __import__("concurrent.futures", fromlist=["concurrent"])
+        done, _ = concurrent_futures.wait(futures.keys())
+    else:
+        done = {f for f in futures if f.done()}
+
+    for future in done:
+        start_time = futures.pop(future)
+        try:
+            text = future.result()
+            if text:
+                all_results.append((start_time, {"text": text, "segments": [], "language": ""}))
+        except Exception as exc:
+            logging.getLogger(__name__).error("Chunk transcription failed: %s", exc)
+
+
+def _merge_results(results: list[tuple[float, dict]]) -> dict:
+    """Merge chunk results into a single result dict with adjusted timestamps."""
+    results.sort(key=lambda r: r[0])
+
+    merged_text_parts: list[str] = []
+    merged_segments: list[dict] = []
+
+    for start_offset, result in results:
+        text = result.get("text", "").strip()
+        if text:
+            merged_text_parts.append(text)
+
+        for seg in result.get("segments", []):
+            merged_segments.append({
+                **seg,
+                "start": seg["start"] + start_offset,
+                "end": seg["end"] + start_offset,
+            })
+
+    return {
+        "text": " ".join(merged_text_parts),
+        "segments": merged_segments,
+        "language": results[0][1].get("language", "") if results else "",
+    }
 
 
 def _collect_files(paths: tuple[str, ...]) -> list[Path]:

@@ -1,4 +1,4 @@
-"""Periodic screenshot capture with change detection."""
+"""Periodic screenshot capture with perceptual change detection (dHash)."""
 
 import logging
 import subprocess
@@ -7,15 +7,22 @@ import time
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_INTERVAL = 5.0  # seconds between capture attempts
-CHANGE_THRESHOLD = 0.02  # 2% pixel change required to save
+DHASH_SIZE = 16  # 16x16 grid = 256-bit hash
+CHANGE_THRESHOLD = 0.12  # hamming distance — ignores cursor/clock, catches slide changes
 
 
 class ScreenCapture:
-    """Captures screenshots at regular intervals, skipping unchanged frames."""
+    """Captures screenshots at regular intervals, skipping unchanged frames.
+
+    Uses dHash (difference hash) for perceptual change detection.
+    Only saves when screen content meaningfully changes — ignores cursor
+    blinks, clock updates, and notification badges.
+    """
 
     def __init__(
         self,
@@ -29,7 +36,7 @@ class ScreenCapture:
         self._running = False
         self._thread: threading.Thread | None = None
         self._start_time: float = 0.0
-        self._last_image: np.ndarray | None = None
+        self._last_hash: np.ndarray | None = None
         self._saved_count = 0
 
     @property
@@ -40,12 +47,14 @@ class ScreenCapture:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._running = True
         self._start_time = time.monotonic()
-        self._last_image = None
+        self._last_hash = None
         self._saved_count = 0
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
-        logger.info("Screen capture started (interval=%.1fs, threshold=%.0f%%)",
-                     self._interval, self._threshold * 100)
+        logger.info(
+            "Screen capture started (interval=%.1fs, dHash threshold=%.2f)",
+            self._interval, self._threshold,
+        )
 
     def stop(self) -> None:
         self._running = False
@@ -66,7 +75,6 @@ class ScreenCapture:
         elapsed = time.monotonic() - self._start_time
         timestamp_sec = int(elapsed)
 
-        # Capture to temp file using macOS screencapture
         temp_path = self._output_dir / "_temp.png"
         result = subprocess.run(
             ["screencapture", "-x", "-C", str(temp_path)],
@@ -76,58 +84,36 @@ class ScreenCapture:
         if result.returncode != 0 or not temp_path.exists():
             return
 
-        current_image = _load_image_as_array(temp_path)
-        if current_image is None:
+        try:
+            img = Image.open(temp_path)
+        except Exception:
             temp_path.unlink(missing_ok=True)
             return
 
-        if self._last_image is not None and not _has_changed(
-            self._last_image, current_image, self._threshold
-        ):
-            temp_path.unlink(missing_ok=True)
-            return
+        current_hash = _dhash(img)
 
-        # Screen changed — save with timestamp name
+        if self._last_hash is not None:
+            distance = _hamming_distance(self._last_hash, current_hash)
+            if distance < self._threshold:
+                temp_path.unlink(missing_ok=True)
+                return
+
         final_path = self._output_dir / f"{timestamp_sec:06d}.png"
         temp_path.rename(final_path)
-        self._last_image = current_image
+        self._last_hash = current_hash
         self._saved_count += 1
         logger.debug("Screenshot saved: %s (at %ds)", final_path.name, timestamp_sec)
 
 
-def _load_image_as_array(path: Path) -> np.ndarray | None:
-    """Load PNG as a small grayscale array for fast comparison."""
-    try:
-        # Use sips to get raw pixel data quickly (macOS built-in)
-        # Resize to small thumbnail for fast comparison
-        result = subprocess.run(
-            [
-                "sips",
-                "-z", "64", "64",
-                "-s", "format", "jpeg",
-                str(path),
-                "--out", str(path.with_suffix(".thumb.jpg")),
-            ],
-            capture_output=True,
-            timeout=5,
-        )
-        thumb_path = path.with_suffix(".thumb.jpg")
-        if result.returncode != 0 or not thumb_path.exists():
-            return None
-
-        data = np.frombuffer(thumb_path.read_bytes(), dtype=np.uint8)
-        thumb_path.unlink(missing_ok=True)
-        return data
-    except Exception:
-        return None
+def _dhash(image: Image.Image, hash_size: int = DHASH_SIZE) -> np.ndarray:
+    """Compute difference hash — compare each pixel to its right neighbor."""
+    gray = image.convert("L").resize(
+        (hash_size + 1, hash_size), Image.LANCZOS
+    )
+    pixels = np.asarray(gray)
+    return (pixels[:, 1:] > pixels[:, :-1]).flatten()
 
 
-def _has_changed(prev: np.ndarray, curr: np.ndarray, threshold: float) -> bool:
-    """Check if two image arrays differ by more than threshold."""
-    if prev.shape != curr.shape:
-        return True
-
-    min_len = min(len(prev), len(curr))
-    diff = np.abs(prev[:min_len].astype(np.int16) - curr[:min_len].astype(np.int16))
-    changed_pixels = np.sum(diff > 10) / min_len
-    return changed_pixels > threshold
+def _hamming_distance(hash1: np.ndarray, hash2: np.ndarray) -> float:
+    """Normalized hamming distance. 0.0 = identical, 1.0 = completely different."""
+    return np.count_nonzero(hash1 != hash2) / len(hash1)

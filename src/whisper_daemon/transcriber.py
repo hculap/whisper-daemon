@@ -61,3 +61,39 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL) -> str:
     except Exception:
         logger.exception("Transcription failed")
         return ""
+
+
+def transcribe_file(
+    path: str,
+    model: str = DEFAULT_MODEL,
+    language: str | None = None,
+) -> dict:
+    """Transcribe an audio/video file and return the full result dict.
+
+    Args:
+        path: Path to audio/video file (ffmpeg handles decoding).
+        model: HuggingFace model repo ID.
+        language: Force language code, or None for auto-detect.
+
+    Returns:
+        Dict with keys: text, segments, language.
+    """
+    logger.info("Transcribing file: %s", path)
+    kwargs: dict = {
+        "path_or_hf_repo": model,
+        "temperature": 0,
+        "condition_on_previous_text": False,
+        "word_timestamps": False,
+    }
+    if language is not None:
+        kwargs["language"] = language
+
+    result = mlx_whisper.transcribe(path, **kwargs)
+    language_detected = result.get("language", "unknown")
+    text_len = len(result.get("text", ""))
+    segments_count = len(result.get("segments", []))
+    logger.info(
+        "Done — lang=%s, %d chars, %d segments",
+        language_detected, text_len, segments_count,
+    )
+    return result

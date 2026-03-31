@@ -1,33 +1,118 @@
-"""Entry point for whisper-daemon."""
+"""CLI entry point for whisper-daemon."""
 
-import argparse
 import logging
+import os
 import queue
 import signal
+import subprocess
 import sys
+from pathlib import Path
 
-from whisper_daemon.daemon import Daemon
-from whisper_daemon.events import Event
-from whisper_daemon.hotkey import HotkeyListener
-from whisper_daemon.menubar import run_with_menubar
-from whisper_daemon.recorder import AudioRecorder
-from whisper_daemon.transcriber import preload_model
+import click
+
+CONFIG_DIR = Path.home() / ".config" / "whisper-daemon"
+PID_FILE = CONFIG_DIR / "daemon.pid"
+LOG_FILE = CONFIG_DIR / "daemon.log"
 
 
-def main() -> None:
-    args = _parse_args()
-    _setup_logging(args.verbose)
+@click.group(invoke_without_command=True)
+@click.pass_context
+def cli(ctx: click.Context) -> None:
+    """Local push-to-talk transcription daemon for macOS."""
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
 
+
+@cli.command()
+@click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
+@click.option("--silence-timeout", default=1.5, type=float, help="Seconds of silence before auto-stop.")
+@click.option("--no-menubar", is_flag=True, help="Run without menu bar icon.")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
+def start(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> None:
+    """Start the daemon in the background."""
+    if _is_running():
+        pid = _read_pid()
+        click.echo(f"Already running (PID {pid}). Use 'whisper-daemon stop' first.")
+        raise SystemExit(1)
+
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        sys.executable, "-m", "whisper_daemon", "run",
+        "--model", model,
+        "--silence-timeout", str(silence_timeout),
+    ]
+    if no_menubar:
+        cmd.append("--no-menubar")
+    if verbose:
+        cmd.append("--verbose")
+
+    log_handle = open(LOG_FILE, "a")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=log_handle,
+        stderr=log_handle,
+        start_new_session=True,
+    )
+
+    PID_FILE.write_text(str(proc.pid))
+    click.echo(f"Started (PID {proc.pid})")
+    click.echo(f"Logs: {LOG_FILE}")
+    click.echo(f"Stop: whisper-daemon stop")
+
+
+@cli.command()
+def stop() -> None:
+    """Stop the running daemon."""
+    if not _is_running():
+        click.echo("Not running.")
+        return
+
+    pid = _read_pid()
+    try:
+        os.kill(pid, signal.SIGTERM)
+        click.echo(f"Sent SIGTERM to PID {pid}")
+    except ProcessLookupError:
+        click.echo(f"Process {pid} not found (stale PID file)")
+
+    PID_FILE.unlink(missing_ok=True)
+
+
+@cli.command()
+def status() -> None:
+    """Show daemon status."""
+    if _is_running():
+        pid = _read_pid()
+        click.echo(f"Running (PID {pid})")
+    else:
+        click.echo("Not running.")
+
+
+@cli.command()
+@click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
+@click.option("--silence-timeout", default=1.5, type=float, help="Seconds of silence before auto-stop.")
+@click.option("--no-menubar", is_flag=True, help="Run without menu bar icon.")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
+def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> None:
+    """Run the daemon in the foreground."""
+    _setup_logging(verbose)
     logger = logging.getLogger("whisper_daemon")
+
+    from whisper_daemon.daemon import Daemon
+    from whisper_daemon.events import Event
+    from whisper_daemon.hotkey import HotkeyListener
+    from whisper_daemon.menubar import run_with_menubar
+    from whisper_daemon.recorder import AudioRecorder
+    from whisper_daemon.transcriber import preload_model
 
     event_queue: queue.Queue[Event] = queue.Queue()
 
     logger.info("Initializing components...")
-    recorder = AudioRecorder(event_queue, silence_timeout=args.silence_timeout)
+    recorder = AudioRecorder(event_queue, silence_timeout=silence_timeout)
     hotkey = HotkeyListener(event_queue)
-    daemon = Daemon(event_queue, recorder, model=args.model)
+    daemon = Daemon(event_queue, recorder, model=model)
 
-    preload_model(args.model)
+    preload_model(model)
 
     def _signal_handler(sig: int, frame: object) -> None:
         logger.info("Received signal %s", signal.Signals(sig).name)
@@ -39,16 +124,12 @@ def main() -> None:
 
     hotkey.start()
 
-    print(f"whisper-daemon running — press Cmd+Shift+Space to record")
-    print(f"Model: {args.model}")
-    print(f"Silence timeout: {args.silence_timeout}s")
-    print("Press Ctrl+C to quit")
-    print()
-    print("NOTE: Terminal needs Accessibility + Microphone permissions")
-    print("      System Settings > Privacy & Security > Accessibility")
-    print("      System Settings > Privacy & Security > Microphone")
+    click.echo(f"whisper-daemon running — press Cmd+Shift+Space to record")
+    click.echo(f"Model: {model}")
+    click.echo(f"Silence timeout: {silence_timeout}s")
+    click.echo("Press Ctrl+C to quit")
 
-    if args.no_menubar:
+    if no_menubar:
         try:
             daemon.run()
         finally:
@@ -57,33 +138,135 @@ def main() -> None:
         run_with_menubar(daemon, hotkey)
 
 
-def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="whisper-daemon",
-        description="Local push-to-talk transcription daemon for macOS",
-    )
-    parser.add_argument(
-        "--model",
-        default="mlx-community/whisper-large-v3-turbo-q4",
-        help="HuggingFace model repo (default: whisper-large-v3-turbo-q4)",
-    )
-    parser.add_argument(
-        "--silence-timeout",
-        type=float,
-        default=1.5,
-        help="Seconds of silence before auto-stop (default: 1.5)",
-    )
-    parser.add_argument(
-        "--no-menubar",
-        action="store_true",
-        help="Run without menu bar icon (CLI-only mode)",
-    )
-    parser.add_argument(
-        "-v", "--verbose",
-        action="store_true",
-        help="Enable debug logging",
-    )
-    return parser.parse_args()
+@cli.command()
+@click.option("-f", "--follow", is_flag=True, help="Follow log output (like tail -f).")
+@click.option("-n", "--lines", default=50, type=int, help="Number of lines to show.")
+def logs(follow: bool, lines: int) -> None:
+    """Show daemon logs."""
+    if not LOG_FILE.exists():
+        click.echo("No log file found. Start the daemon first.")
+        return
+
+    cmd = ["tail", f"-n{lines}"]
+    if follow:
+        cmd.append("-f")
+    cmd.append(str(LOG_FILE))
+
+    try:
+        subprocess.run(cmd)
+    except KeyboardInterrupt:
+        pass
+
+
+AUDIO_VIDEO_EXTENSIONS = {
+    ".mp3", ".wav", ".m4a", ".flac", ".ogg", ".webm",
+    ".mp4", ".mkv", ".avi", ".mov", ".aac", ".wma",
+}
+
+
+@cli.command()
+@click.argument("paths", nargs=-1, required=True, type=click.Path(exists=True))
+@click.option("--format", "formats", default="txt", help="Output formats, comma-separated: txt,srt,vtt,json.")
+@click.option("--output-dir", type=click.Path(), default=None, help="Output directory (default: same as input).")
+@click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
+@click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
+def transcribe(
+    paths: tuple[str, ...],
+    formats: str,
+    output_dir: str | None,
+    model: str,
+    language: str | None,
+    verbose: bool,
+) -> None:
+    """Transcribe audio/video files to text, SRT, VTT, or JSON.
+
+    Accepts files or directories. Directories are scanned for audio/video files.
+    Requires ffmpeg installed on the system.
+
+    \b
+    Examples:
+      whisper-daemon transcribe meeting.mp3
+      whisper-daemon transcribe meeting.mp3 --format srt
+      whisper-daemon transcribe meeting.mp3 --format txt,srt,json
+      whisper-daemon transcribe ./recordings/
+      whisper-daemon transcribe video.mp4 --output-dir ./out
+    """
+    _setup_logging(verbose)
+
+    from whisper_daemon.formats import FORMATTERS
+    from whisper_daemon.transcriber import preload_model, transcribe_file
+
+    format_list = [f.strip().lower() for f in formats.split(",")]
+    for fmt in format_list:
+        if fmt not in FORMATTERS:
+            click.echo(f"Unknown format: {fmt}. Available: {', '.join(FORMATTERS)}")
+            raise SystemExit(1)
+
+    files = _collect_files(paths)
+    if not files:
+        click.echo("No audio/video files found.")
+        raise SystemExit(1)
+
+    out_dir = Path(output_dir) if output_dir else None
+    if out_dir:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    click.echo(f"Model: {model}")
+    click.echo(f"Files: {len(files)}")
+    click.echo(f"Formats: {', '.join(format_list)}")
+    click.echo()
+
+    preload_model(model)
+
+    for i, file_path in enumerate(files, start=1):
+        click.echo(f"[{i}/{len(files)}] {file_path.name}")
+        try:
+            result = transcribe_file(str(file_path), model=model, language=language)
+        except Exception as exc:
+            click.echo(f"  ERROR: {exc}")
+            continue
+
+        dest_dir = out_dir or file_path.parent
+        stem = file_path.stem
+
+        for fmt in format_list:
+            output_text = FORMATTERS[fmt](result)
+            output_path = dest_dir / f"{stem}.{fmt}"
+            output_path.write_text(output_text, encoding="utf-8")
+            click.echo(f"  → {output_path}")
+
+    click.echo(f"\nDone — {len(files)} file(s) transcribed.")
+
+
+def _collect_files(paths: tuple[str, ...]) -> list[Path]:
+    """Resolve paths to a flat list of audio/video files."""
+    files: list[Path] = []
+    for p in paths:
+        path = Path(p)
+        if path.is_file():
+            files.append(path)
+        elif path.is_dir():
+            for child in sorted(path.iterdir()):
+                if child.is_file() and child.suffix.lower() in AUDIO_VIDEO_EXTENSIONS:
+                    files.append(child)
+    return files
+
+
+def _read_pid() -> int:
+    return int(PID_FILE.read_text().strip())
+
+
+def _is_running() -> bool:
+    if not PID_FILE.exists():
+        return False
+    try:
+        pid = _read_pid()
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        PID_FILE.unlink(missing_ok=True)
+        return False
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -99,4 +282,4 @@ def _setup_logging(verbose: bool) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    cli()

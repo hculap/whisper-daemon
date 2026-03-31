@@ -16,10 +16,11 @@ dependencies = [
     "pyobjc-framework-Quartz>=10.0",
     "onnxruntime>=1.16",
     "rumps>=0.4",
+    "click>=8.0",
 ]
 
 [project.scripts]
-whisper-daemon = "whisper_daemon.__main__:main"
+whisper-daemon = "whisper_daemon.__main__:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]

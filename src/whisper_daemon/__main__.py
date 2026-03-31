@@ -102,13 +102,17 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     from whisper_daemon.events import Event
     from whisper_daemon.hotkey import HotkeyListener
     from whisper_daemon.menubar import run_with_menubar
+    from whisper_daemon.config import load_settings
     from whisper_daemon.recorder import AudioRecorder
     from whisper_daemon.transcriber import preload_model
+
+    settings = load_settings()
+    device = settings.recording_device or None
 
     event_queue: queue.Queue[Event] = queue.Queue()
 
     logger.info("Initializing components...")
-    recorder = AudioRecorder(event_queue, silence_timeout=silence_timeout)
+    recorder = AudioRecorder(event_queue, silence_timeout=silence_timeout, device=device)
     hotkey = HotkeyListener(event_queue)
     daemon = Daemon(event_queue, recorder, model=model)
 

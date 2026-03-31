@@ -13,7 +13,6 @@ from whisper_daemon.vad import SileroVAD
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
-CHANNELS = 1
 DTYPE = "float32"
 BLOCK_SIZE = 512  # Matches Silero VAD expected chunk size (32ms at 16kHz)
 MAX_RECORDING_SEC = 120
@@ -22,15 +21,18 @@ DEFAULT_SILENCE_SEC = 1.5
 
 
 class AudioRecorder:
-    """Records audio from the default mic with Silero VAD auto-stop."""
+    """Records audio with Silero VAD auto-stop. Supports multi-channel devices."""
 
     def __init__(
         self,
         event_queue: queue.Queue[Event],
         silence_timeout: float = DEFAULT_SILENCE_SEC,
+        device: str | int | None = None,
     ) -> None:
         self._queue = event_queue
         self._silence_timeout = silence_timeout
+        self._device = device
+        self._channels = _detect_channels(device)
 
         self._vad = SileroVAD()
 
@@ -42,7 +44,7 @@ class AudioRecorder:
         self._recording = False
 
     def start_recording(self) -> None:
-        """Start capturing audio from the default microphone."""
+        """Start capturing audio."""
         self._chunks = []
         self._voice_detected = False
         self._silence_start = None
@@ -51,14 +53,16 @@ class AudioRecorder:
         self._vad.reset_states()
 
         self._stream = sd.InputStream(
+            device=self._device,
             samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
+            channels=self._channels,
             dtype=DTYPE,
             blocksize=BLOCK_SIZE,
             callback=self._audio_callback,
         )
         self._stream.start()
-        logger.info("Recording started")
+        device_name = self._device or "system default"
+        logger.info("Recording started (device: %s, channels: %d)", device_name, self._channels)
 
     def stop_recording(self) -> np.ndarray:
         """Stop recording and return the captured audio as a 1D numpy array."""
@@ -92,7 +96,12 @@ class AudioRecorder:
         if not self._recording:
             return
 
-        self._chunks.append(indata.copy())
+        # Mix to mono if multi-channel
+        if indata.shape[1] > 1:
+            mono = indata.mean(axis=1, keepdims=True)
+        else:
+            mono = indata
+        self._chunks.append(mono.copy())
 
         elapsed = time.monotonic() - self._recording_start
         if elapsed > MAX_RECORDING_SEC:
@@ -100,7 +109,7 @@ class AudioRecorder:
             self._queue.put(Event(EventType.RECORD_STOP))
             return
 
-        speech_prob = self._vad(indata[:, 0].copy())
+        speech_prob = self._vad(mono[:, 0].copy())
 
         now = time.monotonic()
 
@@ -113,3 +122,17 @@ class AudioRecorder:
             elif now - self._silence_start >= self._silence_timeout:
                 logger.info("VAD: silence detected (%.1fs)", self._silence_timeout)
                 self._queue.put(Event(EventType.RECORD_STOP))
+
+
+def _detect_channels(device: str | int | None) -> int:
+    """Detect the number of input channels for the selected device."""
+    if device is None:
+        return 1
+    try:
+        info = sd.query_devices(device)
+        ch = info["max_input_channels"]
+        if ch > 1:
+            logger.info("Device '%s' has %d input channels (will mix to mono)", device, ch)
+        return max(ch, 1)
+    except Exception:
+        return 1

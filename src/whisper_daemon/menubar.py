@@ -39,11 +39,12 @@ AUDIO_VIDEO_EXTENSIONS = [
     "mp4", "mkv", "avi", "mov", "aac", "wma",
 ]
 
-ICONS = {
-    State.IDLE: "\U0001f399",       # 🎙
-    State.RECORDING: "\U0001f534",  # 🔴
-    State.TRANSCRIBING: "\u231b",   # ⏳
+SF_SYMBOLS = {
+    State.IDLE: "mic.fill",
+    State.RECORDING: "record.circle.fill",
+    State.TRANSCRIBING: "text.bubble.fill",
 }
+MEETING_RECORDING_SYMBOL = "record.circle.fill"
 
 TITLES = {
     State.IDLE: "Ready",
@@ -79,7 +80,7 @@ class MenuBarDelegate(NSObject):
         self._status_item = status_bar.statusItemWithLength_(
             NSVariableStatusItemLength
         )
-        self._status_item.setTitle_(ICONS[State.IDLE])
+        self._set_icon(State.IDLE)
         self._status_item.setHighlightMode_(True)
 
         menu = NSMenu.alloc().init()
@@ -235,7 +236,7 @@ class MenuBarDelegate(NSObject):
         if self._meeting_active:
             elapsed = time.monotonic() - self._meeting_start
             mins, secs = divmod(int(elapsed), 60)
-            self._status_item.setTitle_("\U0001f534")
+            self._set_icon_by_name(MEETING_RECORDING_SYMBOL)
             self._meeting_menu_item.setTitle_(f"Stop Recording ({mins}:{secs:02d})")
             self._status_menu_item.setTitle_(f"Meeting recording ({mins}:{secs:02d})")
             return
@@ -243,7 +244,7 @@ class MenuBarDelegate(NSObject):
         state = self._daemon._state
         if state != self._last_state:
             self._last_state = state
-            self._status_item.setTitle_(ICONS.get(state, "\U0001f399"))
+            self._set_icon(state)
             self._status_menu_item.setTitle_(
                 f"Status: {TITLES.get(state, 'Unknown')}"
             )
@@ -306,6 +307,29 @@ class MenuBarDelegate(NSObject):
         self._hotkey.stop()
         self._daemon.shutdown()
         AppHelper.stopEventLoop()
+
+    def _set_icon(self, state: State) -> None:
+        """Set the menu bar icon to the SF Symbol for the given state."""
+        symbol_name = SF_SYMBOLS.get(state, "mic.fill")
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            symbol_name, None
+        )
+        if image:
+            image.setTemplate_(True)
+            self._status_item.button().setImage_(image)
+            self._status_item.setTitle_("")
+        else:
+            self._status_item.setTitle_("W")
+
+    def _set_icon_by_name(self, symbol_name: str) -> None:
+        """Set the menu bar icon to a specific SF Symbol name."""
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
+            symbol_name, None
+        )
+        if image:
+            image.setTemplate_(True)
+            self._status_item.button().setImage_(image)
+            self._status_item.setTitle_("")
 
     # -- Recent transcriptions --
 
@@ -487,7 +511,7 @@ class MenuBarDelegate(NSObject):
         self._meeting_active = True
         self._meeting_start = time.monotonic()
         self._meeting_menu_item.setTitle_("Stop Recording (0:00)")
-        self._status_item.setTitle_("\U0001f534")
+        self._set_icon_by_name(MEETING_RECORDING_SYMBOL)
         logger.info("Meeting recording started from menu bar")
 
         self._meeting_thread = threading.Thread(
@@ -498,7 +522,7 @@ class MenuBarDelegate(NSObject):
     def _stop_meeting(self):
         self._meeting_active = False
         self._meeting_menu_item.setTitle_("Start Meeting Recording")
-        self._status_item.setTitle_("\u231b")
+        self._set_icon(State.TRANSCRIBING)
         self._status_menu_item.setTitle_("Finishing transcription...")
         logger.info("Meeting recording stop requested from menu bar")
 
@@ -638,7 +662,7 @@ class MenuBarDelegate(NSObject):
     def _reset_meeting_ui(self):
         self._meeting_active = False
         self._meeting_menu_item.setTitle_("Start Meeting Recording")
-        self._status_item.setTitle_(ICONS[State.IDLE])
+        self._set_icon(State.IDLE)
         self._status_menu_item.setTitle_("Status: Ready")
 
     # -- File transcription --
@@ -649,7 +673,7 @@ class MenuBarDelegate(NSObject):
 
         model = self._daemon._model
 
-        self._status_item.setTitle_("\u231b")
+        self._set_icon(State.TRANSCRIBING)
         self._status_menu_item.setTitle_("Transcribing files...")
 
         files: list[Path] = []

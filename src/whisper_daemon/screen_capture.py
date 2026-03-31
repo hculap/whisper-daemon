@@ -81,16 +81,17 @@ class ScreenCapture:
         elapsed = time.monotonic() - self._start_time
         timestamp_sec = int(elapsed)
 
-        display_ids = _get_display_ids()
+        display_count = _get_display_count()
 
-        for i, display_id in enumerate(display_ids, start=1):
-            self._capture_display(display_id, i, timestamp_sec)
+        for display_num in range(1, display_count + 1):
+            self._capture_display(display_num, timestamp_sec)
 
-    def _capture_display(self, display_id: int, display_num: int, timestamp_sec: int) -> None:
+    def _capture_display(self, display_num: int, timestamp_sec: int) -> None:
         temp_path = self._output_dir / f"_temp_d{display_num}.png"
 
+        # screencapture -D uses sequential index (1, 2, 3...), not display IDs
         result = subprocess.run(
-            ["screencapture", "-x", "-C", "-D", str(display_id), str(temp_path)],
+            ["screencapture", "-x", "-C", "-D", str(display_num), str(temp_path)],
             capture_output=True,
             timeout=5,
         )
@@ -105,7 +106,7 @@ class ScreenCapture:
 
         current_hash = _dhash(img)
 
-        last_hash = self._last_hashes.get(display_id)
+        last_hash = self._last_hashes.get(display_num)
         if last_hash is not None:
             distance = _hamming_distance(last_hash, current_hash)
             if distance < self._threshold:
@@ -114,7 +115,7 @@ class ScreenCapture:
 
         final_path = self._output_dir / f"{timestamp_sec:06d}_display{display_num}.png"
         temp_path.rename(final_path)
-        self._last_hashes[display_id] = current_hash
+        self._last_hashes[display_num] = current_hash
         self._saved_count += 1
         logger.debug("Screenshot saved: %s", final_path.name)
 

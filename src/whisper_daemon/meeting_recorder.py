@@ -50,6 +50,7 @@ class MeetingRecorder:
         self._chunk_silence = chunk_silence
 
         self._vad = SileroVAD()
+        self._channels = self._detect_channels()
 
         self._stream: sd.InputStream | None = None
         self._frames: list[np.ndarray] = []
@@ -73,7 +74,7 @@ class MeetingRecorder:
         self._stream = sd.InputStream(
             device=self._device,
             samplerate=SAMPLE_RATE,
-            channels=CHANNELS,
+            channels=self._channels,
             dtype=DTYPE,
             blocksize=BLOCK_SIZE,
             callback=self._callback,
@@ -81,7 +82,10 @@ class MeetingRecorder:
         self._stream.start()
 
         device_name = self._device or "system default"
-        logger.info("Meeting recording started (device: %s)", device_name)
+        logger.info(
+            "Meeting recording started (device: %s, channels: %d)",
+            device_name, self._channels,
+        )
 
     def stop(self) -> None:
         """Stop recording and emit any remaining audio as a final chunk."""
@@ -112,7 +116,12 @@ class MeetingRecorder:
         if not self._recording:
             return
 
-        self._frames.append(indata.copy())
+        # Mix to mono if multi-channel (e.g. aggregate device)
+        if indata.shape[1] > 1:
+            mono = indata.mean(axis=1, keepdims=True)
+        else:
+            mono = indata
+        self._frames.append(mono.copy())
 
         chunk_elapsed = self._current_chunk_duration()
         if chunk_elapsed >= MAX_CHUNK_SEC:
@@ -120,7 +129,7 @@ class MeetingRecorder:
             self._emit_chunk()
             return
 
-        speech_prob = self._vad(indata[:, 0].copy())
+        speech_prob = self._vad(mono[:, 0].copy())
         now = time.monotonic()
 
         if speech_prob > VAD_THRESHOLD:
@@ -169,6 +178,19 @@ class MeetingRecorder:
         self._voice_detected_in_chunk = False
         self._silence_start = None
         self._vad.reset_states()
+
+    def _detect_channels(self) -> int:
+        """Detect the number of input channels for the selected device."""
+        if self._device is None:
+            return CHANNELS
+        try:
+            info = sd.query_devices(self._device)
+            ch = info["max_input_channels"]
+            if ch > 1:
+                logger.info("Device '%s' has %d input channels (will mix to mono)", self._device, ch)
+            return max(ch, 1)
+        except Exception:
+            return CHANNELS
 
     def _current_chunk_duration(self) -> float:
         total_samples = sum(f.shape[0] for f in self._frames)

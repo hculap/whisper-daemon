@@ -487,16 +487,15 @@ class MenuBarDelegate(NSObject):
         }
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rec_dir = self._settings.recording_dir_path
+        rec_dir = self._settings.recording_dir_path / f"recording_{timestamp}"
         rec_dir.mkdir(parents=True, exist_ok=True)
-        stem = f"meeting_{timestamp}"
 
         from whisper_daemon.formats import FORMATTERS
 
         written: list[str] = []
         for fmt in self._settings.recording_formats:
             if fmt in FORMATTERS:
-                out = rec_dir / f"{stem}.{fmt}"
+                out = rec_dir / f"transcript.{fmt}"
                 out.write_text(FORMATTERS[fmt](merged_result), encoding="utf-8")
                 written.append(str(out))
 

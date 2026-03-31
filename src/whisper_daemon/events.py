@@ -9,6 +9,7 @@ class EventType(Enum):
     RECORD_TOGGLE = auto()
     RECORD_STOP = auto()
     TRANSCRIPTION_DONE = auto()
+    PASTE_LAST = auto()
     ERROR = auto()
 
 

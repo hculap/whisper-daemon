@@ -36,6 +36,12 @@ class Daemon:
         self._state = State.IDLE
         self._running = False
         self._recording_started_at: float = 0.0
+        self._history: list[str] = []
+        self._max_history = 5
+
+    @property
+    def history(self) -> list[str]:
+        return list(self._history)
 
     @property
     def running(self) -> bool:
@@ -69,6 +75,8 @@ class Daemon:
             self._handle_record_stop()
         elif event.type == EventType.TRANSCRIPTION_DONE:
             self._handle_transcription_done(event.payload)
+        elif event.type == EventType.PASTE_LAST:
+            self._handle_paste_last()
         elif event.type == EventType.ERROR:
             self._handle_error(event.payload)
 
@@ -121,11 +129,21 @@ class Daemon:
     def _handle_transcription_done(self, text: str) -> None:
         if text:
             paste_text(text)
+            self._history.insert(0, text)
+            if len(self._history) > self._max_history:
+                self._history.pop()
         else:
             logger.info("Empty transcription, nothing to paste")
 
         self._state = State.IDLE
         logger.info("State: TRANSCRIBING -> IDLE")
+
+    def _handle_paste_last(self) -> None:
+        if self._history:
+            paste_text(self._history[0])
+            logger.info("Pasted last transcription (%d chars)", len(self._history[0]))
+        else:
+            logger.info("No transcription history to paste")
 
     def _handle_error(self, message: str) -> None:
         play_error()

@@ -90,6 +90,19 @@ class MenuBarDelegate(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
+        # Recent transcriptions submenu
+        self._recent_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Recent", None, ""
+        )
+        self._recent_menu = NSMenu.alloc().init()
+        no_items = _make_item("No transcriptions yet", None, None)
+        no_items.setEnabled_(False)
+        self._recent_menu.addItem_(no_items)
+        self._recent_menu_item.setSubmenu_(self._recent_menu)
+        menu.addItem_(self._recent_menu_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
         self._meeting_menu_item = _make_item(
             "Start Meeting Recording", "onMeeting:", self
         )
@@ -224,6 +237,8 @@ class MenuBarDelegate(NSObject):
                 f"Status: {TITLES.get(state, 'Unknown')}"
             )
 
+        self._update_recent_menu()
+
     # -- Menu actions --
 
     @objc.typedSelector(b"v@:@")
@@ -280,6 +295,39 @@ class MenuBarDelegate(NSObject):
         self._hotkey.stop()
         self._daemon.shutdown()
         AppHelper.stopEventLoop()
+
+    # -- Recent transcriptions --
+
+    def _update_recent_menu(self):
+        history = self._daemon.history
+        if not history:
+            return
+
+        current_count = self._recent_menu.numberOfItems()
+        if current_count == len(history):
+            # Check if first item matches — if so, no update needed
+            first = self._recent_menu.itemAtIndex_(0)
+            if first and str(first.title()).startswith(history[0][:30]):
+                return
+
+        self._recent_menu.removeAllItems()
+        for i, text in enumerate(history):
+            truncated = text[:50] + "..." if len(text) > 50 else text
+            truncated = truncated.replace("\n", " ")
+            item = _make_item(f"\"{truncated}\"", "onCopyRecent:", self)
+            item.setTag_(i)
+            self._recent_menu.addItem_(item)
+
+    @objc.typedSelector(b"v@:@")
+    def onCopyRecent_(self, sender):
+        idx = sender.tag()
+        history = self._daemon.history
+        if idx < len(history):
+            from AppKit import NSPasteboard, NSPasteboardTypeString
+            pb = NSPasteboard.generalPasteboard()
+            pb.clearContents()
+            pb.setString_forType_(history[idx], NSPasteboardTypeString)
+            logger.info("Copied transcription #%d to clipboard (%d chars)", idx + 1, len(history[idx]))
 
     # -- Settings actions --
 

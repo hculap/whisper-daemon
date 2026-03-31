@@ -9,25 +9,31 @@ from whisper_daemon.events import Event, EventType
 
 logger = logging.getLogger(__name__)
 
-HOTKEY_COMBO = "<cmd>+<shift>+<space>"
+RECORD_HOTKEY = "<cmd>+<shift>+<space>"
+PASTE_LAST_HOTKEY = "<cmd>+<shift>+v"
 
 
 class HotkeyListener:
-    """Listens for a global hotkey and emits RECORD_TOGGLE events."""
+    """Listens for global hotkeys: record toggle and paste-last."""
 
     def __init__(self, event_queue: queue.Queue[Event]) -> None:
         self._queue = event_queue
         self._listener = keyboard.GlobalHotKeys({
-            HOTKEY_COMBO: self._on_activate,
+            RECORD_HOTKEY: self._on_record,
+            PASTE_LAST_HOTKEY: self._on_paste_last,
         })
         self._listener.daemon = True
 
-    def _on_activate(self) -> None:
-        logger.info("Hotkey pressed")
+    def _on_record(self) -> None:
+        logger.info("Hotkey: record toggle")
         self._queue.put(Event(EventType.RECORD_TOGGLE))
 
+    def _on_paste_last(self) -> None:
+        logger.info("Hotkey: paste last transcription")
+        self._queue.put(Event(EventType.PASTE_LAST))
+
     def start(self) -> None:
-        logger.info("Hotkey listener started (%s)", HOTKEY_COMBO)
+        logger.info("Hotkeys: %s (record), %s (paste last)", RECORD_HOTKEY, PASTE_LAST_HOTKEY)
         self._listener.start()
 
     def stop(self) -> None:

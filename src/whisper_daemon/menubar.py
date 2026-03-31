@@ -126,6 +126,14 @@ class MenuBarDelegate(NSObject):
             self._save_audio_item.setState_(1)
         settings_menu.addItem_(self._save_audio_item)
 
+        # Capture Screenshots toggle
+        self._capture_screenshots_item = _make_item(
+            "Capture Screenshots", "onToggleScreenshots:", self
+        )
+        if self._settings.capture_screenshots:
+            self._capture_screenshots_item.setState_(1)
+        settings_menu.addItem_(self._capture_screenshots_item)
+
         settings_menu.addItem_(NSMenuItem.separatorItem())
 
         # Recording Folder
@@ -283,6 +291,13 @@ class MenuBarDelegate(NSObject):
         logger.info("Save audio: %s", self._settings.save_audio)
 
     @objc.typedSelector(b"v@:@")
+    def onToggleScreenshots_(self, sender):
+        self._settings.capture_screenshots = not self._settings.capture_screenshots
+        sender.setState_(1 if self._settings.capture_screenshots else 0)
+        save_settings(self._settings)
+        logger.info("Capture screenshots: %s", self._settings.capture_screenshots)
+
+    @objc.typedSelector(b"v@:@")
     def onChangeRecDir_(self, sender):
         from AppKit import NSOpenPanel
 
@@ -420,6 +435,7 @@ class MenuBarDelegate(NSObject):
 
     def _meeting_worker(self):
         from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
+        from whisper_daemon.screen_capture import ScreenCapture
         from whisper_daemon.transcriber import transcribe_full
 
         model = self._daemon._model
@@ -430,6 +446,18 @@ class MenuBarDelegate(NSObject):
         all_results: list[tuple[float, dict]] = []
         all_audio: list[np.ndarray] = []
         chunk_count = 0
+
+        # Prepare output dir early for screenshots
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        rec_dir = self._settings.recording_dir_path / f"recording_{timestamp}"
+        rec_dir.mkdir(parents=True, exist_ok=True)
+
+        screen_capture: ScreenCapture | None = None
+        if self._settings.capture_screenshots:
+            screen_capture = ScreenCapture(
+                rec_dir, interval=self._settings.screenshot_interval
+            )
+            screen_capture.start()
 
         recorder.start()
 
@@ -458,6 +486,8 @@ class MenuBarDelegate(NSObject):
                     _collect_futures(futures, all_results)
 
                 recorder.stop()
+                if screen_capture is not None:
+                    screen_capture.stop()
 
                 # Wait for in-flight transcription to finish FIRST
                 _collect_futures(futures, all_results, wait=True)
@@ -509,10 +539,6 @@ class MenuBarDelegate(NSObject):
             "language": all_results[0][1].get("language", "") if all_results else "",
         }
 
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rec_dir = self._settings.recording_dir_path / f"recording_{timestamp}"
-        rec_dir.mkdir(parents=True, exist_ok=True)
-
         from whisper_daemon.formats import FORMATTERS
 
         written: list[str] = []
@@ -528,11 +554,15 @@ class MenuBarDelegate(NSObject):
             _save_wav(audio_path, full_audio, 16000)
             written.append(str(audio_path))
 
+        screenshots_msg = ""
+        if screen_capture is not None and screen_capture.saved_count > 0:
+            screenshots_msg = f", {screen_capture.saved_count} screenshots"
+
         logger.info("Meeting saved: %s", ", ".join(written))
         _notify(
             "whisper-daemon",
-            f"Meeting recorded ({chunk_count} chunks)",
-            written[0] if written else "no output",
+            f"Meeting recorded ({chunk_count} chunks{screenshots_msg})",
+            str(rec_dir),
         )
         self._reset_meeting_ui()
 

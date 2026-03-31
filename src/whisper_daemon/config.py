@@ -19,6 +19,8 @@ class Settings:
     recording_formats: list[str] = field(default_factory=lambda: ["txt"])
     recording_device: str = ""  # empty = system default
     save_audio: bool = False  # save raw audio alongside transcripts
+    capture_screenshots: bool = False  # capture screenshots during recording
+    screenshot_interval: float = 5.0  # seconds between capture attempts
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
 
@@ -50,6 +52,8 @@ def load_settings() -> Settings:
             recording_formats=_validate_formats(rec.get("formats", ["txt"])),
             recording_device=rec.get("device", ""),
             save_audio=rec.get("save_audio", False),
+            capture_screenshots=rec.get("capture_screenshots", False),
+            screenshot_interval=rec.get("screenshot_interval", 5.0),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
         )
@@ -68,6 +72,8 @@ def save_settings(settings: Settings) -> None:
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.recording_formats)}]',
         f'device = "{settings.recording_device}"',
         f'save_audio = {"true" if settings.save_audio else "false"}',
+        f'capture_screenshots = {"true" if settings.capture_screenshots else "false"}',
+        f"screenshot_interval = {settings.screenshot_interval}",
         "",
         "[transcription]",
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',

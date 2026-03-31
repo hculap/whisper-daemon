@@ -9,8 +9,11 @@ import logging
 import queue
 import threading
 import time
+import wave
 from datetime import datetime
 from pathlib import Path
+
+import numpy as np
 
 import objc
 from AppKit import (
@@ -114,6 +117,14 @@ class MenuBarDelegate(NSObject):
         self._build_device_menu()
         rec_dev_item.setSubmenu_(self._rec_dev_menu)
         settings_menu.addItem_(rec_dev_item)
+
+        # Save Audio toggle
+        self._save_audio_item = _make_item(
+            "Save Audio Recording", "onToggleSaveAudio:", self
+        )
+        if self._settings.save_audio:
+            self._save_audio_item.setState_(1)
+        settings_menu.addItem_(self._save_audio_item)
 
         settings_menu.addItem_(NSMenuItem.separatorItem())
 
@@ -265,6 +276,13 @@ class MenuBarDelegate(NSObject):
     # -- Settings actions --
 
     @objc.typedSelector(b"v@:@")
+    def onToggleSaveAudio_(self, sender):
+        self._settings.save_audio = not self._settings.save_audio
+        sender.setState_(1 if self._settings.save_audio else 0)
+        save_settings(self._settings)
+        logger.info("Save audio: %s", self._settings.save_audio)
+
+    @objc.typedSelector(b"v@:@")
     def onChangeRecDir_(self, sender):
         from AppKit import NSOpenPanel
 
@@ -410,6 +428,7 @@ class MenuBarDelegate(NSObject):
         recorder = MeetingRecorder(chunk_queue, device=device)
 
         all_results: list[tuple[float, dict]] = []
+        all_audio: list[np.ndarray] = []
         chunk_count = 0
 
         recorder.start()
@@ -432,6 +451,8 @@ class MenuBarDelegate(NSObject):
                     logger.info(
                         "Meeting chunk %d: %.1fs", chunk_count, chunk.duration
                     )
+                    if self._settings.save_audio:
+                        all_audio.append(chunk.audio.copy())
                     future = pool.submit(transcribe_full, chunk.audio, model)
                     futures[future] = chunk.start_time
                     _collect_futures(futures, all_results)
@@ -450,6 +471,8 @@ class MenuBarDelegate(NSObject):
                     if chunk is None:
                         break
                     chunk_count += 1
+                    if self._settings.save_audio:
+                        all_audio.append(chunk.audio.copy())
                     result = transcribe_full(chunk.audio, model)
                     if result.get("text", "").strip():
                         all_results.append((chunk.start_time, result))
@@ -499,7 +522,13 @@ class MenuBarDelegate(NSObject):
                 out.write_text(FORMATTERS[fmt](merged_result), encoding="utf-8")
                 written.append(str(out))
 
-        logger.info("Meeting transcript saved: %s", ", ".join(written))
+        if self._settings.save_audio and all_audio:
+            audio_path = rec_dir / "recording.wav"
+            full_audio = np.concatenate(all_audio)
+            _save_wav(audio_path, full_audio, 16000)
+            written.append(str(audio_path))
+
+        logger.info("Meeting saved: %s", ", ".join(written))
         _notify(
             "whisper-daemon",
             f"Meeting recorded ({chunk_count} chunks)",
@@ -599,6 +628,17 @@ def _notify(title: str, subtitle: str, message: str) -> None:
         )
     except Exception:
         logger.warning("Notification failed: %s — %s — %s", title, subtitle, message)
+
+
+def _save_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
+    """Save float32 audio array as 16-bit WAV file."""
+    int16_audio = (audio * 32767).clip(-32768, 32767).astype(np.int16)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(int16_audio.tobytes())
+    logger.info("Audio saved: %s (%.1fs)", path, len(audio) / sample_rate)
 
 
 def _collect_futures(

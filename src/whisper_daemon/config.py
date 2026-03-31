@@ -18,6 +18,7 @@ class Settings:
     recording_dir: str = "~/Desktop"
     recording_formats: list[str] = field(default_factory=lambda: ["txt"])
     recording_device: str = ""  # empty = system default
+    save_audio: bool = False  # save raw audio alongside transcripts
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
 
@@ -48,6 +49,7 @@ def load_settings() -> Settings:
             recording_dir=rec.get("dir", "~/Desktop"),
             recording_formats=_validate_formats(rec.get("formats", ["txt"])),
             recording_device=rec.get("device", ""),
+            save_audio=rec.get("save_audio", False),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
         )
@@ -65,6 +67,7 @@ def save_settings(settings: Settings) -> None:
         f'dir = "{settings.recording_dir}"',
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.recording_formats)}]',
         f'device = "{settings.recording_device}"',
+        f'save_audio = {"true" if settings.save_audio else "false"}',
         "",
         "[transcription]",
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',

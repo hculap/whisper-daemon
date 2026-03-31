@@ -15,7 +15,6 @@ dependencies = [
     "pyobjc-framework-Cocoa>=10.0",
     "pyobjc-framework-Quartz>=10.0",
     "onnxruntime>=1.16",
-    "rumps>=0.4",
     "click>=8.0",
 ]
 

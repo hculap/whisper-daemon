@@ -15,7 +15,7 @@ PID_FILE = CONFIG_DIR / "daemon.pid"
 LOG_FILE = CONFIG_DIR / "daemon.log"
 
 
-@click.group(invoke_without_command=True)
+@click.group(invoke_without_command=True, context_settings={"show_default": True})
 @click.pass_context
 def cli(ctx: click.Context) -> None:
     """Local push-to-talk transcription daemon for macOS."""
@@ -118,6 +118,9 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
         logger.info("Received signal %s", signal.Signals(sig).name)
         hotkey.stop()
         daemon.shutdown()
+        if not no_menubar:
+            from PyObjCTools import AppHelper
+            AppHelper.stopEventLoop()
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)

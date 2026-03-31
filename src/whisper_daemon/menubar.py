@@ -1,4 +1,8 @@
-"""Menu bar status icon with interactive actions using rumps."""
+"""Menu bar status icon using raw pyobjc (NSStatusBar + NSMenu).
+
+Replaces rumps which is broken on macOS 14+/Sequoia — menus don't drop down,
+multiple phantom icons appear, and @clicked decorators silently fail.
+"""
 
 import concurrent.futures
 import logging
@@ -8,10 +12,21 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import rumps
-from AppKit import NSOpenPanel
-from AppKit import NSFileHandlingPanelOKButton
+import objc
+from AppKit import (
+    NSApplication,
+    NSApplicationActivationPolicyAccessory,
+    NSMenu,
+    NSMenuItem,
+    NSObject,
+    NSStatusBar,
+    NSTimer,
+    NSVariableStatusItemLength,
+)
+from Foundation import NSRunLoop, NSDefaultRunLoopMode
+from PyObjCTools import AppHelper
 
+from whisper_daemon.config import VALID_FORMATS, Settings, load_settings, save_settings
 from whisper_daemon.daemon import State
 
 logger = logging.getLogger(__name__)
@@ -22,9 +37,9 @@ AUDIO_VIDEO_EXTENSIONS = [
 ]
 
 ICONS = {
-    State.IDLE: "🎙",
-    State.RECORDING: "🔴",
-    State.TRANSCRIBING: "⏳",
+    State.IDLE: "\U0001f399",       # 🎙
+    State.RECORDING: "\U0001f534",  # 🔴
+    State.TRANSCRIBING: "\u231b",   # ⏳
 }
 
 TITLES = {
@@ -34,70 +49,285 @@ TITLES = {
 }
 
 
-class MenuBarApp(rumps.App):
-    """Menu bar icon with status display and interactive actions."""
+class MenuBarDelegate(NSObject):
+    """NSApplication delegate that manages the status bar item and menu."""
 
-    def __init__(self, daemon: object, hotkey_listener: object) -> None:
-        super().__init__(ICONS[State.IDLE], quit_button=None)
+    def initWithDaemon_hotkeyListener_(self, daemon, hotkey_listener):
+        self = objc.super(MenuBarDelegate, self).init()
+        if self is None:
+            return None
+
         self._daemon = daemon
         self._hotkey = hotkey_listener
-
         self._meeting_active = False
-        self._meeting_start: float = 0.0
-        self._meeting_thread: threading.Thread | None = None
-
-        self._status_item = rumps.MenuItem("Status: Ready", callback=None)
-        self._meeting_item = rumps.MenuItem(
-            "Start Meeting Recording", callback=self._toggle_meeting
-        )
-        self._transcribe_files_item = rumps.MenuItem(
-            "Transcribe Files...", callback=self._transcribe_files
-        )
-        self._transcribe_folder_item = rumps.MenuItem(
-            "Transcribe Folder...", callback=self._transcribe_folder
-        )
-
-        self.menu = [
-            self._status_item,
-            None,
-            self._meeting_item,
-            None,
-            self._transcribe_files_item,
-            self._transcribe_folder_item,
-            None,
-            rumps.MenuItem("Quit", callback=self._quit),
-        ]
-
-        self._poll_timer = rumps.Timer(self._poll_state, 0.3)
-        self._poll_timer.start()
+        self._meeting_start = 0.0
+        self._meeting_thread = None
         self._last_state = State.IDLE
+        self._settings = load_settings()
 
-    def _poll_state(self, _timer: rumps.Timer) -> None:
+        return self
+
+    def applicationDidFinishLaunching_(self, notification):
+        self._setup_status_bar()
+        self._start_poll_timer()
+
+    def _setup_status_bar(self):
+        status_bar = NSStatusBar.systemStatusBar()
+        self._status_item = status_bar.statusItemWithLength_(
+            NSVariableStatusItemLength
+        )
+        self._status_item.setTitle_(ICONS[State.IDLE])
+        self._status_item.setHighlightMode_(True)
+
+        menu = NSMenu.alloc().init()
+
+        self._status_menu_item = _make_item("Status: Ready", None, self)
+        self._status_menu_item.setEnabled_(False)
+        menu.addItem_(self._status_menu_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        self._meeting_menu_item = _make_item(
+            "Start Meeting Recording", "onMeeting:", self
+        )
+        menu.addItem_(self._meeting_menu_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        menu.addItem_(_make_item("Transcribe Files...", "onTranscribeFiles:", self))
+        menu.addItem_(_make_item("Transcribe Folder...", "onTranscribeFolder:", self))
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # Settings submenu
+        settings_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Settings", None, ""
+        )
+        settings_menu = NSMenu.alloc().init()
+
+        # Recording Folder
+        self._rec_dir_item = _make_item(
+            self._format_dir_label("Recording Folder", self._settings.recording_dir),
+            "onChangeRecDir:", self,
+        )
+        settings_menu.addItem_(self._rec_dir_item)
+
+        # Recording Format (submenu with checkmarks)
+        rec_fmt_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Recording Format", None, ""
+        )
+        self._rec_fmt_menu = NSMenu.alloc().init()
+        self._rec_fmt_items = {}
+        for fmt in VALID_FORMATS:
+            fi = _make_item(fmt, "onToggleRecFmt:", self)
+            fi.setRepresentedObject_(fmt)
+            if fmt in self._settings.recording_formats:
+                fi.setState_(1)  # NSOnState
+            self._rec_fmt_menu.addItem_(fi)
+            self._rec_fmt_items[fmt] = fi
+        rec_fmt_item.setSubmenu_(self._rec_fmt_menu)
+        settings_menu.addItem_(rec_fmt_item)
+
+        settings_menu.addItem_(NSMenuItem.separatorItem())
+
+        # Transcription Output Folder
+        self._trans_dir_item = _make_item(
+            self._format_dir_label(
+                "Transcription Output",
+                self._settings.transcription_output_dir or "same as input",
+            ),
+            "onChangeTransDir:", self,
+        )
+        settings_menu.addItem_(self._trans_dir_item)
+
+        # Transcription Format (submenu with checkmarks)
+        trans_fmt_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Transcription Format", None, ""
+        )
+        self._trans_fmt_menu = NSMenu.alloc().init()
+        self._trans_fmt_items = {}
+        for fmt in VALID_FORMATS:
+            fi = _make_item(fmt, "onToggleTransFmt:", self)
+            fi.setRepresentedObject_(fmt)
+            if fmt in self._settings.transcription_formats:
+                fi.setState_(1)
+            self._trans_fmt_menu.addItem_(fi)
+            self._trans_fmt_items[fmt] = fi
+        trans_fmt_item.setSubmenu_(self._trans_fmt_menu)
+        settings_menu.addItem_(trans_fmt_item)
+
+        settings_item.setSubmenu_(settings_menu)
+        menu.addItem_(settings_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        menu.addItem_(_make_item("Quit", "onQuit:", self))
+
+        self._status_item.setMenu_(menu)
+
+    def _start_poll_timer(self):
+        self._timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.3, self, "pollState:", None, True
+        )
+        NSRunLoop.currentRunLoop().addTimer_forMode_(
+            self._timer, NSDefaultRunLoopMode
+        )
+
+    # -- Poll timer --
+
+    @objc.typedSelector(b"v@:@")
+    def pollState_(self, timer):
         if self._meeting_active:
             elapsed = time.monotonic() - self._meeting_start
             mins, secs = divmod(int(elapsed), 60)
-            self.title = "🔴"
-            self._meeting_item.title = f"Stop Recording ({mins}:{secs:02d})"
-            self._status_item.title = f"Meeting recording ({mins}:{secs:02d})"
+            self._status_item.setTitle_("\U0001f534")
+            self._meeting_menu_item.setTitle_(f"Stop Recording ({mins}:{secs:02d})")
+            self._status_menu_item.setTitle_(f"Meeting recording ({mins}:{secs:02d})")
             return
 
         state = self._daemon._state
         if state != self._last_state:
             self._last_state = state
-            self.title = ICONS.get(state, "🎙")
-            self._status_item.title = f"Status: {TITLES.get(state, 'Unknown')}"
+            self._status_item.setTitle_(ICONS.get(state, "\U0001f399"))
+            self._status_menu_item.setTitle_(
+                f"Status: {TITLES.get(state, 'Unknown')}"
+            )
 
-    def _toggle_meeting(self, _sender: rumps.MenuItem) -> None:
+    # -- Menu actions --
+
+    @objc.typedSelector(b"v@:@")
+    def onMeeting_(self, sender):
         if self._meeting_active:
             self._stop_meeting()
         else:
             self._start_meeting()
 
-    def _start_meeting(self) -> None:
+    @objc.typedSelector(b"v@:@")
+    def onTranscribeFiles_(self, sender):
+        from AppKit import NSOpenPanel
+
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowsMultipleSelection_(True)
+        panel.setAllowedFileTypes_(AUDIO_VIDEO_EXTENSIONS)
+        panel.setTitle_("Select audio/video files to transcribe")
+
+        if panel.runModal() != 1:
+            return
+
+        paths = [str(url.path()) for url in panel.URLs()]
+        if paths:
+            threading.Thread(
+                target=self._transcribe_paths_worker, args=(paths,), daemon=True
+            ).start()
+
+    @objc.typedSelector(b"v@:@")
+    def onTranscribeFolder_(self, sender):
+        from AppKit import NSOpenPanel
+
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(False)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setTitle_("Select folder to transcribe")
+
+        if panel.runModal() != 1:
+            return
+
+        folder = str(panel.URLs()[0].path())
+        if folder:
+            threading.Thread(
+                target=self._transcribe_paths_worker, args=([folder],), daemon=True
+            ).start()
+
+    @objc.typedSelector(b"v@:@")
+    def onQuit_(self, sender):
+        logger.info("Quit from menu bar")
+        if self._meeting_active:
+            self._stop_meeting()
+        self._hotkey.stop()
+        self._daemon.shutdown()
+        AppHelper.stopEventLoop()
+
+    # -- Settings actions --
+
+    @objc.typedSelector(b"v@:@")
+    def onChangeRecDir_(self, sender):
+        from AppKit import NSOpenPanel
+
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(False)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setTitle_("Choose recording output folder")
+
+        if panel.runModal() != 1:
+            return
+
+        path = str(panel.URLs()[0].path())
+        self._settings.recording_dir = path
+        save_settings(self._settings)
+        self._rec_dir_item.setTitle_(
+            self._format_dir_label("Recording Folder", path)
+        )
+
+    @objc.typedSelector(b"v@:@")
+    def onToggleRecFmt_(self, sender):
+        fmt = sender.representedObject()
+        if fmt in self._settings.recording_formats:
+            if len(self._settings.recording_formats) > 1:
+                self._settings.recording_formats.remove(fmt)
+                sender.setState_(0)
+        else:
+            self._settings.recording_formats.append(fmt)
+            sender.setState_(1)
+        save_settings(self._settings)
+
+    @objc.typedSelector(b"v@:@")
+    def onChangeTransDir_(self, sender):
+        from AppKit import NSOpenPanel
+
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(False)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
+        panel.setTitle_("Choose transcription output folder")
+
+        if panel.runModal() != 1:
+            return
+
+        path = str(panel.URLs()[0].path())
+        self._settings.transcription_output_dir = path
+        save_settings(self._settings)
+        self._trans_dir_item.setTitle_(
+            self._format_dir_label("Transcription Output", path)
+        )
+
+    @objc.typedSelector(b"v@:@")
+    def onToggleTransFmt_(self, sender):
+        fmt = sender.representedObject()
+        if fmt in self._settings.transcription_formats:
+            if len(self._settings.transcription_formats) > 1:
+                self._settings.transcription_formats.remove(fmt)
+                sender.setState_(0)
+        else:
+            self._settings.transcription_formats.append(fmt)
+            sender.setState_(1)
+        save_settings(self._settings)
+
+    @staticmethod
+    def _format_dir_label(prefix: str, path: str) -> str:
+        display = path.replace(str(Path.home()), "~") if path else "same as input"
+        return f"{prefix}: {display}"
+
+    # -- Meeting recording --
+
+    def _start_meeting(self):
         self._meeting_active = True
         self._meeting_start = time.monotonic()
-        self._meeting_item.title = "Stop Recording (0:00)"
-        self.title = "🔴"
+        self._meeting_menu_item.setTitle_("Stop Recording (0:00)")
+        self._status_item.setTitle_("\U0001f534")
         logger.info("Meeting recording started from menu bar")
 
         self._meeting_thread = threading.Thread(
@@ -105,15 +335,14 @@ class MenuBarApp(rumps.App):
         )
         self._meeting_thread.start()
 
-    def _stop_meeting(self) -> None:
+    def _stop_meeting(self):
         self._meeting_active = False
-        self._meeting_item.title = "Start Meeting Recording"
-        self.title = "⏳"
-        self._status_item.title = "Finishing transcription..."
+        self._meeting_menu_item.setTitle_("Start Meeting Recording")
+        self._status_item.setTitle_("\u231b")
+        self._status_menu_item.setTitle_("Finishing transcription...")
         logger.info("Meeting recording stop requested from menu bar")
 
-    def _meeting_worker(self) -> None:
-        from whisper_daemon.formats import to_txt
+    def _meeting_worker(self):
         from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
         from whisper_daemon.transcriber import transcribe as transcribe_audio
 
@@ -134,17 +363,19 @@ class MenuBarApp(rumps.App):
                     try:
                         chunk = chunk_queue.get(timeout=0.5)
                     except queue.Empty:
-                        self._collect_meeting_results(futures, all_results)
+                        _collect_futures(futures, all_results)
                         continue
 
                     if chunk is None:
                         break
 
                     chunk_count += 1
-                    logger.info("Meeting chunk %d: %.1fs", chunk_count, chunk.duration)
+                    logger.info(
+                        "Meeting chunk %d: %.1fs", chunk_count, chunk.duration
+                    )
                     future = pool.submit(transcribe_audio, chunk.audio, model)
                     futures[future] = chunk.start_time
-                    self._collect_meeting_results(futures, all_results)
+                    _collect_futures(futures, all_results)
 
                 recorder.stop()
 
@@ -160,103 +391,63 @@ class MenuBarApp(rumps.App):
                     if text:
                         all_results.append((chunk.start_time, text))
 
-                self._collect_meeting_results(futures, all_results, wait=True)
+                _collect_futures(futures, all_results, wait=True)
 
         except Exception:
             logger.exception("Meeting recording failed")
-            rumps.notification(
-                "whisper-daemon", "Error", "Meeting recording failed. Check logs."
-            )
+            _notify("whisper-daemon", "Error", "Meeting recording failed.")
             self._reset_meeting_ui()
             return
 
         if not all_results:
-            rumps.notification("whisper-daemon", "Done", "No speech detected.")
+            _notify("whisper-daemon", "Done", "No speech detected.")
             self._reset_meeting_ui()
             return
 
         all_results.sort(key=lambda r: r[0])
-        full_text = " ".join(text for _, text in all_results if text)
+
+        # Build merged result dict for formatters
+        merged_text = " ".join(text for _, text in all_results if text)
+        merged_result = {"text": merged_text, "segments": [], "language": ""}
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = Path.home() / "Desktop" / f"meeting_{timestamp}.txt"
-        output_path.write_text(full_text, encoding="utf-8")
+        rec_dir = self._settings.recording_dir_path
+        rec_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"meeting_{timestamp}"
 
-        logger.info("Meeting transcript saved to %s", output_path)
-        rumps.notification(
+        from whisper_daemon.formats import FORMATTERS
+
+        written: list[str] = []
+        for fmt in self._settings.recording_formats:
+            if fmt in FORMATTERS:
+                out = rec_dir / f"{stem}.{fmt}"
+                out.write_text(FORMATTERS[fmt](merged_result), encoding="utf-8")
+                written.append(str(out))
+
+        logger.info("Meeting transcript saved: %s", ", ".join(written))
+        _notify(
             "whisper-daemon",
             f"Meeting recorded ({chunk_count} chunks)",
-            str(output_path),
+            written[0] if written else "no output",
         )
         self._reset_meeting_ui()
 
-    def _collect_meeting_results(
-        self,
-        futures: dict,
-        all_results: list[tuple[float, str]],
-        wait: bool = False,
-    ) -> None:
-        if wait and futures:
-            done_futures, _ = concurrent.futures.wait(futures.keys())
-        else:
-            done_futures = {f for f in futures if f.done()}
-
-        for future in done_futures:
-            start_time = futures.pop(future)
-            try:
-                text = future.result()
-                if text:
-                    all_results.append((start_time, text))
-            except Exception as exc:
-                logger.error("Meeting chunk failed: %s", exc)
-
-    def _reset_meeting_ui(self) -> None:
+    def _reset_meeting_ui(self):
         self._meeting_active = False
-        self._meeting_item.title = "Start Meeting Recording"
-        self.title = ICONS[State.IDLE]
-        self._status_item.title = "Status: Ready"
+        self._meeting_menu_item.setTitle_("Start Meeting Recording")
+        self._status_item.setTitle_(ICONS[State.IDLE])
+        self._status_menu_item.setTitle_("Status: Ready")
 
-    def _transcribe_files(self, _sender: rumps.MenuItem) -> None:
-        panel = NSOpenPanel.openPanel()
-        panel.setCanChooseFiles_(True)
-        panel.setCanChooseDirectories_(False)
-        panel.setAllowsMultipleSelection_(True)
-        panel.setAllowedFileTypes_(AUDIO_VIDEO_EXTENSIONS)
-        panel.setTitle_("Select audio/video files to transcribe")
-
-        if panel.runModal() != NSFileHandlingPanelOKButton:
-            return
-
-        paths = [str(url.path()) for url in panel.URLs()]
-        if paths:
-            threading.Thread(
-                target=self._transcribe_paths_worker, args=(paths,), daemon=True
-            ).start()
-
-    def _transcribe_folder(self, _sender: rumps.MenuItem) -> None:
-        panel = NSOpenPanel.openPanel()
-        panel.setCanChooseFiles_(False)
-        panel.setCanChooseDirectories_(True)
-        panel.setAllowsMultipleSelection_(False)
-        panel.setTitle_("Select folder to transcribe")
-
-        if panel.runModal() != NSFileHandlingPanelOKButton:
-            return
-
-        folder = str(panel.URLs()[0].path())
-        if folder:
-            threading.Thread(
-                target=self._transcribe_paths_worker, args=([folder],), daemon=True
-            ).start()
+    # -- File transcription --
 
     def _transcribe_paths_worker(self, paths: list[str]) -> None:
-        from whisper_daemon.formats import to_txt
+        from whisper_daemon.formats import FORMATTERS
         from whisper_daemon.transcriber import transcribe_file
 
         model = self._daemon._model
 
-        self.title = "⏳"
-        self._status_item.title = "Transcribing files..."
+        self._status_item.setTitle_("\u231b")
+        self._status_menu_item.setTitle_("Transcribing files...")
 
         files: list[Path] = []
         ext_set = {"." + e for e in AUDIO_VIDEO_EXTENSIONS}
@@ -270,43 +461,107 @@ class MenuBarApp(rumps.App):
                         files.append(child)
 
         if not files:
-            rumps.notification("whisper-daemon", "No files", "No audio/video files found.")
+            _notify("whisper-daemon", "No files", "No audio/video files found.")
             self._reset_meeting_ui()
             return
+
+        out_dir = self._settings.transcription_output_dir_path
+        if out_dir:
+            out_dir.mkdir(parents=True, exist_ok=True)
 
         done = 0
         for file_path in files:
             try:
-                self._status_item.title = f"Transcribing {file_path.name}..."
+                self._status_menu_item.setTitle_(
+                    f"Transcribing {file_path.name}..."
+                )
                 result = transcribe_file(str(file_path), model=model)
-                text = result.get("text", "").strip()
-                if text:
-                    output = file_path.with_suffix(".txt")
-                    output.write_text(text, encoding="utf-8")
-                    done += 1
+
+                dest = out_dir or file_path.parent
+                stem = file_path.stem
+                for fmt in self._settings.transcription_formats:
+                    if fmt in FORMATTERS:
+                        output = dest / f"{stem}.{fmt}"
+                        output.write_text(
+                            FORMATTERS[fmt](result), encoding="utf-8"
+                        )
+                done += 1
             except Exception:
                 logger.exception("Failed to transcribe %s", file_path)
 
-        rumps.notification(
+        _notify(
             "whisper-daemon",
-            f"Transcription complete",
+            "Transcription complete",
             f"{done}/{len(files)} files transcribed.",
         )
         self._reset_meeting_ui()
 
-    def _quit(self, _sender: rumps.MenuItem) -> None:
-        logger.info("Quit from menu bar")
-        if self._meeting_active:
-            self._stop_meeting()
-        self._hotkey.stop()
-        self._daemon.shutdown()
-        rumps.quit_application()
+
+def _make_item(title: str, action: str | None, target: object) -> NSMenuItem:
+    """Create an NSMenuItem with the given title, action selector, and target."""
+    item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+        title, action, ""
+    )
+    if target is not None:
+        item.setTarget_(target)
+    return item
+
+
+def _notify(title: str, subtitle: str, message: str) -> None:
+    """Post a macOS notification via NSUserNotificationCenter (best-effort)."""
+    try:
+        from Foundation import (
+            NSUserNotification,
+            NSUserNotificationCenter,
+        )
+
+        notification = NSUserNotification.alloc().init()
+        notification.setTitle_(title)
+        notification.setSubtitle_(subtitle)
+        notification.setInformativeText_(message)
+        NSUserNotificationCenter.defaultUserNotificationCenter().deliverNotification_(
+            notification
+        )
+    except Exception:
+        logger.warning("Notification failed: %s — %s — %s", title, subtitle, message)
+
+
+def _collect_futures(
+    futures: dict,
+    all_results: list[tuple[float, str]],
+    wait: bool = False,
+) -> None:
+    """Collect completed transcription futures."""
+    if wait and futures:
+        done_set, _ = concurrent.futures.wait(futures.keys())
+    else:
+        done_set = {f for f in futures if f.done()}
+
+    for future in done_set:
+        start_time = futures.pop(future)
+        try:
+            text = future.result()
+            if text:
+                all_results.append((start_time, text))
+        except Exception as exc:
+            logger.error("Chunk transcription failed: %s", exc)
 
 
 def run_with_menubar(daemon: object, hotkey_listener: object) -> None:
-    """Run the daemon event loop in a background thread, menu bar on main thread."""
+    """Run the daemon event loop in a background thread, menu bar on main thread.
+
+    The main thread MUST run the NSApplication event loop for AppKit to work.
+    The daemon event loop runs in a daemon thread.
+    """
     daemon_thread = threading.Thread(target=daemon.run, daemon=True)
     daemon_thread.start()
 
-    app = MenuBarApp(daemon, hotkey_listener)
-    app.run()
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+    delegate = MenuBarDelegate.alloc().initWithDaemon_hotkeyListener_(
+        daemon, hotkey_listener
+    )
+    app.setDelegate_(delegate)
+
+    AppHelper.runEventLoop()

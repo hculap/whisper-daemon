@@ -149,6 +149,17 @@ class MenuBarDelegate(NSObject):
 
         settings_menu.addItem_(NSMenuItem.separatorItem())
 
+        # Start at Login toggle
+        from whisper_daemon.autostart import is_enabled as autostart_enabled
+        self._autostart_item = _make_item(
+            "Start at Login", "onToggleAutostart:", self
+        )
+        if autostart_enabled():
+            self._autostart_item.setState_(1)
+        settings_menu.addItem_(self._autostart_item)
+
+        settings_menu.addItem_(NSMenuItem.separatorItem())
+
         # Recording Folder
         self._rec_dir_item = _make_item(
             self._format_dir_label("Recording Folder", self._settings.recording_dir),
@@ -337,6 +348,16 @@ class MenuBarDelegate(NSObject):
         sender.setState_(1 if self._settings.save_audio else 0)
         save_settings(self._settings)
         logger.info("Save audio: %s", self._settings.save_audio)
+
+    @objc.typedSelector(b"v@:@")
+    def onToggleAutostart_(self, sender):
+        from whisper_daemon.autostart import disable, enable, is_enabled
+        if is_enabled():
+            disable()
+            sender.setState_(0)
+        else:
+            enable()
+            sender.setState_(1)
 
     @objc.typedSelector(b"v@:@")
     def onToggleScreenshots_(self, sender):

@@ -79,6 +79,32 @@ def stop() -> None:
 
 
 @cli.command()
+@click.argument("action", type=click.Choice(["enable", "disable", "status"]))
+def autostart(action: str) -> None:
+    """Manage auto-start at macOS login.
+
+    \b
+    Examples:
+      whisper-daemon autostart enable
+      whisper-daemon autostart disable
+      whisper-daemon autostart status
+    """
+    from whisper_daemon.autostart import disable, enable, is_enabled
+
+    if action == "enable":
+        enable()
+        click.echo("Autostart enabled. whisper-daemon will start at login.")
+    elif action == "disable":
+        disable()
+        click.echo("Autostart disabled.")
+    elif action == "status":
+        if is_enabled():
+            click.echo("Autostart: enabled")
+        else:
+            click.echo("Autostart: disabled")
+
+
+@cli.command()
 def status() -> None:
     """Show daemon status."""
     if _is_running():

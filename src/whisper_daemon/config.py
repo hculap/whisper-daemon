@@ -17,6 +17,7 @@ VALID_FORMATS = {"txt", "srt", "vtt", "json"}
 class Settings:
     recording_dir: str = "~/Desktop"
     recording_formats: list[str] = field(default_factory=lambda: ["txt"])
+    recording_device: str = ""  # empty = system default
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
 
@@ -46,6 +47,7 @@ def load_settings() -> Settings:
         return Settings(
             recording_dir=rec.get("dir", "~/Desktop"),
             recording_formats=_validate_formats(rec.get("formats", ["txt"])),
+            recording_device=rec.get("device", ""),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
         )
@@ -62,6 +64,7 @@ def save_settings(settings: Settings) -> None:
         "[recording]",
         f'dir = "{settings.recording_dir}"',
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.recording_formats)}]',
+        f'device = "{settings.recording_device}"',
         "",
         "[transcription]",
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',

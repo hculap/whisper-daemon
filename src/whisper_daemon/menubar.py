@@ -105,6 +105,18 @@ class MenuBarDelegate(NSObject):
         )
         settings_menu = NSMenu.alloc().init()
 
+        # Recording Device (submenu with radio-style selection)
+        rec_dev_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Recording Device", None, ""
+        )
+        self._rec_dev_menu = NSMenu.alloc().init()
+        self._rec_dev_items = {}
+        self._build_device_menu()
+        rec_dev_item.setSubmenu_(self._rec_dev_menu)
+        settings_menu.addItem_(rec_dev_item)
+
+        settings_menu.addItem_(NSMenuItem.separatorItem())
+
         # Recording Folder
         self._rec_dir_item = _make_item(
             self._format_dir_label("Recording Folder", self._settings.recording_dir),
@@ -120,7 +132,7 @@ class MenuBarDelegate(NSObject):
         self._rec_fmt_items = {}
         for fmt in VALID_FORMATS:
             fi = _make_item(fmt, "onToggleRecFmt:", self)
-            fi.setRepresentedObject_(fmt)
+            fi.setTag_(list(VALID_FORMATS).index(fmt))
             if fmt in self._settings.recording_formats:
                 fi.setState_(1)  # NSOnState
             self._rec_fmt_menu.addItem_(fi)
@@ -148,7 +160,7 @@ class MenuBarDelegate(NSObject):
         self._trans_fmt_items = {}
         for fmt in VALID_FORMATS:
             fi = _make_item(fmt, "onToggleTransFmt:", self)
-            fi.setRepresentedObject_(fmt)
+            fi.setTag_(list(VALID_FORMATS).index(fmt))
             if fmt in self._settings.transcription_formats:
                 fi.setState_(1)
             self._trans_fmt_menu.addItem_(fi)
@@ -274,7 +286,7 @@ class MenuBarDelegate(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def onToggleRecFmt_(self, sender):
-        fmt = sender.representedObject()
+        fmt = str(sender.title())
         if fmt in self._settings.recording_formats:
             if len(self._settings.recording_formats) > 1:
                 self._settings.recording_formats.remove(fmt)
@@ -306,7 +318,7 @@ class MenuBarDelegate(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def onToggleTransFmt_(self, sender):
-        fmt = sender.representedObject()
+        fmt = str(sender.title())
         if fmt in self._settings.transcription_formats:
             if len(self._settings.transcription_formats) > 1:
                 self._settings.transcription_formats.remove(fmt)
@@ -315,6 +327,52 @@ class MenuBarDelegate(NSObject):
             self._settings.transcription_formats.append(fmt)
             sender.setState_(1)
         save_settings(self._settings)
+
+    def _build_device_menu(self):
+        """Populate the recording device submenu with available input devices."""
+        try:
+            import sounddevice as sd
+
+            self._rec_dev_menu.removeAllItems()
+            self._rec_dev_items = {}
+
+            # Default device option
+            default_item = _make_item("System Default", "onSelectDevice:", self)
+            default_item.setTag_(0)
+            if not self._settings.recording_device:
+                default_item.setState_(1)
+            self._rec_dev_menu.addItem_(default_item)
+            self._rec_dev_items[""] = default_item
+
+            self._rec_dev_menu.addItem_(NSMenuItem.separatorItem())
+
+            devs = sd.query_devices()
+            tag = 1
+            for i, d in enumerate(devs):
+                if d["max_input_channels"] > 0:
+                    name = d["name"]
+                    item = _make_item(name, "onSelectDevice:", self)
+                    item.setTag_(tag)
+                    tag += 1
+                    if name == self._settings.recording_device:
+                        item.setState_(1)
+                    self._rec_dev_menu.addItem_(item)
+                    self._rec_dev_items[name] = item
+        except Exception:
+            logger.exception("Failed to build device menu")
+
+    @objc.typedSelector(b"v@:@")
+    def onSelectDevice_(self, sender):
+        title = str(sender.title())
+        device_name = "" if title == "System Default" else title
+
+        for item in self._rec_dev_items.values():
+            item.setState_(0)
+        sender.setState_(1)
+
+        self._settings.recording_device = device_name
+        save_settings(self._settings)
+        logger.info("Recording device changed to: %s", device_name or "system default")
 
     @staticmethod
     def _format_dir_label(prefix: str, path: str) -> str:
@@ -344,19 +402,20 @@ class MenuBarDelegate(NSObject):
 
     def _meeting_worker(self):
         from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
-        from whisper_daemon.transcriber import transcribe as transcribe_audio
+        from whisper_daemon.transcriber import transcribe_full
 
         model = self._daemon._model
+        device = self._settings.recording_device or None
         chunk_queue: queue.Queue[AudioChunk | None] = queue.Queue()
-        recorder = MeetingRecorder(chunk_queue)
+        recorder = MeetingRecorder(chunk_queue, device=device)
 
-        all_results: list[tuple[float, str]] = []
+        all_results: list[tuple[float, dict]] = []
         chunk_count = 0
 
         recorder.start()
 
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 futures: dict[concurrent.futures.Future, float] = {}
 
                 while self._meeting_active:
@@ -373,12 +432,16 @@ class MenuBarDelegate(NSObject):
                     logger.info(
                         "Meeting chunk %d: %.1fs", chunk_count, chunk.duration
                     )
-                    future = pool.submit(transcribe_audio, chunk.audio, model)
+                    future = pool.submit(transcribe_full, chunk.audio, model)
                     futures[future] = chunk.start_time
                     _collect_futures(futures, all_results)
 
                 recorder.stop()
 
+                # Wait for in-flight transcription to finish FIRST
+                _collect_futures(futures, all_results, wait=True)
+
+                # Now safe to transcribe remaining chunks (no concurrent GPU access)
                 while True:
                     try:
                         chunk = chunk_queue.get_nowait()
@@ -387,11 +450,9 @@ class MenuBarDelegate(NSObject):
                     if chunk is None:
                         break
                     chunk_count += 1
-                    text = transcribe_audio(chunk.audio, model)
-                    if text:
-                        all_results.append((chunk.start_time, text))
-
-                _collect_futures(futures, all_results, wait=True)
+                    result = transcribe_full(chunk.audio, model)
+                    if result.get("text", "").strip():
+                        all_results.append((chunk.start_time, result))
 
         except Exception:
             logger.exception("Meeting recording failed")
@@ -406,9 +467,24 @@ class MenuBarDelegate(NSObject):
 
         all_results.sort(key=lambda r: r[0])
 
-        # Build merged result dict for formatters
-        merged_text = " ".join(text for _, text in all_results if text)
-        merged_result = {"text": merged_text, "segments": [], "language": ""}
+        # Merge results with timestamp-adjusted segments
+        merged_segments: list[dict] = []
+        merged_text_parts: list[str] = []
+        for start_offset, result in all_results:
+            text = result.get("text", "").strip()
+            if text:
+                merged_text_parts.append(text)
+            for seg in result.get("segments", []):
+                merged_segments.append({
+                    **seg,
+                    "start": seg["start"] + start_offset,
+                    "end": seg["end"] + start_offset,
+                })
+        merged_result = {
+            "text": " ".join(merged_text_parts),
+            "segments": merged_segments,
+            "language": all_results[0][1].get("language", "") if all_results else "",
+        }
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         rec_dir = self._settings.recording_dir_path
@@ -528,7 +604,7 @@ def _notify(title: str, subtitle: str, message: str) -> None:
 
 def _collect_futures(
     futures: dict,
-    all_results: list[tuple[float, str]],
+    all_results: list[tuple[float, dict]],
     wait: bool = False,
 ) -> None:
     """Collect completed transcription futures."""
@@ -540,9 +616,9 @@ def _collect_futures(
     for future in done_set:
         start_time = futures.pop(future)
         try:
-            text = future.result()
-            if text:
-                all_results.append((start_time, text))
+            result = future.result()
+            if result.get("text", "").strip():
+                all_results.append((start_time, result))
         except Exception as exc:
             logger.error("Chunk transcription failed: %s", exc)
 

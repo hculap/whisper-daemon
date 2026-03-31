@@ -337,7 +337,7 @@ def record(
     recorder.start()
 
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             futures: dict[concurrent.futures.Future, float] = {}
 
             while True:
@@ -363,7 +363,10 @@ def record(
         click.echo("\n\nStopping recording...")
         recorder.stop()
 
-        # Drain remaining chunks from queue
+        # Wait for in-flight transcription FIRST (avoid concurrent GPU access)
+        _collect_results(futures, all_results, wait=True)
+
+        # Now safe to transcribe remaining chunks
         while True:
             try:
                 chunk = chunk_queue.get_nowait()
@@ -376,9 +379,6 @@ def record(
             result_text = transcribe_audio(chunk.audio, model)
             if result_text:
                 all_results.append((chunk.start_time, {"text": result_text, "segments": [], "language": ""}))
-
-        # Wait for pending futures
-        _collect_results(futures, all_results, wait=True)
 
     if not all_results:
         click.echo("No audio transcribed.")

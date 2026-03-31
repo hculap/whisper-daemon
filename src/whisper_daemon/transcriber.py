@@ -63,6 +63,40 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL) -> str:
         return ""
 
 
+def transcribe_full(audio: np.ndarray, model: str = DEFAULT_MODEL) -> dict:
+    """Transcribe audio array and return the full result dict with segments.
+
+    Args:
+        audio: 1D float32 numpy array, 16kHz mono.
+        model: HuggingFace model repo ID.
+
+    Returns:
+        Dict with keys: text, segments, language.
+    """
+    if audio.size == 0:
+        return {"text": "", "segments": [], "language": ""}
+
+    try:
+        logger.info("Transcribing %.1fs of audio...", len(audio) / 16000)
+        result = mlx_whisper.transcribe(
+            audio,
+            path_or_hf_repo=model,
+            temperature=0,
+            condition_on_previous_text=False,
+            word_timestamps=False,
+        )
+        logger.info(
+            "Transcription done — lang=%s, %d chars, %d segments",
+            result.get("language", "unknown"),
+            len(result.get("text", "")),
+            len(result.get("segments", [])),
+        )
+        return result
+    except Exception:
+        logger.exception("Transcription failed")
+        return {"text": "", "segments": [], "language": ""}
+
+
 def transcribe_file(
     path: str,
     model: str = DEFAULT_MODEL,

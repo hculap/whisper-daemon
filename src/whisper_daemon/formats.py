@@ -2,6 +2,8 @@
 
 import json
 
+COMPACT_STRIP_KEYS = {"tokens", "seek", "compression_ratio", "temperature", "avg_logprob", "no_speech_prob"}
+
 
 def to_txt(result: dict) -> str:
     return result.get("text", "").strip()
@@ -34,7 +36,27 @@ def to_vtt(result: dict) -> str:
 
 
 def to_json(result: dict) -> str:
-    return json.dumps(result, ensure_ascii=False, indent=2)
+    cleaned = _strip_segments(result)
+    return json.dumps(cleaned, ensure_ascii=False, indent=2)
+
+
+def _strip_segments(result: dict) -> dict:
+    """Strip verbose keys (tokens, seek, etc.) from segments for compact output."""
+    segments = result.get("segments", [])
+    compact_segments = [
+        {
+            "id": seg.get("id"),
+            "start": seg["start"],
+            "end": seg["end"],
+            "text": seg["text"].strip(),
+        }
+        for seg in segments
+    ]
+    return {
+        "text": result.get("text", "").strip(),
+        "segments": compact_segments,
+        "language": result.get("language", ""),
+    }
 
 
 FORMATTERS = {

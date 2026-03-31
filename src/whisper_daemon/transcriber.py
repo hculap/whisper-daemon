@@ -85,6 +85,11 @@ def transcribe_full(audio: np.ndarray, model: str = DEFAULT_MODEL) -> dict:
             condition_on_previous_text=False,
             word_timestamps=False,
         )
+        # Strip leading whitespace from segment texts
+        for seg in result.get("segments", []):
+            seg["text"] = seg["text"].strip()
+        result["text"] = result.get("text", "").strip()
+
         logger.info(
             "Transcription done — lang=%s, %d chars, %d segments",
             result.get("language", "unknown"),

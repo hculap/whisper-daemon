@@ -268,7 +268,7 @@ def transcribe(
 @click.option("--format", "formats", default="txt", help="Output formats, comma-separated: txt,srt,vtt,json.")
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
 @click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
-@click.option("--chunk-silence", default=2.0, type=float, help="Seconds of silence to split chunks (default: 2.0).")
+@click.option("--chunk-silence", default=1.0, type=float, help="Seconds of silence to split chunks.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def record(
     output: str,

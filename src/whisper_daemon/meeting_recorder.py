@@ -17,8 +17,9 @@ CHANNELS = 1
 DTYPE = "float32"
 BLOCK_SIZE = 512
 VAD_THRESHOLD = 0.5
-DEFAULT_CHUNK_SILENCE = 2.0
-MAX_CHUNK_SEC = 120  # Force split after 2min to keep chunks manageable
+DEFAULT_CHUNK_SILENCE = 1.0
+MAX_CHUNK_SEC = 30
+OVERLAP_SEC = 2.0  # seconds of audio overlap between chunks
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,8 @@ class MeetingRecorder:
     """Records audio continuously and splits into chunks at natural pauses.
 
     Chunks are emitted to a queue for parallel transcription while
-    recording continues.
+    recording continues. Adjacent chunks overlap by OVERLAP_SEC to
+    preserve context at boundaries.
     """
 
     def __init__(
@@ -90,7 +92,7 @@ class MeetingRecorder:
             self._stream.close()
             self._stream = None
 
-        self._emit_chunk()
+        self._emit_chunk(is_final=True)
         self._chunk_queue.put(None)  # sentinel: no more chunks
         self._vad.reset_states()
 
@@ -131,7 +133,7 @@ class MeetingRecorder:
                 logger.info("Pause detected (%.1fs silence), splitting chunk", self._chunk_silence)
                 self._emit_chunk()
 
-    def _emit_chunk(self) -> None:
+    def _emit_chunk(self, is_final: bool = False) -> None:
         """Concatenate accumulated frames and put chunk on queue."""
         if not self._frames:
             return
@@ -154,8 +156,16 @@ class MeetingRecorder:
             chunk.start_time, chunk.duration,
         )
 
-        self._chunk_start += duration
-        self._frames = []
+        # Keep overlap samples for next chunk (preserves context at boundary)
+        overlap_samples = int(OVERLAP_SEC * SAMPLE_RATE)
+        if not is_final and len(audio) > overlap_samples:
+            overlap_audio = audio[-overlap_samples:]
+            self._frames = [overlap_audio.reshape(-1, 1)]
+            self._chunk_start += duration - OVERLAP_SEC
+        else:
+            self._frames = []
+            self._chunk_start += duration
+
         self._voice_detected_in_chunk = False
         self._silence_start = None
         self._vad.reset_states()

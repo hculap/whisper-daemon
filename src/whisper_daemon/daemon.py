@@ -6,6 +6,8 @@ import threading
 import time
 from enum import Enum, auto
 
+import numpy as np
+
 from whisper_daemon.events import Event, EventType
 from whisper_daemon.paster import paste_text
 from whisper_daemon.recorder import AudioRecorder
@@ -13,6 +15,8 @@ from whisper_daemon.sounds import play_error, play_start, play_stop
 from whisper_daemon.transcriber import transcribe
 
 logger = logging.getLogger(__name__)
+
+GPU_WARMUP_INTERVAL = 60.0  # seconds between idle GPU warm-ups
 
 
 class State(Enum):
@@ -39,6 +43,14 @@ class Daemon:
         self._history: list[str] = []
         self._max_history = 5
 
+        # Progressive transcription state
+        self._pending_text: str = ""
+        self._pending_samples: int = 0
+        self._preview_thread: threading.Thread | None = None
+
+        # GPU warm-up
+        self._last_transcription_time: float = time.monotonic()
+
     @property
     def history(self) -> list[str]:
         return list(self._history)
@@ -61,6 +73,7 @@ class Daemon:
             try:
                 event = self._queue.get(timeout=0.5)
             except queue.Empty:
+                self._maybe_warmup_gpu()
                 continue
 
             self._handle_event(event)
@@ -73,6 +86,8 @@ class Daemon:
             self._handle_toggle()
         elif event.type == EventType.RECORD_STOP:
             self._handle_record_stop()
+        elif event.type == EventType.TRANSCRIBE_PREVIEW:
+            self._handle_preview()
         elif event.type == EventType.TRANSCRIPTION_DONE:
             self._handle_transcription_done(event.payload)
         elif event.type == EventType.PASTE_LAST:
@@ -84,6 +99,8 @@ class Daemon:
         if self._state == State.IDLE:
             self._state = State.RECORDING
             self._recording_started_at = time.monotonic()
+            self._pending_text = ""
+            self._pending_samples = 0
             self._recorder.start_recording()
             play_start()
             logger.info("State: IDLE -> RECORDING")
@@ -100,6 +117,38 @@ class Daemon:
         if self._state == State.RECORDING:
             self._start_transcription()
 
+    def _handle_preview(self) -> None:
+        """Snapshot audio buffer and transcribe in background while recording continues."""
+        if self._state != State.RECORDING:
+            return
+
+        # Don't start a new preview if previous is still running
+        if self._preview_thread is not None and self._preview_thread.is_alive():
+            return
+
+        audio, total_samples = self._recorder.get_audio_snapshot()
+        if audio.size == 0:
+            return
+
+        logger.info("Preview: transcribing %.1fs snapshot", len(audio) / 16000)
+        self._preview_thread = threading.Thread(
+            target=self._preview_worker,
+            args=(audio, total_samples),
+            daemon=True,
+        )
+        self._preview_thread.start()
+
+    def _preview_worker(self, audio: np.ndarray, total_samples: int) -> None:
+        """Transcribe a snapshot of the audio buffer."""
+        try:
+            text = transcribe(audio, model=self._model)
+            self._pending_text = text
+            self._pending_samples = total_samples
+            self._last_transcription_time = time.monotonic()
+            logger.info("Preview done: %d chars", len(text))
+        except Exception:
+            logger.exception("Preview transcription failed")
+
     def _start_transcription(self) -> None:
         self._state = State.TRANSCRIBING
         audio = self._recorder.stop_recording()
@@ -111,6 +160,19 @@ class Daemon:
             self._queue.put(Event(EventType.TRANSCRIPTION_DONE, ""))
             return
 
+        # If we have a recent preview and audio hasn't grown much since, use it
+        new_samples = len(audio) - self._pending_samples
+        new_seconds = new_samples / 16000
+        if self._pending_text and new_seconds < 1.5:
+            logger.info(
+                "Using preview result (%.1fs new audio since preview, skipping re-transcription)",
+                new_seconds,
+            )
+            self._queue.put(Event(EventType.TRANSCRIPTION_DONE, self._pending_text))
+            self._last_transcription_time = time.monotonic()
+            return
+
+        # Full transcription needed
         thread = threading.Thread(
             target=self._transcribe_worker,
             args=(audio,),
@@ -118,9 +180,10 @@ class Daemon:
         )
         thread.start()
 
-    def _transcribe_worker(self, audio: object) -> None:
+    def _transcribe_worker(self, audio: np.ndarray) -> None:
         try:
             text = transcribe(audio, model=self._model)
+            self._last_transcription_time = time.monotonic()
             self._queue.put(Event(EventType.TRANSCRIPTION_DONE, text))
         except Exception as exc:
             logger.exception("Transcription worker failed")
@@ -135,6 +198,8 @@ class Daemon:
         else:
             logger.info("Empty transcription, nothing to paste")
 
+        self._pending_text = ""
+        self._pending_samples = 0
         self._state = State.IDLE
         logger.info("State: TRANSCRIBING -> IDLE")
 
@@ -150,8 +215,27 @@ class Daemon:
         logger.error("Error: %s", message)
         if self._state == State.RECORDING:
             self._recorder.stop_recording()
+        self._pending_text = ""
+        self._pending_samples = 0
         self._state = State.IDLE
         logger.info("State: -> IDLE (error recovery)")
+
+    def _maybe_warmup_gpu(self) -> None:
+        """Keep Metal GPU warm with periodic dummy inference."""
+        if self._state != State.IDLE:
+            return
+        elapsed = time.monotonic() - self._last_transcription_time
+        if elapsed < GPU_WARMUP_INTERVAL:
+            return
+        self._last_transcription_time = time.monotonic()
+        threading.Thread(target=self._gpu_warmup, daemon=True).start()
+
+    def _gpu_warmup(self) -> None:
+        try:
+            transcribe(np.zeros(8000, dtype=np.float32), model=self._model)
+            logger.debug("GPU warm-up done")
+        except Exception:
+            pass
 
     def _cleanup(self) -> None:
         if self._state == State.RECORDING:

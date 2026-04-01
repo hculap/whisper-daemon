@@ -17,7 +17,10 @@ DTYPE = "float32"
 BLOCK_SIZE = 512  # Matches Silero VAD expected chunk size (32ms at 16kHz)
 MAX_RECORDING_SEC = 120
 VAD_THRESHOLD = 0.5
-DEFAULT_SILENCE_SEC = 1.5
+RMS_SILENCE_FLOOR = 0.005  # Below this RMS = definitely silence, skip VAD
+DEFAULT_SILENCE_SEC = 0.7
+PREVIEW_START_SEC = 2.0  # Start previews after 2s of voice
+PREVIEW_INTERVAL_SEC = 3.0  # Send preview every 3s
 
 
 class AudioRecorder:
@@ -42,6 +45,8 @@ class AudioRecorder:
         self._silence_start: float | None = None
         self._recording_start: float = 0.0
         self._recording = False
+        self._last_preview_time: float = 0.0
+        self._last_preview_samples: int = 0
 
     def start_recording(self) -> None:
         """Start capturing audio."""
@@ -50,6 +55,8 @@ class AudioRecorder:
         self._silence_start = None
         self._recording_start = time.monotonic()
         self._recording = True
+        self._last_preview_time = 0.0
+        self._last_preview_samples = 0
         self._vad.reset_states()
 
         self._stream = sd.InputStream(
@@ -83,6 +90,16 @@ class AudioRecorder:
         logger.info("Recording stopped — %.1fs of audio", len(audio) / SAMPLE_RATE)
         return audio
 
+    def get_audio_snapshot(self) -> tuple[np.ndarray, int]:
+        """Get a copy of the current audio buffer without stopping recording.
+
+        Returns (audio_array, total_samples) for progressive transcription.
+        """
+        if not self._chunks:
+            return np.array([], dtype=np.float32), 0
+        audio = np.concatenate(self._chunks, axis=0).squeeze()
+        return audio, len(audio)
+
     def _audio_callback(
         self,
         indata: np.ndarray,
@@ -109,7 +126,13 @@ class AudioRecorder:
             self._queue.put(Event(EventType.RECORD_STOP))
             return
 
-        speech_prob = self._vad(mono[:, 0].copy())
+        # RMS energy pre-filter: skip VAD for obviously silent frames
+        samples = mono[:, 0]
+        rms = np.sqrt(np.mean(samples ** 2))
+        if rms < RMS_SILENCE_FLOOR:
+            speech_prob = 0.0
+        else:
+            speech_prob = self._vad(samples.copy())
 
         now = time.monotonic()
 
@@ -122,6 +145,17 @@ class AudioRecorder:
             elif now - self._silence_start >= self._silence_timeout:
                 logger.info("VAD: silence detected (%.1fs)", self._silence_timeout)
                 self._queue.put(Event(EventType.RECORD_STOP))
+                return
+
+        # Progressive transcription: emit preview snapshots while recording
+        if self._voice_detected and elapsed > PREVIEW_START_SEC:
+            time_since_preview = now - self._last_preview_time
+            if self._last_preview_time == 0.0 or time_since_preview >= PREVIEW_INTERVAL_SEC:
+                total_samples = sum(c.shape[0] for c in self._chunks)
+                if total_samples > self._last_preview_samples:
+                    self._last_preview_time = now
+                    self._last_preview_samples = total_samples
+                    self._queue.put(Event(EventType.TRANSCRIBE_PREVIEW))
 
 
 def _detect_channels(device: str | int | None) -> int:

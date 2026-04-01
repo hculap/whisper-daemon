@@ -17,8 +17,9 @@ CHANNELS = 1
 DTYPE = "float32"
 BLOCK_SIZE = 512
 VAD_THRESHOLD = 0.5
+RMS_SILENCE_FLOOR = 0.005  # Below this RMS = definitely silence, skip VAD
 DEFAULT_CHUNK_SILENCE = 1.0
-MAX_CHUNK_SEC = 30
+MAX_CHUNK_SEC = 20
 OVERLAP_SEC = 2.0  # seconds of audio overlap between chunks
 
 
@@ -129,7 +130,12 @@ class MeetingRecorder:
             self._emit_chunk()
             return
 
-        speech_prob = self._vad(mono[:, 0].copy())
+        samples = mono[:, 0]
+        rms = np.sqrt(np.mean(samples ** 2))
+        if rms < RMS_SILENCE_FLOOR:
+            speech_prob = 0.0
+        else:
+            speech_prob = self._vad(samples.copy())
         now = time.monotonic()
 
         if speech_prob > VAD_THRESHOLD:

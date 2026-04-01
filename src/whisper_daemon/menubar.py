@@ -543,11 +543,14 @@ class MenuBarDelegate(NSObject):
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 futures: dict[concurrent.futures.Future, float] = {}
 
+                partial_path = rec_dir / "transcript_live.txt"
+
                 while self._meeting_active:
                     try:
                         chunk = chunk_queue.get(timeout=0.5)
                     except queue.Empty:
-                        _collect_futures(futures, all_results)
+                        if _collect_futures(futures, all_results):
+                            _write_partial(partial_path, all_results)
                         continue
 
                     if chunk is None:
@@ -569,7 +572,8 @@ class MenuBarDelegate(NSObject):
                         return result
                     future = pool.submit(_transcribe_and_track, chunk.audio, model, cn)
                     futures[future] = chunk.start_time
-                    _collect_futures(futures, all_results)
+                    if _collect_futures(futures, all_results):
+                        _write_partial(partial_path, all_results)
 
                 recorder.stop()
                 if screen_capture is not None:
@@ -643,6 +647,10 @@ class MenuBarDelegate(NSObject):
         screenshots_msg = ""
         if screen_capture is not None and screen_capture.saved_count > 0:
             screenshots_msg = f", {screen_capture.saved_count} screenshots"
+
+        # Remove live partial now that final transcript exists
+        partial_path = rec_dir / "transcript_live.txt"
+        partial_path.unlink(missing_ok=True)
 
         telemetry.meeting_stop(chunk_count, str(rec_dir))
         logger.info("Meeting saved: %s", ", ".join(written))
@@ -763,21 +771,34 @@ def _collect_futures(
     futures: dict,
     all_results: list[tuple[float, dict]],
     wait: bool = False,
-) -> None:
-    """Collect completed transcription futures."""
+) -> bool:
+    """Collect completed transcription futures. Returns True if any were collected."""
     if wait and futures:
         done_set, _ = concurrent.futures.wait(futures.keys())
     else:
         done_set = {f for f in futures if f.done()}
 
+    collected = False
     for future in done_set:
         start_time = futures.pop(future)
         try:
             result = future.result()
             if result.get("text", "").strip():
                 all_results.append((start_time, result))
+                collected = True
         except Exception as exc:
             logger.error("Chunk transcription failed: %s", exc)
+    return collected
+
+
+def _write_partial(path: Path, results: list[tuple[float, dict]]) -> None:
+    """Write current transcript-so-far to a live file."""
+    sorted_results = sorted(results, key=lambda r: r[0])
+    text = " ".join(r.get("text", "").strip() for _, r in sorted_results if r.get("text", "").strip())
+    try:
+        path.write_text(text, encoding="utf-8")
+    except Exception:
+        pass
 
 
 def run_with_menubar(daemon: object, hotkey_listener: object) -> None:

@@ -351,7 +351,7 @@ def transcribe(
 @click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
 @click.option("--chunk-silence", default=1.0, type=float, help="Seconds of silence to split chunks.")
 @click.option("--diarize", is_flag=True, help="Enable speaker diarization (requires HF_TOKEN).")
-@click.option("--diarize-mode", type=click.Choice(["batch", "realtime", "hybrid"]), default="batch", help="Diarization approach.")
+@click.option("--diarize-mode", type=click.Choice(["batch", "realtime", "hybrid"]), default="hybrid", help="Diarization approach.")
 @click.option("--num-speakers", type=int, default=None, help="Expected number of speakers (improves diarization).")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def record(
@@ -375,7 +375,7 @@ def record(
     Examples:
       whisper-daemon record                                   # → recording.txt
       whisper-daemon record meeting.txt --format txt,srt
-      whisper-daemon record meeting.txt --diarize             # batch diarization
+      whisper-daemon record meeting.txt --diarize             # hybrid (default)
       whisper-daemon record meeting.txt --diarize --diarize-mode realtime
       whisper-daemon record meeting.txt --device "BlackHole 2ch"
       whisper-daemon record meeting.txt --device 3            # by device index
@@ -500,39 +500,21 @@ def record(
     if diarize:
         from whisper_daemon.diarize_merge import merge_speakers_with_transcript
 
-        if diarize_mode == "batch" or diarize_mode == "hybrid":
+        if diarize_mode in ("batch", "hybrid"):
             from whisper_daemon.diarizer import diarize_batch
 
             full_audio = _concatenate_audio_chunks(all_audio_chunks)
-            click.echo(f"\nDiarizing {len(full_audio) / 16000:.1f}s of audio (batch)...")
+            click.echo(f"\nDiarizing {len(full_audio) / 16000:.1f}s of audio (batch correction)...")
             batch_segments = diarize_batch(full_audio, num_speakers=num_speakers)
-            batch_result = merge_speakers_with_transcript(batch_segments, merged)
-            speaker_count = len(batch_result.get("speakers", []))
+            final_result = merge_speakers_with_transcript(batch_segments, merged)
+            speaker_count = len(final_result.get("speakers", []))
             click.echo(f"Found {speaker_count} speaker(s)")
 
-            if diarize_mode == "hybrid" and speaker_tracker is not None:
-                # Output both for comparison
-                rt_segments = speaker_tracker.get_all_segments()
-                rt_result = merge_speakers_with_transcript(rt_segments, merged)
-
-                for fmt in format_list:
-                    # Batch output
-                    ext_path = output_dir / f"{output_stem}_batch.{fmt}"
-                    content = FORMATTERS[fmt](batch_result)
-                    ext_path.write_text(content, encoding="utf-8")
-                    click.echo(f"  → {ext_path}")
-
-                    # Realtime output
-                    ext_path = output_dir / f"{output_stem}_realtime.{fmt}"
-                    content = FORMATTERS[fmt](rt_result)
-                    ext_path.write_text(content, encoding="utf-8")
-                    click.echo(f"  → {ext_path}")
-            else:
-                for fmt in format_list:
-                    ext_path = output_dir / f"{output_stem}.{fmt}"
-                    content = FORMATTERS[fmt](batch_result)
-                    ext_path.write_text(content, encoding="utf-8")
-                    click.echo(f"  → {ext_path}")
+            for fmt in format_list:
+                ext_path = output_dir / f"{output_stem}.{fmt}"
+                content = FORMATTERS[fmt](final_result)
+                ext_path.write_text(content, encoding="utf-8")
+                click.echo(f"  → {ext_path}")
 
         elif diarize_mode == "realtime" and speaker_tracker is not None:
             rt_segments = speaker_tracker.get_all_segments()

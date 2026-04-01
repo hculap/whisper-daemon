@@ -72,3 +72,65 @@ def flush() -> None:
         logger.debug("Failed to write telemetry")
 
     _current = {}
+
+
+# -- Meeting telemetry --
+
+_meeting: dict = {}
+_meeting_chunks: list[dict] = []
+
+
+def meeting_start() -> None:
+    """Start tracking a meeting recording session."""
+    global _meeting, _meeting_chunks
+    _meeting = {"type": "meeting", "start": time.time(), "start_mono": time.monotonic()}
+    _meeting_chunks = []
+
+
+def meeting_chunk_queued(chunk_num: int, audio_sec: float, start_time: float) -> None:
+    """Record when a chunk is emitted from recorder."""
+    _meeting_chunks.append({
+        "chunk": chunk_num,
+        "audio_sec": round(audio_sec, 1),
+        "chunk_start_sec": round(start_time, 1),
+        "queued_at": time.monotonic(),
+    })
+
+
+def meeting_chunk_transcribed(chunk_num: int, chars: int, segments: int) -> None:
+    """Record when a chunk finishes transcription."""
+    for c in _meeting_chunks:
+        if c["chunk"] == chunk_num and "transcribed_at" not in c:
+            c["transcribed_at"] = time.monotonic()
+            c["chars"] = chars
+            c["segments"] = segments
+            c["transcribe_sec"] = round(c["transcribed_at"] - c["queued_at"], 3)
+            break
+
+
+def meeting_stop(chunks_total: int, output_dir: str) -> None:
+    """Finalize and write meeting telemetry."""
+    if not _meeting:
+        return
+
+    now = time.monotonic()
+    _meeting["stop"] = time.time()
+    _meeting["duration_total_s"] = round(now - _meeting["start_mono"], 1)
+    _meeting["chunks_total"] = chunks_total
+    _meeting["output_dir"] = output_dir
+    _meeting["chunks"] = _meeting_chunks
+
+    # Summary stats
+    transcribe_times = [c["transcribe_sec"] for c in _meeting_chunks if "transcribe_sec" in c]
+    if transcribe_times:
+        _meeting["transcribe_avg_s"] = round(sum(transcribe_times) / len(transcribe_times), 3)
+        _meeting["transcribe_max_s"] = round(max(transcribe_times), 3)
+
+    audio_total = sum(c.get("audio_sec", 0) for c in _meeting_chunks)
+    _meeting["audio_total_s"] = round(audio_total, 1)
+
+    try:
+        with open(TELEMETRY_FILE, "a") as f:
+            f.write(json.dumps(_meeting, default=str) + "\n")
+    except Exception:
+        logger.debug("Failed to write meeting telemetry")

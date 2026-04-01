@@ -509,6 +509,7 @@ class MenuBarDelegate(NSObject):
         logger.info("Meeting recording stop requested from menu bar")
 
     def _meeting_worker(self):
+        from whisper_daemon import telemetry
         from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
         from whisper_daemon.screen_capture import ScreenCapture
         from whisper_daemon.transcriber import transcribe_full
@@ -535,6 +536,7 @@ class MenuBarDelegate(NSObject):
             screen_capture.start()
 
         self._daemon._gpu_busy = True
+        telemetry.meeting_start()
         recorder.start()
 
         try:
@@ -555,9 +557,17 @@ class MenuBarDelegate(NSObject):
                     logger.info(
                         "Meeting chunk %d: %.1fs", chunk_count, chunk.duration
                     )
+                    telemetry.meeting_chunk_queued(chunk_count, chunk.duration, chunk.start_time)
                     if self._settings.save_audio:
                         all_audio.append(chunk.audio.copy())
-                    future = pool.submit(transcribe_full, chunk.audio, model)
+                    cn = chunk_count  # capture for closure
+                    def _transcribe_and_track(audio, m, n):
+                        result = transcribe_full(audio, m)
+                        segs = len(result.get("segments", []))
+                        chars = len(result.get("text", ""))
+                        telemetry.meeting_chunk_transcribed(n, chars, segs)
+                        return result
+                    future = pool.submit(_transcribe_and_track, chunk.audio, model, cn)
                     futures[future] = chunk.start_time
                     _collect_futures(futures, all_results)
 
@@ -634,6 +644,7 @@ class MenuBarDelegate(NSObject):
         if screen_capture is not None and screen_capture.saved_count > 0:
             screenshots_msg = f", {screen_capture.saved_count} screenshots"
 
+        telemetry.meeting_stop(chunk_count, str(rec_dir))
         logger.info("Meeting saved: %s", ", ".join(written))
         _notify(
             "whisper-daemon",

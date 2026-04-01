@@ -158,6 +158,12 @@ class Daemon:
         self._state = State.TRANSCRIBING
         audio = self._recorder.stop_recording()
         play_stop()
+
+        # Wait for any in-flight preview to finish (avoid concurrent GPU access)
+        if self._preview_thread is not None and self._preview_thread.is_alive():
+            logger.info("Waiting for preview to finish before final transcription...")
+            self._preview_thread.join(timeout=5.0)
+
         telemetry.mark("record_stop", audio_sec=round(len(audio) / 16000, 1) if audio.size > 0 else 0)
         logger.info("State: RECORDING -> TRANSCRIBING")
 
@@ -169,7 +175,7 @@ class Daemon:
         # If we have a recent preview and audio hasn't grown much since, use it
         new_samples = len(audio) - self._pending_samples
         new_seconds = new_samples / 16000
-        if self._pending_text and new_seconds < 1.5:
+        if self._pending_text and new_seconds < 2.5:
             telemetry.mark("transcribe_start", mode="preview_cached", new_audio_sec=round(new_seconds, 1))
             telemetry.mark("transcribe_done", chars=len(self._pending_text))
             logger.info(

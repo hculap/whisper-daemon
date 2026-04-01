@@ -25,7 +25,7 @@ def cli(ctx: click.Context) -> None:
 
 @cli.command()
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
-@click.option("--silence-timeout", default=1.5, type=float, help="Seconds of silence before auto-stop.")
+@click.option("--silence-timeout", default=0.7, type=float, help="Seconds of silence before auto-stop.")
 @click.option("--no-menubar", is_flag=True, help="Run without menu bar icon.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def start(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> None:
@@ -116,7 +116,7 @@ def status() -> None:
 
 @cli.command()
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
-@click.option("--silence-timeout", default=1.5, type=float, help="Seconds of silence before auto-stop.")
+@click.option("--silence-timeout", default=0.7, type=float, help="Seconds of silence before auto-stop.")
 @click.option("--no-menubar", is_flag=True, help="Run without menu bar icon.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> None:

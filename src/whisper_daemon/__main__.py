@@ -258,6 +258,8 @@ AUDIO_VIDEO_EXTENSIONS = {
 @click.option("--output-dir", type=click.Path(), default=None, help="Output directory (default: same as input).")
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
 @click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
+@click.option("--diarize", is_flag=True, help="Enable speaker diarization (requires HF_TOKEN).")
+@click.option("--num-speakers", type=int, default=None, help="Expected number of speakers (improves diarization).")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def transcribe(
     paths: tuple[str, ...],
@@ -265,6 +267,8 @@ def transcribe(
     output_dir: str | None,
     model: str,
     language: str | None,
+    diarize: bool,
+    num_speakers: int | None,
     verbose: bool,
 ) -> None:
     """Transcribe audio/video files to text, SRT, VTT, or JSON.
@@ -276,7 +280,7 @@ def transcribe(
     Examples:
       whisper-daemon transcribe meeting.mp3
       whisper-daemon transcribe meeting.mp3 --format srt
-      whisper-daemon transcribe meeting.mp3 --format txt,srt,json
+      whisper-daemon transcribe meeting.mp3 --diarize --format txt,json
       whisper-daemon transcribe ./recordings/
       whisper-daemon transcribe video.mp4 --output-dir ./out
     """
@@ -303,6 +307,8 @@ def transcribe(
     click.echo(f"Model: {model}")
     click.echo(f"Files: {len(files)}")
     click.echo(f"Formats: {', '.join(format_list)}")
+    if diarize:
+        click.echo("Diarization: enabled")
     click.echo()
 
     preload_model(model)
@@ -314,6 +320,16 @@ def transcribe(
         except Exception as exc:
             click.echo(f"  ERROR: {exc}")
             continue
+
+        if diarize:
+            from whisper_daemon.diarizer import diarize_file as run_diarization
+            from whisper_daemon.diarize_merge import merge_speakers_with_transcript
+
+            click.echo("  Diarizing speakers...")
+            speaker_segments = run_diarization(str(file_path), num_speakers=num_speakers)
+            result = merge_speakers_with_transcript(speaker_segments, result)
+            speaker_count = len(result.get("speakers", []))
+            click.echo(f"  Found {speaker_count} speaker(s)")
 
         dest_dir = out_dir or file_path.parent
         stem = file_path.stem
@@ -334,6 +350,9 @@ def transcribe(
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
 @click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
 @click.option("--chunk-silence", default=1.0, type=float, help="Seconds of silence to split chunks.")
+@click.option("--diarize", is_flag=True, help="Enable speaker diarization (requires HF_TOKEN).")
+@click.option("--diarize-mode", type=click.Choice(["batch", "realtime", "hybrid"]), default="batch", help="Diarization approach.")
+@click.option("--num-speakers", type=int, default=None, help="Expected number of speakers (improves diarization).")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def record(
     output: str,
@@ -342,6 +361,9 @@ def record(
     model: str,
     language: str | None,
     chunk_silence: float,
+    diarize: bool,
+    diarize_mode: str,
+    num_speakers: int | None,
     verbose: bool,
 ) -> None:
     """Record and transcribe a live meeting or long audio session.
@@ -353,6 +375,8 @@ def record(
     Examples:
       whisper-daemon record                                   # → recording.txt
       whisper-daemon record meeting.txt --format txt,srt
+      whisper-daemon record meeting.txt --diarize             # batch diarization
+      whisper-daemon record meeting.txt --diarize --diarize-mode realtime
       whisper-daemon record meeting.txt --device "BlackHole 2ch"
       whisper-daemon record meeting.txt --device 3            # by device index
     """
@@ -388,14 +412,23 @@ def record(
     click.echo(f"Device: {device or 'system default'}")
     click.echo(f"Chunk silence: {chunk_silence}s")
     click.echo(f"Output: {output_path}")
+    if diarize:
+        click.echo(f"Diarization: {diarize_mode}")
     click.echo()
 
     preload_model(model)
+
+    # Set up realtime speaker tracker if needed
+    speaker_tracker = None
+    if diarize and diarize_mode in ("realtime", "hybrid"):
+        from whisper_daemon.diarizer import SpeakerTracker
+        speaker_tracker = SpeakerTracker()
 
     chunk_queue: queue_mod.Queue[AudioChunk | None] = queue_mod.Queue()
     recorder = MeetingRecorder(chunk_queue, device=resolved_device, chunk_silence=chunk_silence)
 
     all_results: list[tuple[float, dict]] = []  # (start_time, result)
+    all_audio_chunks: list[tuple[float, np.ndarray]] = []  # for batch diarization
     chunk_count = 0
 
     click.echo("Recording... press Ctrl+C to stop.\n")
@@ -417,6 +450,14 @@ def record(
 
             chunk_count += 1
             click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
+
+            if diarize:
+                all_audio_chunks.append((chunk.start_time, chunk.audio.copy()))
+
+            if speaker_tracker is not None:
+                rt_segments = speaker_tracker.identify(chunk.audio, chunk.start_time)
+                if rt_segments:
+                    click.echo(f"    → Speaker {rt_segments[0].speaker + 1}")
 
             future = pool.submit(transcribe_audio, chunk.audio, model)
             futures[future] = chunk.start_time
@@ -440,6 +481,10 @@ def record(
                 break
             chunk_count += 1
             click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
+            if diarize:
+                all_audio_chunks.append((chunk.start_time, chunk.audio.copy()))
+            if speaker_tracker is not None:
+                speaker_tracker.identify(chunk.audio, chunk.start_time)
             result_text = transcribe_audio(chunk.audio, model)
             if result_text:
                 all_results.append((chunk.start_time, {"text": result_text, "segments": [], "language": ""}))
@@ -452,13 +497,61 @@ def record(
 
     merged = _merge_results(all_results)
 
-    for fmt in format_list:
-        ext_path = output_dir / f"{output_stem}.{fmt}"
-        content = FORMATTERS[fmt](merged)
-        ext_path.write_text(content, encoding="utf-8")
-        click.echo(f"  → {ext_path}")
+    if diarize:
+        from whisper_daemon.diarize_merge import merge_speakers_with_transcript
 
-    total_duration = sum(r[0] for r in all_results) if not all_results else max(r[0] for r in all_results)
+        if diarize_mode == "batch" or diarize_mode == "hybrid":
+            from whisper_daemon.diarizer import diarize_batch
+
+            full_audio = _concatenate_audio_chunks(all_audio_chunks)
+            click.echo(f"\nDiarizing {len(full_audio) / 16000:.1f}s of audio (batch)...")
+            batch_segments = diarize_batch(full_audio, num_speakers=num_speakers)
+            batch_result = merge_speakers_with_transcript(batch_segments, merged)
+            speaker_count = len(batch_result.get("speakers", []))
+            click.echo(f"Found {speaker_count} speaker(s)")
+
+            if diarize_mode == "hybrid" and speaker_tracker is not None:
+                # Output both for comparison
+                rt_segments = speaker_tracker.get_all_segments()
+                rt_result = merge_speakers_with_transcript(rt_segments, merged)
+
+                for fmt in format_list:
+                    # Batch output
+                    ext_path = output_dir / f"{output_stem}_batch.{fmt}"
+                    content = FORMATTERS[fmt](batch_result)
+                    ext_path.write_text(content, encoding="utf-8")
+                    click.echo(f"  → {ext_path}")
+
+                    # Realtime output
+                    ext_path = output_dir / f"{output_stem}_realtime.{fmt}"
+                    content = FORMATTERS[fmt](rt_result)
+                    ext_path.write_text(content, encoding="utf-8")
+                    click.echo(f"  → {ext_path}")
+            else:
+                for fmt in format_list:
+                    ext_path = output_dir / f"{output_stem}.{fmt}"
+                    content = FORMATTERS[fmt](batch_result)
+                    ext_path.write_text(content, encoding="utf-8")
+                    click.echo(f"  → {ext_path}")
+
+        elif diarize_mode == "realtime" and speaker_tracker is not None:
+            rt_segments = speaker_tracker.get_all_segments()
+            rt_result = merge_speakers_with_transcript(rt_segments, merged)
+            speaker_count = len(rt_result.get("speakers", []))
+            click.echo(f"\nFound {speaker_count} speaker(s) (realtime)")
+
+            for fmt in format_list:
+                ext_path = output_dir / f"{output_stem}.{fmt}"
+                content = FORMATTERS[fmt](rt_result)
+                ext_path.write_text(content, encoding="utf-8")
+                click.echo(f"  → {ext_path}")
+    else:
+        for fmt in format_list:
+            ext_path = output_dir / f"{output_stem}.{fmt}"
+            content = FORMATTERS[fmt](merged)
+            ext_path.write_text(content, encoding="utf-8")
+            click.echo(f"  → {ext_path}")
+
     click.echo(f"\nDone — {chunk_count} chunks, {len(merged.get('segments', []))} segments.")
 
 
@@ -488,6 +581,32 @@ def _merge_results(results: list[tuple[float, dict]]) -> dict:
     """Merge chunk results into a single result dict with adjusted timestamps."""
     from whisper_daemon.formats import merge_chunk_results
     return merge_chunk_results(results)
+
+
+def _concatenate_audio_chunks(chunks: list[tuple[float, "np.ndarray"]]) -> "np.ndarray":
+    """Concatenate audio chunks into a single continuous array.
+
+    Chunks may overlap; places each chunk at its start_time offset
+    to reconstruct the original timeline.
+    """
+    import numpy as np
+
+    if not chunks:
+        return np.array([], dtype=np.float32)
+
+    sorted_chunks = sorted(chunks, key=lambda c: c[0])
+    last_start, last_audio = sorted_chunks[-1]
+    total_samples = int((last_start + len(last_audio) / 16000) * 16000) + 1
+    full_audio = np.zeros(total_samples, dtype=np.float32)
+
+    for start_time, audio in sorted_chunks:
+        offset = int(start_time * 16000)
+        end = offset + len(audio)
+        if end > len(full_audio):
+            full_audio = np.pad(full_audio, (0, end - len(full_audio)))
+        full_audio[offset:end] = audio
+
+    return full_audio
 
 
 def _collect_files(paths: tuple[str, ...]) -> list[Path]:

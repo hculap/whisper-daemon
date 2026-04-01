@@ -24,6 +24,8 @@ class Settings:
     screenshot_event_triggers: bool = True  # capture on keyboard/mouse/scroll
     screenshot_debounce: float = 2.0  # seconds after last event before capture
     screenshot_cooldown: float = 5.0  # minimum seconds between captures
+    diarize: bool = False  # enable speaker diarization for meeting recordings
+    diarize_mode: str = "hybrid"  # batch, realtime, or hybrid
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
 
@@ -60,6 +62,8 @@ def load_settings() -> Settings:
             screenshot_event_triggers=rec.get("screenshot_event_triggers", True),
             screenshot_debounce=rec.get("screenshot_debounce", 2.0),
             screenshot_cooldown=rec.get("screenshot_cooldown", 5.0),
+            diarize=rec.get("diarize", False),
+            diarize_mode=rec.get("diarize_mode", "hybrid"),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
         )
@@ -83,6 +87,8 @@ def save_settings(settings: Settings) -> None:
         f'screenshot_event_triggers = {"true" if settings.screenshot_event_triggers else "false"}',
         f"screenshot_debounce = {settings.screenshot_debounce}",
         f"screenshot_cooldown = {settings.screenshot_cooldown}",
+        f'diarize = {"true" if settings.diarize else "false"}',
+        f'diarize_mode = "{settings.diarize_mode}"',
         "",
         "[transcription]",
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',

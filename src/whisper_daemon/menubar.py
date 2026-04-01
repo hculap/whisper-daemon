@@ -148,6 +148,14 @@ class MenuBarDelegate(NSObject):
             self._capture_screenshots_item.setState_(1)
         settings_menu.addItem_(self._capture_screenshots_item)
 
+        # Speaker Diarization toggle
+        self._diarize_item = _make_item(
+            "Speaker Diarization", "onToggleDiarize:", self
+        )
+        if self._settings.diarize:
+            self._diarize_item.setState_(1)
+        settings_menu.addItem_(self._diarize_item)
+
         settings_menu.addItem_(NSMenuItem.separatorItem())
 
         # Start at Login toggle
@@ -376,6 +384,13 @@ class MenuBarDelegate(NSObject):
         logger.info("Capture screenshots: %s", self._settings.capture_screenshots)
 
     @objc.typedSelector(b"v@:@")
+    def onToggleDiarize_(self, sender):
+        self._settings.diarize = not self._settings.diarize
+        sender.setState_(1 if self._settings.diarize else 0)
+        save_settings(self._settings)
+        logger.info("Speaker diarization: %s", self._settings.diarize)
+
+    @objc.typedSelector(b"v@:@")
     def onChangeRecDir_(self, sender):
         from AppKit import NSOpenPanel
 
@@ -570,7 +585,7 @@ class MenuBarDelegate(NSObject):
                         "Meeting chunk %d: %.1fs", chunk_count, chunk.duration
                     )
                     telemetry.meeting_chunk_queued(chunk_count, chunk.duration, chunk.start_time)
-                    if self._settings.save_audio:
+                    if self._settings.save_audio or self._settings.diarize:
                         all_audio.append(chunk.audio.copy())
                     cn = chunk_count  # capture for closure
                     def _transcribe_and_track(audio, m, n):
@@ -600,7 +615,7 @@ class MenuBarDelegate(NSObject):
                     if chunk is None:
                         break
                     chunk_count += 1
-                    if self._settings.save_audio:
+                    if self._settings.save_audio or self._settings.diarize:
                         all_audio.append(chunk.audio.copy())
                     result = transcribe_full(chunk.audio, model)
                     if result.get("text", "").strip():
@@ -619,6 +634,22 @@ class MenuBarDelegate(NSObject):
 
         from whisper_daemon.formats import merge_chunk_results
         merged_result = merge_chunk_results(all_results)
+
+        if self._settings.diarize and all_audio:
+            try:
+                from whisper_daemon.diarizer import diarize_batch
+                from whisper_daemon.diarize_merge import merge_speakers_with_transcript
+
+                full_audio = np.concatenate(all_audio)
+                logger.info("Diarizing %.1fs of audio...", len(full_audio) / 16000)
+                speaker_segments = diarize_batch(full_audio)
+                merged_result = merge_speakers_with_transcript(
+                    speaker_segments, merged_result
+                )
+                speaker_count = len(merged_result.get("speakers", []))
+                logger.info("Diarization done — %d speakers", speaker_count)
+            except Exception:
+                logger.exception("Diarization failed, saving without speaker labels")
 
         from whisper_daemon.formats import FORMATTERS
 

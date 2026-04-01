@@ -144,9 +144,16 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
 
     preload_model(model)
 
+    screen_capture = None
+    activity_monitor = None
+
     def _signal_handler(sig: int, frame: object) -> None:
         logger.info("Received signal %s", signal.Signals(sig).name)
         hotkey.stop()
+        if activity_monitor:
+            activity_monitor.stop()
+        if screen_capture:
+            screen_capture.stop()
         daemon.shutdown()
         if not no_menubar:
             from PyObjCTools import AppHelper
@@ -155,17 +162,43 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
+    if settings.capture_screenshots:
+        from whisper_daemon.screen_capture import ScreenCapture
+
+        screen_capture = ScreenCapture(
+            output_dir=settings.recording_dir_path,
+            interval=settings.screenshot_interval,
+        )
+        screen_capture.start()
+
+        if settings.screenshot_event_triggers:
+            from whisper_daemon.activity_monitor import ActivityMonitor
+
+            activity_monitor = ActivityMonitor(
+                on_activity=screen_capture.capture_now,
+                debounce_delay=settings.screenshot_debounce,
+                cooldown=settings.screenshot_cooldown,
+            )
+            activity_monitor.start()
+
     hotkey.start()
 
     click.echo(f"whisper-daemon running — press Cmd+Shift+Space to record")
     click.echo(f"Model: {model}")
     click.echo(f"Silence timeout: {silence_timeout}s")
+    if screen_capture:
+        trigger_mode = "events + interval" if activity_monitor else "interval only"
+        click.echo(f"Screenshots: {trigger_mode}")
     click.echo("Press Ctrl+C to quit")
 
     if no_menubar:
         try:
             daemon.run()
         finally:
+            if activity_monitor:
+                activity_monitor.stop()
+            if screen_capture:
+                screen_capture.stop()
             hotkey.stop()
     else:
         run_with_menubar(daemon, hotkey)

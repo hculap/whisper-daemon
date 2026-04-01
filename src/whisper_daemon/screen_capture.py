@@ -42,6 +42,7 @@ class ScreenCapture:
         self._start_time: float = 0.0
         self._last_hashes: dict[int, np.ndarray] = {}  # display_id → last hash
         self._saved_count = 0
+        self._capture_lock = threading.Lock()
 
     @property
     def saved_count(self) -> int:
@@ -69,12 +70,17 @@ class ScreenCapture:
             self._thread = None
         logger.info("Screen capture stopped — %d screenshots saved", self._saved_count)
 
-    def _capture_loop(self) -> None:
-        while self._running:
+    def capture_now(self) -> None:
+        """Capture all displays immediately (called by activity monitor)."""
+        with self._capture_lock:
             try:
                 self._capture_all_displays()
             except Exception:
-                logger.exception("Screenshot capture failed")
+                logger.exception("Event-triggered screenshot capture failed")
+
+    def _capture_loop(self) -> None:
+        while self._running:
+            self.capture_now()
             time.sleep(self._interval)
 
     def _capture_all_displays(self) -> None:

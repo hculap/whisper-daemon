@@ -20,7 +20,10 @@ class Settings:
     recording_device: str = ""  # empty = system default
     save_audio: bool = False  # save raw audio alongside transcripts
     capture_screenshots: bool = False  # capture screenshots during recording
-    screenshot_interval: float = 5.0  # seconds between capture attempts
+    screenshot_interval: float = 30.0  # seconds between fallback captures
+    screenshot_event_triggers: bool = True  # capture on keyboard/mouse/scroll
+    screenshot_debounce: float = 2.0  # seconds after last event before capture
+    screenshot_cooldown: float = 5.0  # minimum seconds between captures
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
 
@@ -53,7 +56,10 @@ def load_settings() -> Settings:
             recording_device=rec.get("device", ""),
             save_audio=rec.get("save_audio", False),
             capture_screenshots=rec.get("capture_screenshots", False),
-            screenshot_interval=rec.get("screenshot_interval", 5.0),
+            screenshot_interval=rec.get("screenshot_interval", 30.0),
+            screenshot_event_triggers=rec.get("screenshot_event_triggers", True),
+            screenshot_debounce=rec.get("screenshot_debounce", 2.0),
+            screenshot_cooldown=rec.get("screenshot_cooldown", 5.0),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
         )
@@ -74,6 +80,9 @@ def save_settings(settings: Settings) -> None:
         f'save_audio = {"true" if settings.save_audio else "false"}',
         f'capture_screenshots = {"true" if settings.capture_screenshots else "false"}',
         f"screenshot_interval = {settings.screenshot_interval}",
+        f'screenshot_event_triggers = {"true" if settings.screenshot_event_triggers else "false"}',
+        f"screenshot_debounce = {settings.screenshot_debounce}",
+        f"screenshot_cooldown = {settings.screenshot_cooldown}",
         "",
         "[transcription]",
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',

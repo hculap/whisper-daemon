@@ -51,6 +51,7 @@ class Daemon:
 
         # GPU warm-up
         self._last_transcription_time: float = time.monotonic()
+        self._gpu_busy = False  # set True during any transcription (meeting or push-to-talk)
 
     @property
     def history(self) -> list[str]:
@@ -240,7 +241,7 @@ class Daemon:
 
     def _maybe_warmup_gpu(self) -> None:
         """Keep Metal GPU warm with periodic dummy inference."""
-        if self._state != State.IDLE:
+        if self._state != State.IDLE or self._gpu_busy:
             return
         elapsed = time.monotonic() - self._last_transcription_time
         if elapsed < GPU_WARMUP_INTERVAL:

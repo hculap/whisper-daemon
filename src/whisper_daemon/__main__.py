@@ -366,28 +366,27 @@ def record(
     click.echo("Recording... press Ctrl+C to stop.\n")
     recorder.start()
 
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    futures: dict[concurrent.futures.Future, float] = {}
+
     try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            futures: dict[concurrent.futures.Future, float] = {}
-
-            while True:
-                try:
-                    chunk = chunk_queue.get(timeout=0.5)
-                except queue_mod.Empty:
-                    # Collect completed futures
-                    _collect_results(futures, all_results)
-                    continue
-
-                if chunk is None:
-                    break
-
-                chunk_count += 1
-                click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
-
-                future = pool.submit(transcribe_audio, chunk.audio, model)
-                futures[future] = chunk.start_time
-
+        while True:
+            try:
+                chunk = chunk_queue.get(timeout=0.5)
+            except queue_mod.Empty:
                 _collect_results(futures, all_results)
+                continue
+
+            if chunk is None:
+                break
+
+            chunk_count += 1
+            click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
+
+            future = pool.submit(transcribe_audio, chunk.audio, model)
+            futures[future] = chunk.start_time
+
+            _collect_results(futures, all_results)
 
     except KeyboardInterrupt:
         click.echo("\n\nStopping recording...")
@@ -409,6 +408,8 @@ def record(
             result_text = transcribe_audio(chunk.audio, model)
             if result_text:
                 all_results.append((chunk.start_time, {"text": result_text, "segments": [], "language": ""}))
+    finally:
+        pool.shutdown(wait=False)
 
     if not all_results:
         click.echo("No audio transcribed.")

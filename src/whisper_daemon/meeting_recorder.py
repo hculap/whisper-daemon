@@ -156,7 +156,7 @@ class MeetingRecorder:
         audio = np.concatenate(self._frames, axis=0).squeeze()
         duration = len(audio) / SAMPLE_RATE
 
-        if duration < 0.3:
+        if duration < 0.3 and not is_final:
             self._frames = []
             return
 

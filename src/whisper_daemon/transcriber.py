@@ -45,6 +45,11 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL) -> str:
         logger.warning("Empty audio buffer, skipping transcription")
         return ""
 
+    # Pad very short audio to 1s — Whisper can hang in decode loops on tiny clips
+    min_samples = 16000
+    if len(audio) < min_samples:
+        audio = np.pad(audio, (0, min_samples - len(audio)))
+
     try:
         logger.info("Transcribing %.1fs of audio...", len(audio) / 16000)
         result = mlx_whisper.transcribe(
@@ -75,6 +80,11 @@ def transcribe_full(audio: np.ndarray, model: str = DEFAULT_MODEL) -> dict:
     """
     if audio.size == 0:
         return {"text": "", "segments": [], "language": ""}
+
+    # Pad very short audio to 1s — Whisper can hang in decode loops on tiny clips
+    min_samples = 16000
+    if len(audio) < min_samples:
+        audio = np.pad(audio, (0, min_samples - len(audio)))
 
     try:
         logger.info("Transcribing %.1fs of audio...", len(audio) / 16000)

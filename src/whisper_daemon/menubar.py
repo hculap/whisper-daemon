@@ -45,6 +45,8 @@ ICONS = {
     State.TRANSCRIBING: "⏳",
 }
 
+MEETING_RECORDING_SYMBOL = "🔴"
+
 TITLES = {
     State.IDLE: "Ready",
     State.RECORDING: "Recording...",
@@ -503,10 +505,17 @@ class MenuBarDelegate(NSObject):
 
     def _stop_meeting(self):
         self._meeting_active = False
+        logger.info("Meeting recording stop requested from menu bar")
+
+        # If the worker thread never started or already finished, reset UI immediately
+        if self._meeting_thread is None or not self._meeting_thread.is_alive():
+            logger.warning("Meeting worker not running — resetting UI directly")
+            self._reset_meeting_ui()
+            return
+
         self._meeting_menu_item.setTitle_("Start Meeting Recording")
         self._set_icon(State.TRANSCRIBING)
         self._status_menu_item.setTitle_("Finishing transcription...")
-        logger.info("Meeting recording stop requested from menu bar")
 
     def _meeting_worker(self):
         from whisper_daemon import telemetry

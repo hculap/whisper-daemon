@@ -616,26 +616,8 @@ class MenuBarDelegate(NSObject):
             self._reset_meeting_ui()
             return
 
-        all_results.sort(key=lambda r: r[0])
-
-        # Merge results with timestamp-adjusted segments
-        merged_segments: list[dict] = []
-        merged_text_parts: list[str] = []
-        for start_offset, result in all_results:
-            text = result.get("text", "").strip()
-            if text:
-                merged_text_parts.append(text)
-            for seg in result.get("segments", []):
-                merged_segments.append({
-                    **seg,
-                    "start": seg["start"] + start_offset,
-                    "end": seg["end"] + start_offset,
-                })
-        merged_result = {
-            "text": " ".join(merged_text_parts),
-            "segments": merged_segments,
-            "language": all_results[0][1].get("language", "") if all_results else "",
-        }
+        from whisper_daemon.formats import merge_chunk_results
+        merged_result = merge_chunk_results(all_results)
 
         from whisper_daemon.formats import FORMATTERS
 

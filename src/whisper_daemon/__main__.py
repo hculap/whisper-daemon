@@ -451,28 +451,8 @@ def _collect_results(
 
 def _merge_results(results: list[tuple[float, dict]]) -> dict:
     """Merge chunk results into a single result dict with adjusted timestamps."""
-    results.sort(key=lambda r: r[0])
-
-    merged_text_parts: list[str] = []
-    merged_segments: list[dict] = []
-
-    for start_offset, result in results:
-        text = result.get("text", "").strip()
-        if text:
-            merged_text_parts.append(text)
-
-        for seg in result.get("segments", []):
-            merged_segments.append({
-                **seg,
-                "start": seg["start"] + start_offset,
-                "end": seg["end"] + start_offset,
-            })
-
-    return {
-        "text": " ".join(merged_text_parts),
-        "segments": merged_segments,
-        "language": results[0][1].get("language", "") if results else "",
-    }
+    from whisper_daemon.formats import merge_chunk_results
+    return merge_chunk_results(results)
 
 
 def _collect_files(paths: tuple[str, ...]) -> list[Path]:

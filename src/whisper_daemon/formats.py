@@ -67,6 +67,44 @@ FORMATTERS = {
 }
 
 
+def merge_chunk_results(results: list[tuple[float, dict]]) -> dict:
+    """Merge overlapping chunk results into a single result, deduplicating overlap zones.
+
+    Each result is (start_offset, whisper_result). Segments whose adjusted start
+    falls before the high-water mark of previously merged segments are dropped,
+    preventing duplicate text from chunk overlap regions.
+    """
+    sorted_results = sorted(results, key=lambda r: r[0])
+
+    merged_segments: list[dict] = []
+    high_water: float = 0.0
+
+    for start_offset, result in sorted_results:
+        for seg in result.get("segments", []):
+            adjusted_start = seg["start"] + start_offset
+            adjusted_end = seg["end"] + start_offset
+
+            if adjusted_start < high_water:
+                continue
+
+            merged_segments.append({
+                **seg,
+                "start": adjusted_start,
+                "end": adjusted_end,
+            })
+            high_water = adjusted_end
+
+    merged_text = " ".join(
+        seg["text"].strip() for seg in merged_segments if seg.get("text", "").strip()
+    )
+
+    return {
+        "text": merged_text,
+        "segments": merged_segments,
+        "language": sorted_results[0][1].get("language", "") if sorted_results else "",
+    }
+
+
 def _format_timestamp_srt(seconds: float) -> str:
     """Format seconds as HH:MM:SS,mmm (SRT format)."""
     h = int(seconds // 3600)

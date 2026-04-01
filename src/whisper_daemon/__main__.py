@@ -179,7 +179,6 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
                 debounce_delay=settings.screenshot_debounce,
                 cooldown=settings.screenshot_cooldown,
             )
-            activity_monitor.start()
 
     hotkey.start()
 
@@ -192,6 +191,8 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     click.echo("Press Ctrl+C to quit")
 
     if no_menubar:
+        if activity_monitor:
+            activity_monitor.start()
         try:
             daemon.run()
         finally:
@@ -201,7 +202,8 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
                 screen_capture.stop()
             hotkey.stop()
     else:
-        run_with_menubar(daemon, hotkey)
+        on_ready = activity_monitor.start if activity_monitor else None
+        run_with_menubar(daemon, hotkey, on_appkit_ready=on_ready)
 
 
 @cli.command()

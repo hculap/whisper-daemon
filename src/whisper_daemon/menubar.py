@@ -10,6 +10,7 @@ import queue
 import threading
 import time
 import wave
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 
@@ -790,11 +791,19 @@ def _write_partial(path: Path, results: list[tuple[float, dict]]) -> None:
         pass
 
 
-def run_with_menubar(daemon: object, hotkey_listener: object) -> None:
+def run_with_menubar(
+    daemon: object,
+    hotkey_listener: object,
+    on_appkit_ready: Callable[[], None] | None = None,
+) -> None:
     """Run the daemon event loop in a background thread, menu bar on main thread.
 
     The main thread MUST run the NSApplication event loop for AppKit to work.
     The daemon event loop runs in a daemon thread.
+
+    ``on_appkit_ready`` is called on the main thread after NSApplication is
+    configured but before the event loop starts — use it for APIs that
+    require the AppKit run loop (e.g. NSEvent global monitors).
     """
     daemon_thread = threading.Thread(target=daemon.run, daemon=True)
     daemon_thread.start()
@@ -806,5 +815,8 @@ def run_with_menubar(daemon: object, hotkey_listener: object) -> None:
         daemon, hotkey_listener
     )
     app.setDelegate_(delegate)
+
+    if on_appkit_ready is not None:
+        on_appkit_ready()
 
     AppHelper.runEventLoop()

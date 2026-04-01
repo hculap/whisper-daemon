@@ -1,7 +1,8 @@
 """Monitor user activity (keyboard, mouse, scroll) to trigger screenshot captures.
 
-Uses pynput listeners with trailing-edge debounce + cooldown to avoid
-rapid-fire captures during bursts of activity.
+Uses pynput for keyboard events and NSEvent global monitors for mouse
+events (compatible with the AppKit main-thread run loop). Trailing-edge
+debounce + cooldown prevents rapid-fire captures during bursts.
 """
 
 import logging
@@ -9,12 +10,15 @@ import threading
 import time
 from collections.abc import Callable
 
-from pynput import keyboard, mouse
+from AppKit import NSEvent, NSLeftMouseDownMask, NSRightMouseDownMask, NSScrollWheelMask
+from pynput import keyboard
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_DEBOUNCE = 2.0  # seconds after last event before triggering
 DEFAULT_COOLDOWN = 5.0  # minimum seconds between captures
+
+MOUSE_EVENT_MASK = NSLeftMouseDownMask | NSRightMouseDownMask | NSScrollWheelMask
 
 
 class ActivityMonitor:
@@ -39,22 +43,19 @@ class ActivityMonitor:
         self._lock = threading.Lock()
 
         self._keyboard_listener: keyboard.Listener | None = None
-        self._mouse_listener: mouse.Listener | None = None
+        self._mouse_monitor: object | None = None  # NSEvent monitor handle
 
     def start(self) -> None:
         self._last_capture_time = 0.0
 
         self._keyboard_listener = keyboard.Listener(on_press=self._on_key)
         self._keyboard_listener.daemon = True
-
-        self._mouse_listener = mouse.Listener(
-            on_click=self._on_click,
-            on_scroll=self._on_scroll,
-        )
-        self._mouse_listener.daemon = True
-
         self._keyboard_listener.start()
-        self._mouse_listener.start()
+
+        self._mouse_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            MOUSE_EVENT_MASK,
+            self._on_mouse_event,
+        )
 
         logger.info(
             "Activity monitor started (debounce=%.1fs, cooldown=%.1fs)",
@@ -70,25 +71,17 @@ class ActivityMonitor:
 
         if self._keyboard_listener is not None:
             self._keyboard_listener.stop()
-        if self._mouse_listener is not None:
-            self._mouse_listener.stop()
+
+        if self._mouse_monitor is not None:
+            NSEvent.removeMonitor_(self._mouse_monitor)
+            self._mouse_monitor = None
 
         logger.info("Activity monitor stopped")
 
     def _on_key(self, _key: keyboard.Key | keyboard.KeyCode | None) -> None:
         self._on_event()
 
-    def _on_click(
-        self,
-        _x: int,
-        _y: int,
-        _button: mouse.Button,
-        pressed: bool,
-    ) -> None:
-        if pressed:
-            self._on_event()
-
-    def _on_scroll(self, _x: int, _y: int, _dx: int, _dy: int) -> None:
+    def _on_mouse_event(self, _event: object) -> None:
         self._on_event()
 
     def _on_event(self) -> None:

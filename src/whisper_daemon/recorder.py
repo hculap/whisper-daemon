@@ -7,6 +7,7 @@ import time
 import numpy as np
 import sounddevice as sd
 
+from whisper_daemon import telemetry
 from whisper_daemon.events import Event, EventType
 from whisper_daemon.vad import SileroVAD
 
@@ -143,6 +144,7 @@ class AudioRecorder:
             if self._silence_start is None:
                 self._silence_start = now
             elif now - self._silence_start >= self._silence_timeout:
+                telemetry.mark("vad_silence")
                 logger.info("VAD: silence detected (%.1fs)", self._silence_timeout)
                 self._queue.put(Event(EventType.RECORD_STOP))
                 return

@@ -8,6 +8,7 @@ from enum import Enum, auto
 
 import numpy as np
 
+from whisper_daemon import telemetry
 from whisper_daemon.events import Event, EventType
 from whisper_daemon.paster import paste_text
 from whisper_daemon.recorder import AudioRecorder
@@ -67,6 +68,7 @@ class Daemon:
     def run(self) -> None:
         """Main event loop — blocks until shutdown() is called."""
         self._running = True
+        telemetry.start_session()
         logger.info("Daemon running (state=IDLE)")
 
         while self._running:
@@ -103,6 +105,7 @@ class Daemon:
             self._pending_samples = 0
             self._recorder.start_recording()
             play_start()
+            telemetry.mark("record_start")
             logger.info("State: IDLE -> RECORDING")
         elif self._state == State.RECORDING:
             elapsed = time.monotonic() - self._recording_started_at
@@ -130,6 +133,7 @@ class Daemon:
         if audio.size == 0:
             return
 
+        telemetry.mark("preview_start", audio_sec=round(len(audio) / 16000, 1))
         logger.info("Preview: transcribing %.1fs snapshot", len(audio) / 16000)
         self._preview_thread = threading.Thread(
             target=self._preview_worker,
@@ -145,6 +149,7 @@ class Daemon:
             self._pending_text = text
             self._pending_samples = total_samples
             self._last_transcription_time = time.monotonic()
+            telemetry.mark("preview_done", chars=len(text))
             logger.info("Preview done: %d chars", len(text))
         except Exception:
             logger.exception("Preview transcription failed")
@@ -153,6 +158,7 @@ class Daemon:
         self._state = State.TRANSCRIBING
         audio = self._recorder.stop_recording()
         play_stop()
+        telemetry.mark("record_stop", audio_sec=round(len(audio) / 16000, 1) if audio.size > 0 else 0)
         logger.info("State: RECORDING -> TRANSCRIBING")
 
         if audio.size == 0:
@@ -164,6 +170,8 @@ class Daemon:
         new_samples = len(audio) - self._pending_samples
         new_seconds = new_samples / 16000
         if self._pending_text and new_seconds < 1.5:
+            telemetry.mark("transcribe_start", mode="preview_cached", new_audio_sec=round(new_seconds, 1))
+            telemetry.mark("transcribe_done", chars=len(self._pending_text))
             logger.info(
                 "Using preview result (%.1fs new audio since preview, skipping re-transcription)",
                 new_seconds,
@@ -173,6 +181,7 @@ class Daemon:
             return
 
         # Full transcription needed
+        telemetry.mark("transcribe_start", mode="full", new_audio_sec=round(new_seconds, 1))
         thread = threading.Thread(
             target=self._transcribe_worker,
             args=(audio,),
@@ -184,6 +193,7 @@ class Daemon:
         try:
             text = transcribe(audio, model=self._model)
             self._last_transcription_time = time.monotonic()
+            telemetry.mark("transcribe_done", chars=len(text))
             self._queue.put(Event(EventType.TRANSCRIPTION_DONE, text))
         except Exception as exc:
             logger.exception("Transcription worker failed")
@@ -192,6 +202,7 @@ class Daemon:
     def _handle_transcription_done(self, text: str) -> None:
         if text:
             paste_text(text)
+            telemetry.mark("paste_done", chars=len(text))
             self._history.insert(0, text)
             if len(self._history) > self._max_history:
                 self._history.pop()
@@ -201,6 +212,7 @@ class Daemon:
         self._pending_text = ""
         self._pending_samples = 0
         self._state = State.IDLE
+        telemetry.flush()
         logger.info("State: TRANSCRIBING -> IDLE")
 
     def _handle_paste_last(self) -> None:

@@ -39,12 +39,11 @@ AUDIO_VIDEO_EXTENSIONS = [
     "mp4", "mkv", "avi", "mov", "aac", "wma",
 ]
 
-SF_SYMBOLS = {
-    State.IDLE: "mic.fill",
-    State.RECORDING: "record.circle.fill",
-    State.TRANSCRIBING: "text.bubble.fill",
+ICONS = {
+    State.IDLE: "🎙",
+    State.RECORDING: "🔴",
+    State.TRANSCRIBING: "⏳",
 }
-MEETING_RECORDING_SYMBOL = "record.circle.fill"
 
 TITLES = {
     State.IDLE: "Ready",
@@ -77,9 +76,7 @@ class MenuBarDelegate(NSObject):
 
     def _setup_status_bar(self):
         status_bar = NSStatusBar.systemStatusBar()
-        self._status_item = status_bar.statusItemWithLength_(
-            NSVariableStatusItemLength
-        )
+        self._status_item = status_bar.statusItemWithLength_(NSVariableStatusItemLength)
         self._set_icon(State.IDLE)
         self._status_item.setHighlightMode_(True)
 
@@ -236,7 +233,7 @@ class MenuBarDelegate(NSObject):
         if self._meeting_active:
             elapsed = time.monotonic() - self._meeting_start
             mins, secs = divmod(int(elapsed), 60)
-            self._set_icon_by_name(MEETING_RECORDING_SYMBOL)
+            self._set_icon(State.RECORDING)
             self._meeting_menu_item.setTitle_(f"Stop Recording ({mins}:{secs:02d})")
             self._status_menu_item.setTitle_(f"Meeting recording ({mins}:{secs:02d})")
             return
@@ -309,22 +306,12 @@ class MenuBarDelegate(NSObject):
         AppHelper.stopEventLoop()
 
     def _set_icon(self, state: State) -> None:
-        """Set the menu bar icon to the SF Symbol for the given state."""
-        self._set_icon_by_name(SF_SYMBOLS.get(state, "mic.fill"))
+        """Set the menu bar icon emoji for the given state."""
+        self._status_item.button().setTitle_(ICONS.get(state, "🎙"))
 
-    def _set_icon_by_name(self, symbol_name: str) -> None:
-        """Set the menu bar icon to a specific SF Symbol name."""
-        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            symbol_name, None
-        )
-        if image:
-            image.setTemplate_(True)
-            image.setSize_((18, 18))
-            button = self._status_item.button()
-            button.setImage_(image)
-            button.setTitle_("")
-        else:
-            self._status_item.button().setTitle_("W")
+    def _set_icon_by_name(self, icon_text: str, _fallback: str = "") -> None:
+        """Set the menu bar icon to the given text."""
+        self._status_item.button().setTitle_(icon_text)
 
     # -- Recent transcriptions --
 

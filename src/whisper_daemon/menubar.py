@@ -544,7 +544,6 @@ class MenuBarDelegate(NSObject):
             )
             screen_capture.start()
 
-        self._daemon._gpu_busy = True
         telemetry.meeting_start()
         recorder.start()
 
@@ -672,7 +671,6 @@ class MenuBarDelegate(NSObject):
 
     def _reset_meeting_ui(self):
         self._meeting_active = False
-        self._daemon._gpu_busy = False
         self._meeting_menu_item.setTitle_("Start Meeting Recording")
         self._set_icon(State.IDLE)
         self._status_menu_item.setTitle_("Status: Ready")

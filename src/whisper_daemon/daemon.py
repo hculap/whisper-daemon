@@ -17,8 +17,6 @@ from whisper_daemon.transcriber import transcribe
 
 logger = logging.getLogger(__name__)
 
-GPU_WARMUP_INTERVAL = 60.0  # seconds between idle GPU warm-ups
-
 
 class State(Enum):
     IDLE = auto()
@@ -49,9 +47,6 @@ class Daemon:
         self._pending_samples: int = 0
         self._preview_thread: threading.Thread | None = None
 
-        # GPU warm-up
-        self._last_transcription_time: float = time.monotonic()
-        self._gpu_busy = False  # set True during any transcription (meeting or push-to-talk)
 
     @property
     def history(self) -> list[str]:
@@ -149,7 +144,6 @@ class Daemon:
             text = transcribe(audio, model=self._model)
             self._pending_text = text
             self._pending_samples = total_samples
-            self._last_transcription_time = time.monotonic()
             telemetry.mark("preview_done", chars=len(text))
             logger.info("Preview done: %d chars", len(text))
         except Exception:
@@ -184,7 +178,6 @@ class Daemon:
                 new_seconds,
             )
             self._queue.put(Event(EventType.TRANSCRIPTION_DONE, self._pending_text))
-            self._last_transcription_time = time.monotonic()
             return
 
         # Full transcription needed
@@ -199,7 +192,6 @@ class Daemon:
     def _transcribe_worker(self, audio: np.ndarray) -> None:
         try:
             text = transcribe(audio, model=self._model)
-            self._last_transcription_time = time.monotonic()
             telemetry.mark("transcribe_done", chars=len(text))
             self._queue.put(Event(EventType.TRANSCRIPTION_DONE, text))
         except Exception as exc:
@@ -240,21 +232,11 @@ class Daemon:
         logger.info("State: -> IDLE (error recovery)")
 
     def _maybe_warmup_gpu(self) -> None:
-        """Keep Metal GPU warm with periodic dummy inference."""
-        if self._state != State.IDLE or self._gpu_busy:
-            return
-        elapsed = time.monotonic() - self._last_transcription_time
-        if elapsed < GPU_WARMUP_INTERVAL:
-            return
-        self._last_transcription_time = time.monotonic()
-        threading.Thread(target=self._gpu_warmup, daemon=True).start()
-
-    def _gpu_warmup(self) -> None:
-        try:
-            transcribe(np.zeros(8000, dtype=np.float32), model=self._model)
-            logger.debug("GPU warm-up done")
-        except Exception:
-            pass
+        """No-op. GPU warmup removed — it held the GIL for ~2s every 60s,
+        freezing the AppKit main thread and making the menu bar unresponsive.
+        The model stays loaded in memory; cold GPU penalty is ~1-2s on first
+        transcription after idle, which is acceptable.
+        """
 
     def _cleanup(self) -> None:
         if self._state == State.RECORDING:

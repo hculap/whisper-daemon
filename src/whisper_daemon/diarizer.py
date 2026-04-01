@@ -171,23 +171,18 @@ _embedding_model = None
 
 
 def _get_embedding_model():
-    """Lazy-load WeSpeaker embedding model."""
+    """Get the embedding model from the diarization pipeline.
+
+    Returns the pipeline's bundled PyannoteAudioPretrainedSpeakerEmbedding,
+    which is callable: (waveforms, masks) -> embeddings.
+    """
     global _embedding_model
     if _embedding_model is not None:
         return _embedding_model
 
-    import os
-
-    from pyannote.audio import Inference
-
-    token = os.environ.get("HF_TOKEN") or _get_hf_token()
-
-    logger.info("Loading speaker embedding model (%s)...", EMBEDDING_MODEL)
-    _embedding_model = Inference(EMBEDDING_MODEL, window="whole", token=token)
-
-    if torch.backends.mps.is_available():
-        _embedding_model.to(torch.device("mps"))
-
+    pipeline = _get_pipeline()
+    _embedding_model = pipeline._embedding
+    logger.info("Speaker embedding model ready (dim=%d)", _embedding_model.dimension)
     return _embedding_model
 
 
@@ -232,11 +227,11 @@ class SpeakerTracker:
             return []
 
         model = _get_embedding_model()
-        waveform = torch.from_numpy(audio).unsqueeze(0).float()
-        input_data = {"waveform": waveform, "sample_rate": SAMPLE_RATE}
+        # Shape: (batch=1, channel=1, samples)
+        waveform = torch.from_numpy(audio).unsqueeze(0).unsqueeze(0).float()
 
         try:
-            embedding = model(input_data)
+            embedding = model(waveform)
         except Exception:
             logger.exception("Embedding extraction failed")
             return []

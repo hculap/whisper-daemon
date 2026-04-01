@@ -310,16 +310,7 @@ class MenuBarDelegate(NSObject):
 
     def _set_icon(self, state: State) -> None:
         """Set the menu bar icon to the SF Symbol for the given state."""
-        symbol_name = SF_SYMBOLS.get(state, "mic.fill")
-        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(
-            symbol_name, None
-        )
-        if image:
-            image.setTemplate_(True)
-            self._status_item.button().setImage_(image)
-            self._status_item.setTitle_("")
-        else:
-            self._status_item.setTitle_("W")
+        self._set_icon_by_name(SF_SYMBOLS.get(state, "mic.fill"))
 
     def _set_icon_by_name(self, symbol_name: str) -> None:
         """Set the menu bar icon to a specific SF Symbol name."""
@@ -328,8 +319,12 @@ class MenuBarDelegate(NSObject):
         )
         if image:
             image.setTemplate_(True)
-            self._status_item.button().setImage_(image)
-            self._status_item.setTitle_("")
+            image.setSize_((18, 18))
+            button = self._status_item.button()
+            button.setImage_(image)
+            button.setTitle_("")
+        else:
+            self._status_item.button().setTitle_("W")
 
     # -- Recent transcriptions --
 

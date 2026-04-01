@@ -26,7 +26,7 @@ from AppKit import (
     NSTimer,
     NSVariableStatusItemLength,
 )
-from Foundation import NSRunLoop, NSDefaultRunLoopMode
+from Foundation import NSRunLoop, NSRunLoopCommonModes
 from PyObjCTools import AppHelper
 
 from whisper_daemon.config import VALID_FORMATS, Settings, load_settings, save_settings
@@ -225,7 +225,7 @@ class MenuBarDelegate(NSObject):
             0.3, self, "pollState:", None, True
         )
         NSRunLoop.currentRunLoop().addTimer_forMode_(
-            self._timer, NSDefaultRunLoopMode
+            self._timer, NSRunLoopCommonModes
         )
 
     # -- Poll timer --

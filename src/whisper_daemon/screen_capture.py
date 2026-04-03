@@ -96,11 +96,16 @@ class ScreenCapture:
         temp_path = self._output_dir / f"_temp_d{display_num}.png"
 
         # screencapture -D uses sequential index (1, 2, 3...), not display IDs
-        result = subprocess.run(
-            ["screencapture", "-x", "-C", "-D", str(display_num), str(temp_path)],
-            capture_output=True,
-            timeout=5,
-        )
+        try:
+            result = subprocess.run(
+                ["screencapture", "-x", "-C", "-D", str(display_num), str(temp_path)],
+                capture_output=True,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("screencapture timed out for display %d (screen locked?)", display_num)
+            temp_path.unlink(missing_ok=True)
+            return
         if result.returncode != 0 or not temp_path.exists():
             return
 

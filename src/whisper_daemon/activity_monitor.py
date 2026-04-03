@@ -1,7 +1,7 @@
 """Monitor user activity (keyboard, mouse, scroll) to trigger screenshot captures.
 
-Uses pynput for keyboard events and NSEvent global monitors for mouse
-events (compatible with the AppKit main-thread run loop). Trailing-edge
+Uses NSEvent global monitors for both keyboard and mouse events
+(compatible with the AppKit main-thread run loop). Trailing-edge
 debounce + cooldown prevents rapid-fire captures during bursts.
 """
 
@@ -10,8 +10,13 @@ import threading
 import time
 from collections.abc import Callable
 
-from AppKit import NSEvent, NSLeftMouseDownMask, NSRightMouseDownMask, NSScrollWheelMask
-from pynput import keyboard
+from AppKit import (
+    NSEvent,
+    NSKeyDownMask,
+    NSLeftMouseDownMask,
+    NSRightMouseDownMask,
+    NSScrollWheelMask,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -42,19 +47,20 @@ class ActivityMonitor:
         self._timer: threading.Timer | None = None
         self._lock = threading.Lock()
 
-        self._keyboard_listener: keyboard.Listener | None = None
-        self._mouse_monitor: object | None = None  # NSEvent monitor handle
+        self._keyboard_monitor: object | None = None
+        self._mouse_monitor: object | None = None
 
     def start(self) -> None:
         self._last_capture_time = 0.0
 
-        self._keyboard_listener = keyboard.Listener(on_press=self._on_key)
-        self._keyboard_listener.daemon = True
-        self._keyboard_listener.start()
+        self._keyboard_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            NSKeyDownMask,
+            self._on_ns_event,
+        )
 
         self._mouse_monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
             MOUSE_EVENT_MASK,
-            self._on_mouse_event,
+            self._on_ns_event,
         )
 
         logger.info(
@@ -69,8 +75,9 @@ class ActivityMonitor:
                 self._timer.cancel()
                 self._timer = None
 
-        if self._keyboard_listener is not None:
-            self._keyboard_listener.stop()
+        if self._keyboard_monitor is not None:
+            NSEvent.removeMonitor_(self._keyboard_monitor)
+            self._keyboard_monitor = None
 
         if self._mouse_monitor is not None:
             NSEvent.removeMonitor_(self._mouse_monitor)
@@ -78,10 +85,7 @@ class ActivityMonitor:
 
         logger.info("Activity monitor stopped")
 
-    def _on_key(self, _key: keyboard.Key | keyboard.KeyCode | None) -> None:
-        self._on_event()
-
-    def _on_mouse_event(self, _event: object) -> None:
+    def _on_ns_event(self, _event: object) -> None:
         self._on_event()
 
     def _on_event(self) -> None:

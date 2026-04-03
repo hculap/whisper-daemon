@@ -632,6 +632,11 @@ def _setup_logging(verbose: bool) -> None:
     for noisy in ("httpcore", "httpx", "urllib3", "huggingface_hub", "filelock"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    # Suppress multiprocessing resource_tracker warnings about leaked semaphores
+    # on shutdown — these come from mlx-whisper internals, not our code.
+    import warnings
+    warnings.filterwarnings("ignore", message="resource_tracker:.*leaked semaphore", category=UserWarning)
+
 
 if __name__ == "__main__":
     cli()

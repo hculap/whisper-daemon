@@ -180,8 +180,6 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
                 cooldown=settings.screenshot_cooldown,
             )
 
-    hotkey.start()
-
     click.echo(f"whisper-daemon running — press Cmd+Shift+Space to record")
     click.echo(f"Model: {model}")
     click.echo(f"Silence timeout: {silence_timeout}s")
@@ -191,6 +189,7 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     click.echo("Press Ctrl+C to quit")
 
     if no_menubar:
+        hotkey.start()
         if activity_monitor:
             activity_monitor.start()
         try:
@@ -202,8 +201,12 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
                 screen_capture.stop()
             hotkey.stop()
     else:
-        on_ready = activity_monitor.start if activity_monitor else None
-        run_with_menubar(daemon, hotkey, on_appkit_ready=on_ready)
+        def on_appkit_ready() -> None:
+            hotkey.start()
+            if activity_monitor:
+                activity_monitor.start()
+
+        run_with_menubar(daemon, hotkey, on_appkit_ready=on_appkit_ready)
 
 
 @cli.command()

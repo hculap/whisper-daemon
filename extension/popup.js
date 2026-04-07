@@ -48,11 +48,17 @@ function updateUI(state, title) {
   if (state === "capturing") {
     actionBtn.textContent = "Stop Recording";
     actionBtn.className = "btn btn-stop";
+    actionBtn.disabled = false;
     startTimer();
     transcript.classList.add("visible");
+  } else if (state === "starting") {
+    actionBtn.textContent = "Starting...";
+    actionBtn.className = "btn btn-record";
+    actionBtn.disabled = true;
   } else {
     actionBtn.textContent = state === "detected" ? "Start Recording" : "Record This Tab";
     actionBtn.className = "btn btn-record";
+    actionBtn.disabled = false;
     stopTimer();
   }
 

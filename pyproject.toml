@@ -17,10 +17,9 @@ dependencies = [
     "Pillow>=10.0",
     "click>=8.0",
     "pyannote-audio>=3.3",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
 ]
-
-[project.optional-dependencies]
-browser = ["fastapi>=0.115", "uvicorn[standard]>=0.30"]
 
 [project.scripts]
 whisper-daemon = "whisper_daemon.__main__:cli"

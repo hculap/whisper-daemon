@@ -545,7 +545,7 @@ def record(
 @click.option("--port", default=None, type=int, help="Server port (default: from config or 9876).")
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
 @click.option("--format", "formats", default="txt", help="Output formats, comma-separated: txt,srt,vtt,json.")
-@click.option("--output-dir", default=None, type=click.Path(), help="Output directory (default: ~/Desktop).")
+@click.option("--output-dir", default=None, type=click.Path(), help="Output directory (default: from config).")
 @click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
 @click.option("--chunk-silence", default=1.0, type=float, help="Seconds of silence to split chunks.")
 @click.option("--diarize", is_flag=True, help="Enable speaker diarization.")

@@ -188,6 +188,7 @@ class RecordingSession:
 
 
 _active_session: RecordingSession | None = None
+_session_lock = asyncio.Lock()
 _server_config: dict = {}
 
 
@@ -222,11 +223,6 @@ async def audio_websocket(ws: WebSocket) -> None:
 
     await ws.accept()
     logger.info("WebSocket client connected")
-
-    if _active_session is not None:
-        await ws.send_json({"type": "error", "message": "Recording already in progress"})
-        await ws.close()
-        return
 
     session: RecordingSession | None = None
 
@@ -264,8 +260,13 @@ async def audio_websocket(ws: WebSocket) -> None:
                         await ws.send_json({"type": "error", "message": "Already recording"})
                         continue
 
-                    session = RecordingSession(**_server_config)
-                    _active_session = session
+                    async with _session_lock:
+                        if _active_session is not None:
+                            await ws.send_json({"type": "error", "message": "Recording already in progress"})
+                            continue
+                        session = RecordingSession(**_server_config)
+                        _active_session = session
+
                     session.start(
                         meeting_title=data.get("meeting_title", ""),
                         meeting_url=data.get("meeting_url", ""),

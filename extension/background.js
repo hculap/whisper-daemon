@@ -4,7 +4,7 @@
  * States: IDLE -> DETECTED -> CAPTURING
  */
 
-const State = { IDLE: "idle", DETECTED: "detected", CAPTURING: "capturing" };
+const State = { IDLE: "idle", DETECTED: "detected", STARTING: "starting", CAPTURING: "capturing" };
 
 let state = State.IDLE;
 let meetTabId = null;
@@ -22,6 +22,7 @@ function updateBadge() {
   const badges = {
     [State.IDLE]: { text: "", color: "#000" },
     [State.DETECTED]: { text: "!", color: "#FF9800" },
+    [State.STARTING]: { text: "...", color: "#FF9800" },
     [State.CAPTURING]: { text: "REC", color: "#F44336" },
   };
   const badge = badges[state];
@@ -51,7 +52,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "MEET_LEFT") {
-    if (state === State.CAPTURING) {
+    if (state === State.CAPTURING || state === State.STARTING) {
       stopCapture();
     }
     meetTabId = null;
@@ -82,22 +83,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   } else if (msg.type === "START_RECORDING") {
     if (state === State.DETECTED && meetTabId) {
+      transitionTo(State.STARTING);
       startCapture(meetTabId);
     } else if (state === State.IDLE) {
-      // Manual: capture the current active tab
+      transitionTo(State.STARTING);
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         if (tabs[0]) {
           meetTabId = tabs[0].id;
           meetTitle = tabs[0].title || "";
           meetUrl = tabs[0].url || "";
           startCapture(meetTabId);
+        } else {
+          transitionTo(State.IDLE);
         }
       });
     }
+    // STARTING or CAPTURING — ignore duplicate clicks
     sendResponse({ ok: true });
 
   } else if (msg.type === "STOP_RECORDING") {
-    if (state === State.CAPTURING) {
+    if (state === State.CAPTURING || state === State.STARTING) {
       stopCapture();
     }
     sendResponse({ ok: true });
@@ -111,6 +116,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 chrome.notifications.onClicked.addListener((notificationId) => {
   if (notificationId === "meet-detected" && state === State.DETECTED && meetTabId) {
     chrome.notifications.clear("meet-detected");
+    transitionTo(State.STARTING);
     startCapture(meetTabId);
   }
 });

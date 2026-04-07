@@ -28,6 +28,8 @@ class Settings:
     diarize_mode: str = "hybrid"  # batch, realtime, or hybrid
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
+    server_host: str = "127.0.0.1"
+    server_port: int = 9876
 
     @property
     def recording_dir_path(self) -> Path:
@@ -51,6 +53,7 @@ def load_settings() -> Settings:
 
         rec = data.get("recording", {})
         trans = data.get("transcription", {})
+        srv = data.get("server", {})
 
         return Settings(
             recording_dir=rec.get("dir", "~/Desktop"),
@@ -66,6 +69,8 @@ def load_settings() -> Settings:
             diarize_mode=rec.get("diarize_mode", "hybrid"),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
+            server_host=srv.get("host", "127.0.0.1"),
+            server_port=srv.get("port", 9876),
         )
     except Exception:
         logger.exception("Failed to load config, using defaults")
@@ -93,6 +98,10 @@ def save_settings(settings: Settings) -> None:
         "[transcription]",
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',
         f'output_dir = "{settings.transcription_output_dir}"',
+        "",
+        "[server]",
+        f'host = "{settings.server_host}"',
+        f"port = {settings.server_port}",
         "",
     ]
 

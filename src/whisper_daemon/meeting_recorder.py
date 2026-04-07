@@ -61,16 +61,22 @@ class MeetingRecorder:
         self._chunk_start: float = 0.0
         self._voice_detected_in_chunk = False
         self._silence_start: float | None = None
+        self._vad_buffer = np.array([], dtype=np.float32)
 
-    def start(self) -> None:
-        """Start continuous recording."""
+    def _reset_state(self) -> None:
+        """Reset all recording state for a new session."""
         self._frames = []
         self._recording = True
         self._recording_start = time.monotonic()
         self._chunk_start = 0.0
         self._voice_detected_in_chunk = False
         self._silence_start = None
+        self._vad_buffer = np.array([], dtype=np.float32)
         self._vad.reset_states()
+
+    def start(self) -> None:
+        """Start continuous recording from an audio device."""
+        self._reset_state()
 
         self._stream = sd.InputStream(
             device=self._device,
@@ -88,8 +94,16 @@ class MeetingRecorder:
             device_name, self._channels,
         )
 
+    def start_without_device(self) -> None:
+        """Start recording state without an audio device.
+
+        Use with feed_audio() for external audio sources (e.g. WebSocket).
+        """
+        self._reset_state()
+        logger.info("Meeting recording started (external audio source)")
+
     def stop(self) -> None:
-        """Stop recording and emit any remaining audio as a final chunk."""
+        """Stop recording from audio device and emit remaining audio."""
         self._recording = False
 
         if self._stream is not None:
@@ -97,12 +111,38 @@ class MeetingRecorder:
             self._stream.close()
             self._stream = None
 
+        self._finalize()
+
+    def stop_without_device(self) -> None:
+        """Stop recording state for external audio sources."""
+        self._recording = False
+        self._finalize()
+
+    def _finalize(self) -> None:
+        """Emit remaining audio, send sentinel, reset VAD."""
         self._emit_chunk(is_final=True)
-        self._chunk_queue.put(None)  # sentinel: no more chunks
+        self._chunk_queue.put(None)
         self._vad.reset_states()
 
         elapsed = time.monotonic() - self._recording_start
         logger.info("Meeting recording stopped — total %.1fs", elapsed)
+
+    def feed_audio(self, samples: np.ndarray) -> None:
+        """Feed externally-sourced audio into the recording pipeline.
+
+        Accepts a 1D float32 mono array of arbitrary length. Buffers
+        internally and processes in BLOCK_SIZE (512-sample) chunks
+        through VAD and chunk-splitting logic.
+        """
+        if not self._recording:
+            return
+
+        self._vad_buffer = np.concatenate([self._vad_buffer, samples])
+
+        while len(self._vad_buffer) >= BLOCK_SIZE:
+            block = self._vad_buffer[:BLOCK_SIZE]
+            self._vad_buffer = self._vad_buffer[BLOCK_SIZE:]
+            self._process_block(block)
 
     def _callback(
         self,
@@ -117,12 +157,16 @@ class MeetingRecorder:
         if not self._recording:
             return
 
-        # Mix to mono if multi-channel (e.g. aggregate device)
         if indata.shape[1] > 1:
             mono = indata.mean(axis=1, keepdims=True)
         else:
             mono = indata
-        self._frames.append(mono.copy())
+
+        self._process_block(mono[:, 0].copy())
+
+    def _process_block(self, samples: np.ndarray) -> None:
+        """Process a single block of mono audio through VAD and chunk splitting."""
+        self._frames.append(samples.reshape(-1, 1))
 
         chunk_elapsed = self._current_chunk_duration()
         if chunk_elapsed >= MAX_CHUNK_SEC:
@@ -130,7 +174,6 @@ class MeetingRecorder:
             self._emit_chunk()
             return
 
-        samples = mono[:, 0]
         rms = np.sqrt(np.mean(samples ** 2))
         if rms < RMS_SILENCE_FLOOR:
             speech_prob = 0.0

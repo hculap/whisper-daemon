@@ -540,6 +540,83 @@ def record(
     click.echo(f"\nDone — {chunk_count} chunks, {len(merged.get('segments', []))} segments.")
 
 
+@cli.command()
+@click.option("--host", default=None, help="Server host (default: from config or 127.0.0.1).")
+@click.option("--port", default=None, type=int, help="Server port (default: from config or 9876).")
+@click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
+@click.option("--format", "formats", default="txt", help="Output formats, comma-separated: txt,srt,vtt,json.")
+@click.option("--output-dir", default=None, type=click.Path(), help="Output directory (default: ~/Desktop).")
+@click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
+@click.option("--chunk-silence", default=1.0, type=float, help="Seconds of silence to split chunks.")
+@click.option("--diarize", is_flag=True, help="Enable speaker diarization.")
+@click.option("--diarize-mode", type=click.Choice(["batch", "realtime", "hybrid"]), default="hybrid", help="Diarization approach.")
+@click.option("--num-speakers", type=int, default=None, help="Expected number of speakers.")
+@click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
+def serve(
+    host: str | None,
+    port: int | None,
+    model: str,
+    formats: str,
+    output_dir: str | None,
+    language: str | None,
+    chunk_silence: float,
+    diarize: bool,
+    diarize_mode: str,
+    num_speakers: int | None,
+    verbose: bool,
+) -> None:
+    """Start WebSocket server for browser audio capture.
+
+    Receives audio from the Chrome extension and transcribes using
+    the meeting recorder pipeline. Server stays running between sessions.
+
+    \b
+    Examples:
+      whisper-daemon serve                       # defaults
+      whisper-daemon serve --port 8765 -v
+      whisper-daemon serve --diarize --format txt,srt
+    """
+    import uvicorn
+
+    from whisper_daemon.audio_server import app, configure_server
+    from whisper_daemon.config import load_settings
+    from whisper_daemon.transcriber import preload_model
+
+    _setup_logging(verbose)
+
+    settings = load_settings()
+    resolved_host = host or settings.server_host
+    resolved_port = port or settings.server_port
+    resolved_output_dir = output_dir or settings.recording_dir
+
+    format_list = [f.strip().lower() for f in formats.split(",")]
+
+    click.echo(f"Model: {model}")
+    click.echo(f"Server: {resolved_host}:{resolved_port}")
+    click.echo(f"Output: {resolved_output_dir}")
+    if diarize:
+        click.echo(f"Diarization: {diarize_mode}")
+    click.echo()
+
+    preload_model(model)
+
+    configure_server(
+        model=model,
+        output_dir=resolved_output_dir,
+        formats=format_list,
+        language=language,
+        chunk_silence=chunk_silence,
+        diarize=diarize,
+        diarize_mode=diarize_mode,
+        num_speakers=num_speakers,
+    )
+
+    click.echo(f"Listening on ws://{resolved_host}:{resolved_port}/ws/audio")
+    click.echo("Waiting for browser connection... (Ctrl+C to stop)\n")
+
+    uvicorn.run(app, host=resolved_host, port=resolved_port, log_level="warning")
+
+
 def _collect_results(
     futures: dict,
     all_results: list[tuple[float, dict]],

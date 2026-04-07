@@ -206,6 +206,16 @@ class MeetingRecorder:
             self._frames = []
             return
 
+        # Skip silent chunks — no voice detected means only background noise.
+        # Whisper hallucinates on silence (e.g. "Thank you.", random words).
+        if not self._voice_detected_in_chunk and not is_final:
+            logger.debug("Skipping silent chunk (%.1fs, no voice detected)", duration)
+            self._frames = []
+            self._chunk_start += duration
+            self._silence_start = None
+            self._vad.reset_states()
+            return
+
         chunk = AudioChunk(
             audio=audio,
             start_time=self._chunk_start,

@@ -68,14 +68,27 @@ class MenuBarDelegate(NSObject):
         self._meeting_active = False
         self._meeting_start = 0.0
         self._meeting_thread = None
+        self._meeting_browser_triggered = False
         self._last_state = State.IDLE
         self._settings = load_settings()
+
+        # Browser audio bridge (Chrome extension)
+        from whisper_daemon.audio_server import BrowserAudioBridge
+        self._browser_bridge = BrowserAudioBridge(
+            host=self._settings.server_host,
+            port=self._settings.server_port,
+            on_connect=self._on_browser_connect,
+            on_audio=self._on_browser_audio,
+            on_disconnect=self._on_browser_disconnect,
+        )
+        self._browser_recorder = None  # set during meeting with browser source
 
         return self
 
     def applicationDidFinishLaunching_(self, notification):
         self._setup_status_bar()
         self._start_poll_timer()
+        self._browser_bridge.start()
 
     def _setup_status_bar(self):
         status_bar = NSStatusBar.systemStatusBar()
@@ -155,6 +168,14 @@ class MenuBarDelegate(NSObject):
         if self._settings.diarize:
             self._diarize_item.setState_(1)
         settings_menu.addItem_(self._diarize_item)
+
+        # Auto-Record Meetings toggle
+        self._auto_record_item = _make_item(
+            "Auto-Record Meetings", "onToggleAutoRecord:", self
+        )
+        if self._settings.auto_record_meetings:
+            self._auto_record_item.setState_(1)
+        settings_menu.addItem_(self._auto_record_item)
 
         settings_menu.addItem_(NSMenuItem.separatorItem())
 
@@ -312,6 +333,7 @@ class MenuBarDelegate(NSObject):
         logger.info("Quit from menu bar")
         if self._meeting_active:
             self._stop_meeting()
+        self._browser_bridge.stop()
         self._hotkey.stop()
         self._daemon.shutdown()
         AppHelper.stopEventLoop()
@@ -389,6 +411,13 @@ class MenuBarDelegate(NSObject):
         sender.setState_(1 if self._settings.diarize else 0)
         save_settings(self._settings)
         logger.info("Speaker diarization: %s", self._settings.diarize)
+
+    @objc.typedSelector(b"v@:@")
+    def onToggleAutoRecord_(self, sender):
+        self._settings.auto_record_meetings = not self._settings.auto_record_meetings
+        sender.setState_(1 if self._settings.auto_record_meetings else 0)
+        save_settings(self._settings)
+        logger.info("Auto-record meetings: %s", self._settings.auto_record_meetings)
 
     @objc.typedSelector(b"v@:@")
     def onChangeRecDir_(self, sender):
@@ -505,23 +534,48 @@ class MenuBarDelegate(NSObject):
         display = path.replace(str(Path.home()), "~") if path else "same as input"
         return f"{prefix}: {display}"
 
+    # -- Browser bridge callbacks (called from asyncio thread) --
+
+    def _on_browser_connect(self, title: str, url: str) -> None:
+        """Extension started a capture session."""
+        logger.info("Browser meeting started: %s (%s)", title, url)
+        if self._settings.auto_record_meetings and not self._meeting_active:
+            AppHelper.callAfter(self._start_meeting, True, title)
+
+    def _on_browser_audio(self, data: bytes) -> None:
+        """Raw PCM audio from browser tab."""
+        if self._browser_recorder is not None:
+            samples = np.frombuffer(data, dtype=np.float32)
+            self._browser_recorder.feed_audio(samples)
+
+    def _on_browser_disconnect(self) -> None:
+        """Extension disconnected or stopped capture."""
+        logger.info("Browser meeting ended")
+        if self._meeting_active and self._meeting_browser_triggered:
+            AppHelper.callAfter(self._stop_meeting)
+
     # -- Meeting recording --
 
-    def _start_meeting(self):
+    def _start_meeting(self, browser_triggered: bool = False, browser_title: str = "") -> None:
         self._meeting_active = True
+        self._meeting_browser_triggered = browser_triggered
         self._meeting_start = time.monotonic()
         self._meeting_menu_item.setTitle_("Stop Recording (0:00)")
         self._set_icon_by_name(MEETING_RECORDING_SYMBOL)
-        logger.info("Meeting recording started from menu bar")
+
+        trigger = "browser" if browser_triggered else "menu bar"
+        logger.info("Meeting recording started from %s", trigger)
 
         self._meeting_thread = threading.Thread(
-            target=self._meeting_worker, daemon=True
+            target=self._meeting_worker,
+            args=(browser_triggered, browser_title),
+            daemon=True,
         )
         self._meeting_thread.start()
 
-    def _stop_meeting(self):
+    def _stop_meeting(self) -> None:
         self._meeting_active = False
-        logger.info("Meeting recording stop requested from menu bar")
+        logger.info("Meeting recording stop requested")
 
         # If the worker thread never started or already finished, reset UI immediately
         if self._meeting_thread is None or not self._meeting_thread.is_alive():
@@ -533,7 +587,7 @@ class MenuBarDelegate(NSObject):
         self._set_icon(State.TRANSCRIBING)
         self._status_menu_item.setTitle_("Finishing transcription...")
 
-    def _meeting_worker(self):
+    def _meeting_worker(self, browser_triggered: bool = False, browser_title: str = "") -> None:
         from whisper_daemon import telemetry
         from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
         from whisper_daemon.screen_capture import ScreenCapture
@@ -542,7 +596,20 @@ class MenuBarDelegate(NSObject):
         model = self._daemon._model
         device = self._settings.recording_device or None
         chunk_queue: queue.Queue[AudioChunk | None] = queue.Queue()
-        recorder = MeetingRecorder(chunk_queue, device=device)
+
+        # Mic recorder (local device)
+        mic_recorder = MeetingRecorder(chunk_queue, device=device, source_label="mic")
+
+        # Browser recorder (Chrome extension tab audio)
+        browser_recorder: MeetingRecorder | None = None
+        if browser_triggered and self._browser_bridge.connected:
+            browser_recorder = MeetingRecorder(chunk_queue, source_label="browser")
+            browser_recorder.start_without_device()
+            self._browser_recorder = browser_recorder
+
+        # Number of recorders determines how many None sentinels to expect
+        sentinel_expected = 1 + (1 if browser_recorder else 0)
+        sentinel_count = 0
 
         all_results: list[tuple[float, dict]] = []
         all_audio: list[np.ndarray] = []
@@ -550,7 +617,9 @@ class MenuBarDelegate(NSObject):
 
         # Prepare output dir early for screenshots
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        rec_dir = self._settings.recording_dir_path / f"recording_{timestamp}"
+        title_slug = browser_title.replace(" ", "_")[:30] if browser_title else ""
+        dir_name = f"recording_{title_slug}_{timestamp}" if title_slug else f"recording_{timestamp}"
+        rec_dir = self._settings.recording_dir_path / dir_name
         rec_dir.mkdir(parents=True, exist_ok=True)
 
         screen_capture: ScreenCapture | None = None
@@ -561,7 +630,7 @@ class MenuBarDelegate(NSObject):
             screen_capture.start()
 
         telemetry.meeting_start()
-        recorder.start()
+        mic_recorder.start()
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -575,14 +644,19 @@ class MenuBarDelegate(NSObject):
                     except queue.Empty:
                         if _collect_futures(futures, all_results):
                             _write_partial(partial_path, all_results)
+                            self._send_results_to_browser(all_results, chunk_count)
                         continue
 
                     if chunk is None:
-                        break
+                        sentinel_count += 1
+                        if sentinel_count >= sentinel_expected:
+                            break
+                        continue
 
                     chunk_count += 1
                     logger.info(
-                        "Meeting chunk %d: %.1fs", chunk_count, chunk.duration
+                        "Meeting chunk %d: %.1fs [%s]",
+                        chunk_count, chunk.duration, chunk.source,
                     )
                     telemetry.meeting_chunk_queued(chunk_count, chunk.duration, chunk.start_time)
                     if self._settings.save_audio or self._settings.diarize:
@@ -598,8 +672,12 @@ class MenuBarDelegate(NSObject):
                     futures[future] = chunk.start_time
                     if _collect_futures(futures, all_results):
                         _write_partial(partial_path, all_results)
+                        self._send_results_to_browser(all_results, chunk_count)
 
-                recorder.stop()
+                mic_recorder.stop()
+                if browser_recorder is not None:
+                    browser_recorder.stop_without_device()
+                    self._browser_recorder = None
                 if screen_capture is not None:
                     screen_capture.stop()
 
@@ -613,7 +691,7 @@ class MenuBarDelegate(NSObject):
                     except queue.Empty:
                         break
                     if chunk is None:
-                        break
+                        continue
                     chunk_count += 1
                     if self._settings.save_audio or self._settings.diarize:
                         all_audio.append(chunk.audio.copy())
@@ -683,8 +761,19 @@ class MenuBarDelegate(NSObject):
         )
         self._reset_meeting_ui()
 
-    def _reset_meeting_ui(self):
+    def _send_results_to_browser(self, all_results: list, chunk_count: int) -> None:
+        """Forward transcription results to the Chrome extension if connected."""
+        if not self._browser_bridge.connected:
+            return
+        for start_time, result in all_results[-3:]:  # send recent results
+            text = result.get("text", "").strip()
+            if text:
+                self._browser_bridge.send_chunk_result(text, start_time, chunk_count)
+
+    def _reset_meeting_ui(self) -> None:
         self._meeting_active = False
+        self._meeting_browser_triggered = False
+        self._browser_recorder = None
         self._meeting_menu_item.setTitle_("Start Meeting Recording")
         self._set_icon(State.IDLE)
         self._status_menu_item.setTitle_("Status: Ready")

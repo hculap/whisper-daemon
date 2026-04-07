@@ -30,6 +30,7 @@ class AudioChunk:
     audio: np.ndarray
     start_time: float  # seconds from recording start
     duration: float  # seconds
+    source: str = "mic"  # "mic" or "browser"
 
 
 class MeetingRecorder:
@@ -45,10 +46,12 @@ class MeetingRecorder:
         chunk_queue: queue.Queue[AudioChunk | None],
         device: str | int | None = None,
         chunk_silence: float = DEFAULT_CHUNK_SILENCE,
+        source_label: str = "mic",
     ) -> None:
         self._chunk_queue = chunk_queue
         self._device = device
         self._chunk_silence = chunk_silence
+        self._source_label = source_label
 
         self._vad = SileroVAD()
         self._channels = self._detect_channels()
@@ -207,6 +210,7 @@ class MeetingRecorder:
             audio=audio,
             start_time=self._chunk_start,
             duration=duration,
+            source=self._source_label,
         )
         self._chunk_queue.put(chunk)
         logger.info(

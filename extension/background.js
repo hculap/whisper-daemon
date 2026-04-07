@@ -1,7 +1,12 @@
 /**
  * Service worker: manages state machine, tabCapture, and offscreen document lifecycle.
  *
- * States: IDLE -> DETECTED -> CAPTURING
+ * States: IDLE -> DETECTED -> STARTING -> CAPTURING
+ *
+ * The extension is a trigger + audio source for whisper-daemon.
+ * When a meeting is detected, the user clicks "Start Capture" in the popup
+ * (Chrome requires a user gesture for tabCapture). The daemon handles
+ * recording, transcription, diarization, and output automatically.
  */
 
 const State = { IDLE: "idle", DETECTED: "detected", STARTING: "starting", CAPTURING: "capturing" };
@@ -30,7 +35,7 @@ function updateBadge() {
   chrome.action.setBadgeBackgroundColor({ color: badge.color });
 }
 
-// --- Messages from content script and offscreen ---
+// --- Messages ---
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.type === "MEET_JOINED") {
@@ -44,7 +49,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         type: "basic",
         iconUrl: "icons/icon128.png",
         title: "Meeting Detected",
-        message: `${meetTitle || "Google Meet"} — Click to start recording`,
+        message: `${meetTitle || "Google Meet"} — Click to start capture`,
         priority: 2,
         requireInteraction: true,
       });
@@ -61,9 +66,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   } else if (msg.type === "CAPTURE_STARTED") {
     transitionTo(State.CAPTURING);
+    relayToContentScript(msg);
     sendResponse({ ok: true });
 
   } else if (msg.type === "CAPTURE_STOPPED") {
+    relayToContentScript(msg);
     transitionTo(State.IDLE);
     meetTabId = null;
     sendResponse({ ok: true });
@@ -72,33 +79,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     chrome.notifications.create("capture-error", {
       type: "basic",
       iconUrl: "icons/icon128.png",
-      title: "Recording Error",
+      title: "Capture Error",
       message: msg.message || "Failed to capture audio",
     });
+    relayToContentScript(msg);
     transitionTo(State.IDLE);
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "CHUNK_TRANSCRIBED") {
+    relayToContentScript(msg);
     sendResponse({ ok: true });
 
   } else if (msg.type === "GET_STATE") {
     sendResponse({ state, meetTabId, meetTitle, meetUrl });
 
-  } else if (msg.type === "START_RECORDING") {
-    if (state === State.DETECTED && meetTabId) {
+  } else if (msg.type === "START_WITH_STREAM") {
+    // Popup obtained streamId (has user gesture for tabCapture)
+    if (state !== State.CAPTURING) {
+      meetTabId = msg.tabId || meetTabId;
       transitionTo(State.STARTING);
-      startCapture(meetTabId);
-    } else if (state === State.IDLE) {
-      transitionTo(State.STARTING);
-      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
-        if (tabs[0]) {
-          meetTabId = tabs[0].id;
-          meetTitle = tabs[0].title || "";
-          meetUrl = tabs[0].url || "";
-          startCapture(meetTabId);
-        } else {
-          transitionTo(State.IDLE);
-        }
-      });
+      startCaptureWithStream(msg.streamId);
     }
-    // STARTING or CAPTURING — ignore duplicate clicks
     sendResponse({ ok: true });
 
   } else if (msg.type === "STOP_RECORDING") {
@@ -108,43 +109,32 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
   }
 
-  return true; // async response
+  return true;
 });
 
-// --- Notification click ---
+// --- Notification click: open popup ---
 
 chrome.notifications.onClicked.addListener((notificationId) => {
   if (notificationId === "meet-detected" && state === State.DETECTED && meetTabId) {
     chrome.notifications.clear("meet-detected");
-    transitionTo(State.STARTING);
-    startCapture(meetTabId);
+    chrome.tabs.update(meetTabId, { active: true });
+    chrome.action.openPopup();
   }
 });
 
-// --- Tab capture + offscreen orchestration ---
+// --- Capture ---
 
-async function startCapture(tabId) {
+async function startCaptureWithStream(streamId) {
   try {
-    const streamId = await new Promise((resolve, reject) => {
-      chrome.tabCapture.getMediaStreamId({ targetTabId: tabId }, (id) => {
-        if (chrome.runtime.lastError) {
-          return reject(new Error(chrome.runtime.lastError.message));
-        }
-        if (!id) return reject(new Error("Empty stream ID"));
-        resolve(id);
-      });
-    });
-
     await ensureOffscreenDocument();
 
     chrome.runtime.sendMessage({
       type: "START_CAPTURE",
       streamId,
-      tabId,
+      tabId: meetTabId,
       meetTitle,
       meetUrl,
     });
-
   } catch (err) {
     console.error("Failed to start capture:", err);
     chrome.runtime.sendMessage({
@@ -162,7 +152,6 @@ async function ensureOffscreenDocument() {
   const contexts = await chrome.runtime.getContexts({
     contextTypes: ["OFFSCREEN_DOCUMENT"],
   });
-
   if (contexts.length > 0) return;
 
   await chrome.offscreen.createDocument({
@@ -170,6 +159,14 @@ async function ensureOffscreenDocument() {
     reasons: ["USER_MEDIA"],
     justification: "Capture tab audio for transcription",
   });
+}
+
+// --- Relay to content script (overlay) ---
+
+function relayToContentScript(msg) {
+  if (meetTabId) {
+    chrome.tabs.sendMessage(meetTabId, msg).catch(() => {});
+  }
 }
 
 // --- Cleanup on tab close ---

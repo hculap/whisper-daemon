@@ -3,7 +3,7 @@
  * and streams to whisper-daemon over WebSocket.
  */
 
-const WS_URL = "ws://127.0.0.1:9876/ws/audio";
+const WS_URL = "ws://127.0.0.1:9876";
 const RECONNECT_ATTEMPTS = 3;
 const RECONNECT_DELAY_MS = 1000;
 const PING_INTERVAL_MS = 25000;

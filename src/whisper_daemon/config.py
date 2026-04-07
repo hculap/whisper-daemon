@@ -26,6 +26,7 @@ class Settings:
     screenshot_cooldown: float = 5.0  # minimum seconds between captures
     diarize: bool = False  # enable speaker diarization for meeting recordings
     diarize_mode: str = "hybrid"  # batch, realtime, or hybrid
+    auto_record_meetings: bool = True  # auto-start recording on browser meeting detect
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
     server_host: str = "127.0.0.1"
@@ -67,6 +68,7 @@ def load_settings() -> Settings:
             screenshot_cooldown=rec.get("screenshot_cooldown", 5.0),
             diarize=rec.get("diarize", False),
             diarize_mode=rec.get("diarize_mode", "hybrid"),
+            auto_record_meetings=rec.get("auto_record_meetings", True),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
             server_host=srv.get("host", "127.0.0.1"),
@@ -94,6 +96,7 @@ def save_settings(settings: Settings) -> None:
         f"screenshot_cooldown = {settings.screenshot_cooldown}",
         f'diarize = {"true" if settings.diarize else "false"}',
         f'diarize_mode = "{settings.diarize_mode}"',
+        f'auto_record_meetings = {"true" if settings.auto_record_meetings else "false"}',
         "",
         "[transcription]",
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',

@@ -16,10 +16,12 @@ logger = logging.getLogger(__name__)
 
 RECORD_COMBO = (NSCommandKeyMask | NSShiftKeyMask, 49)       # Cmd+Shift+Space
 PASTE_LAST_COMBO = (NSCommandKeyMask | NSShiftKeyMask, 9)    # Cmd+Shift+V
+SPEAK_COMBO = (NSCommandKeyMask | NSShiftKeyMask, 8)         # Cmd+Shift+C
 
 HOTKEY_DESCRIPTIONS = {
     RECORD_COMBO: "Cmd+Shift+Space (record)",
     PASTE_LAST_COMBO: "Cmd+Shift+V (paste last)",
+    SPEAK_COMBO: "Cmd+Shift+C (copy & speak)",
 }
 
 
@@ -44,6 +46,9 @@ class HotkeyListener:
         elif keycode == PASTE_LAST_COMBO[1]:
             logger.info("Hotkey: paste last transcription")
             self._queue.put(Event(EventType.PASTE_LAST))
+        elif keycode == SPEAK_COMBO[1]:
+            logger.info("Hotkey: copy & speak")
+            self._queue.put(Event(EventType.SPEAK_CLIPBOARD))
 
     def start(self) -> None:
         self._monitor = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(

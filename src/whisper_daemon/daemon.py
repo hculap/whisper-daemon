@@ -14,6 +14,7 @@ from whisper_daemon.paster import paste_text
 from whisper_daemon.recorder import AudioRecorder
 from whisper_daemon.sounds import play_error, play_start, play_stop
 from whisper_daemon.transcriber import transcribe
+from whisper_daemon.tts import speak_text
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,8 @@ class Daemon:
             self._handle_transcription_done(event.payload)
         elif event.type == EventType.PASTE_LAST:
             self._handle_paste_last()
+        elif event.type == EventType.SPEAK_CLIPBOARD:
+            self._handle_speak_clipboard()
         elif event.type == EventType.ERROR:
             self._handle_error(event.payload)
 
@@ -220,6 +223,38 @@ class Daemon:
             logger.info("Pasted last transcription (%d chars)", len(self._history[0]))
         else:
             logger.info("No transcription history to paste")
+
+    def _handle_speak_clipboard(self) -> None:
+        """Simulate Cmd+C to copy selected text, then speak it via TTS."""
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+        from Quartz import (
+            CGEventCreateKeyboardEvent,
+            CGEventPost,
+            CGEventSetFlags,
+            kCGEventFlagMaskCommand,
+            kCGHIDEventTap,
+        )
+
+        C_KEYCODE = 8
+
+        event_down = CGEventCreateKeyboardEvent(None, C_KEYCODE, True)
+        CGEventSetFlags(event_down, kCGEventFlagMaskCommand)
+        CGEventPost(kCGHIDEventTap, event_down)
+
+        event_up = CGEventCreateKeyboardEvent(None, C_KEYCODE, False)
+        CGEventSetFlags(event_up, kCGEventFlagMaskCommand)
+        CGEventPost(kCGHIDEventTap, event_up)
+
+        time.sleep(0.15)
+
+        pb = NSPasteboard.generalPasteboard()
+        text = pb.stringForType_(NSPasteboardTypeString)
+
+        if text:
+            logger.info("Speak clipboard: %d chars", len(text))
+            speak_text(str(text))
+        else:
+            logger.info("Clipboard empty, nothing to speak")
 
     def _handle_error(self, message: str) -> None:
         play_error()

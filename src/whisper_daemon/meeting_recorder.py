@@ -65,6 +65,8 @@ class MeetingRecorder:
         self._voice_detected_in_chunk = False
         self._silence_start: float | None = None
         self._vad_buffer = np.array([], dtype=np.float32)
+        self._device_error_count: int = 0
+        self._needs_recovery: bool = False
 
     def _reset_state(self) -> None:
         """Reset all recording state for a new session."""
@@ -75,27 +77,81 @@ class MeetingRecorder:
         self._voice_detected_in_chunk = False
         self._silence_start = None
         self._vad_buffer = np.array([], dtype=np.float32)
+        self._device_error_count = 0
+        self._needs_recovery = False
         self._vad.reset_states()
 
+    @property
+    def needs_recovery(self) -> bool:
+        return self._needs_recovery
+
+    def recover_device(self) -> bool:
+        """Attempt to reopen audio stream after device failure.
+
+        Returns True if recovery succeeded.
+        """
+        if self._stream is not None:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
+
+        self._emit_chunk()
+        self._device_error_count = 0
+        self._needs_recovery = False
+
+        try:
+            device, channels = self._open_stream()
+            self._stream.start()
+            logger.info("Device recovered (device: %s, channels: %d)", device or "system default", channels)
+            return True
+        except Exception:
+            logger.error("Device recovery failed — no audio devices available")
+            return False
+
     def start(self) -> None:
-        """Start continuous recording from an audio device."""
+        """Start continuous recording. Falls back to system default if preferred device fails."""
         self._reset_state()
 
+        device, channels = self._open_stream()
+        self._stream.start()
+        logger.info(
+            "Meeting recording started (device: %s, channels: %d)",
+            device or "system default", channels,
+        )
+
+    def _open_stream(self) -> tuple[str | int | None, int]:
+        """Try preferred device, fall back to system default on failure."""
+        if self._device is not None:
+            try:
+                self._channels = self._detect_channels()
+                self._stream = sd.InputStream(
+                    device=self._device,
+                    samplerate=SAMPLE_RATE,
+                    channels=self._channels,
+                    dtype=DTYPE,
+                    blocksize=BLOCK_SIZE,
+                    callback=self._callback,
+                )
+                return self._device, self._channels
+            except sd.PortAudioError:
+                logger.warning(
+                    "Device '%s' unavailable, falling back to system default",
+                    self._device,
+                )
+
+        self._channels = CHANNELS
         self._stream = sd.InputStream(
-            device=self._device,
+            device=None,
             samplerate=SAMPLE_RATE,
             channels=self._channels,
             dtype=DTYPE,
             blocksize=BLOCK_SIZE,
             callback=self._callback,
         )
-        self._stream.start()
-
-        device_name = self._device or "system default"
-        logger.info(
-            "Meeting recording started (device: %s, channels: %d)",
-            device_name, self._channels,
-        )
+        return None, self._channels
 
     def start_without_device(self) -> None:
         """Start recording state without an audio device.
@@ -156,6 +212,18 @@ class MeetingRecorder:
     ) -> None:
         if status:
             logger.warning("Audio status: %s", status)
+            if status.priming:
+                return
+            # Input overflow is normal under load, but input underflow or
+            # other flags may indicate the device was lost.
+            if not status.input_overflow:
+                self._device_error_count += 1
+                if self._device_error_count >= 10:
+                    logger.error("Too many device errors, requesting recovery")
+                    self._needs_recovery = True
+                    return
+            else:
+                self._device_error_count = 0
 
         if not self._recording:
             return

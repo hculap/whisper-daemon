@@ -33,10 +33,12 @@ class Daemon:
         event_queue: queue.Queue[Event],
         recorder: AudioRecorder,
         model: str = "mlx-community/whisper-large-v3-turbo-q4",
+        settings: object | None = None,
     ) -> None:
         self._queue = event_queue
         self._recorder = recorder
         self._model = model
+        self._settings = settings
         self._state = State.IDLE
         self._running = False
         self._recording_started_at: float = 0.0
@@ -75,7 +77,12 @@ class Daemon:
                 self._maybe_warmup_gpu()
                 continue
 
-            self._handle_event(event)
+            try:
+                self._handle_event(event)
+            except Exception:
+                logger.exception("Unhandled error in event loop")
+                play_error()
+                self._state = State.IDLE
 
         self._cleanup()
         logger.info("Daemon stopped")
@@ -98,11 +105,16 @@ class Daemon:
 
     def _handle_toggle(self) -> None:
         if self._state == State.IDLE:
+            try:
+                self._recorder.start_recording()
+            except Exception as exc:
+                logger.error("Failed to open audio device: %s", exc)
+                play_error()
+                return
             self._state = State.RECORDING
             self._recording_started_at = time.monotonic()
             self._pending_text = ""
             self._pending_samples = 0
-            self._recorder.start_recording()
             play_start()
             telemetry.mark("record_start")
             logger.info("State: IDLE -> RECORDING")
@@ -251,8 +263,11 @@ class Daemon:
         text = pb.stringForType_(NSPasteboardTypeString)
 
         if text:
-            logger.info("Speak clipboard: %d chars", len(text))
-            speak_text(str(text))
+            tts_lang = "auto"
+            if self._settings is not None:
+                tts_lang = getattr(self._settings, "tts_language", "auto")
+            logger.info("Speak clipboard: %d chars (lang=%s)", len(text), tts_lang)
+            speak_text(str(text), language=tts_lang)
         else:
             logger.info("Clipboard empty, nothing to speak")
 

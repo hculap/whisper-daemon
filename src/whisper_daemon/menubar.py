@@ -71,6 +71,7 @@ class MenuBarDelegate(NSObject):
         self._meeting_browser_triggered = False
         self._last_state = State.IDLE
         self._settings = load_settings()
+        self._daemon._settings = self._settings
 
         # Browser audio bridge (Chrome extension)
         from whisper_daemon.audio_server import BrowserAudioBridge
@@ -176,6 +177,22 @@ class MenuBarDelegate(NSObject):
         if self._settings.auto_record_meetings:
             self._auto_record_item.setState_(1)
         settings_menu.addItem_(self._auto_record_item)
+
+        # TTS Language (submenu with radio-style selection)
+        tts_lang_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "TTS Language", None, ""
+        )
+        self._tts_lang_menu = NSMenu.alloc().init()
+        self._tts_lang_items = {}
+        for lang_code, lang_label in [("auto", "Auto-detect"), ("pl", "Polish"), ("en", "English")]:
+            li = _make_item(lang_label, "onSelectTTSLang:", self)
+            li.setRepresentedObject_(lang_code)
+            if self._settings.tts_language == lang_code:
+                li.setState_(1)
+            self._tts_lang_menu.addItem_(li)
+            self._tts_lang_items[lang_code] = li
+        tts_lang_item.setSubmenu_(self._tts_lang_menu)
+        settings_menu.addItem_(tts_lang_item)
 
         settings_menu.addItem_(NSMenuItem.separatorItem())
 
@@ -420,6 +437,16 @@ class MenuBarDelegate(NSObject):
         logger.info("Auto-record meetings: %s", self._settings.auto_record_meetings)
 
     @objc.typedSelector(b"v@:@")
+    def onSelectTTSLang_(self, sender):
+        lang_code = str(sender.representedObject())
+        for item in self._tts_lang_items.values():
+            item.setState_(0)
+        sender.setState_(1)
+        self._settings.tts_language = lang_code
+        save_settings(self._settings)
+        logger.info("TTS language changed to: %s", lang_code)
+
+    @objc.typedSelector(b"v@:@")
     def onChangeRecDir_(self, sender):
         from AppKit import NSOpenPanel
 
@@ -630,7 +657,15 @@ class MenuBarDelegate(NSObject):
             screen_capture.start()
 
         telemetry.meeting_start()
-        mic_recorder.start()
+        try:
+            mic_recorder.start()
+        except Exception as exc:
+            logger.error("Failed to open mic for meeting: %s", exc)
+            if screen_capture:
+                screen_capture.stop()
+            self._meeting_active = False
+            self._update_meeting_menu(False)
+            return
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -639,6 +674,14 @@ class MenuBarDelegate(NSObject):
                 partial_path = rec_dir / "transcript_live.txt"
 
                 while self._meeting_active:
+                    # Check if mic recorder needs device recovery
+                    if mic_recorder.needs_recovery:
+                        logger.warning("Mic device lost, attempting recovery...")
+                        if mic_recorder.recover_device():
+                            logger.info("Mic recovered, meeting continues")
+                        else:
+                            logger.error("Mic recovery failed, meeting continues with browser audio only")
+
                     try:
                         chunk = chunk_queue.get(timeout=0.5)
                     except queue.Empty:

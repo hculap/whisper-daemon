@@ -27,6 +27,7 @@ class Settings:
     diarize: bool = False  # enable speaker diarization for meeting recordings
     diarize_mode: str = "hybrid"  # batch, realtime, or hybrid
     auto_record_meetings: bool = True  # auto-start recording on browser meeting detect
+    tts_language: str = "auto"  # auto, pl, or en
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
     server_host: str = "127.0.0.1"
@@ -69,6 +70,7 @@ def load_settings() -> Settings:
             diarize=rec.get("diarize", False),
             diarize_mode=rec.get("diarize_mode", "hybrid"),
             auto_record_meetings=rec.get("auto_record_meetings", True),
+            tts_language=data.get("tts", {}).get("language", "auto"),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
             server_host=srv.get("host", "127.0.0.1"),
@@ -101,6 +103,9 @@ def save_settings(settings: Settings) -> None:
         "[transcription]",
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',
         f'output_dir = "{settings.transcription_output_dir}"',
+        "",
+        "[tts]",
+        f'language = "{settings.tts_language}"',
         "",
         "[server]",
         f'host = "{settings.server_host}"',

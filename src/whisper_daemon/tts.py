@@ -26,12 +26,12 @@ def _detect_language(text: str) -> str:
     return "pl" if polish_count >= 2 else "en"
 
 
-def speak_text(text: str) -> None:
+def speak_text(text: str, language: str = "auto") -> None:
     """Speak text using Piper TTS in a background thread."""
     if not text.strip():
         return
 
-    thread = threading.Thread(target=_speak_worker, args=(text,), daemon=True)
+    thread = threading.Thread(target=_speak_worker, args=(text, language), daemon=True)
     thread.start()
 
 
@@ -40,14 +40,14 @@ def stop_speaking() -> None:
     _stop_event.set()
 
 
-def _speak_worker(text: str) -> None:
+def _speak_worker(text: str, language: str = "auto") -> None:
     if not _speaking_lock.acquire(blocking=False):
         logger.info("TTS already speaking, skipping")
         return
 
     _stop_event.clear()
     try:
-        lang = _detect_language(text)
+        lang = language if language != "auto" else _detect_language(text)
         voice = VOICES.get(lang, VOICES["en"])
 
         if not voice.exists():

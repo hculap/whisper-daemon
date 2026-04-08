@@ -140,7 +140,7 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     logger.info("Initializing components...")
     recorder = AudioRecorder(event_queue, silence_timeout=silence_timeout, device=device)
     hotkey = HotkeyListener(event_queue)
-    daemon = Daemon(event_queue, recorder, model=model)
+    daemon = Daemon(event_queue, recorder, model=model, settings=settings)
 
     preload_model(model)
 

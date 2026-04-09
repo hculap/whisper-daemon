@@ -169,10 +169,11 @@ class Daemon:
         audio = self._recorder.stop_recording()
         play_stop()
 
-        # Wait for any in-flight preview to finish (avoid concurrent GPU access)
+        # Wait for any in-flight preview to finish (avoid concurrent GPU access).
+        # No timeout — concurrent MLX/Metal calls cause SIGABRT.
         if self._preview_thread is not None and self._preview_thread.is_alive():
             logger.info("Waiting for preview to finish before final transcription...")
-            self._preview_thread.join(timeout=5.0)
+            self._preview_thread.join()
 
         telemetry.mark("record_stop", audio_sec=round(len(audio) / 16000, 1) if audio.size > 0 else 0)
         logger.info("State: RECORDING -> TRANSCRIBING")

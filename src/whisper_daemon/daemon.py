@@ -14,6 +14,7 @@ from whisper_daemon.paster import paste_text
 from whisper_daemon.recorder import AudioRecorder
 from whisper_daemon.sounds import play_error, play_start, play_stop
 from whisper_daemon.transcriber import transcribe
+from whisper_daemon.tts import speak_text
 
 logger = logging.getLogger(__name__)
 
@@ -32,10 +33,12 @@ class Daemon:
         event_queue: queue.Queue[Event],
         recorder: AudioRecorder,
         model: str = "mlx-community/whisper-large-v3-turbo-q4",
+        settings: object | None = None,
     ) -> None:
         self._queue = event_queue
         self._recorder = recorder
         self._model = model
+        self._settings = settings
         self._state = State.IDLE
         self._running = False
         self._recording_started_at: float = 0.0
@@ -74,7 +77,12 @@ class Daemon:
                 self._maybe_warmup_gpu()
                 continue
 
-            self._handle_event(event)
+            try:
+                self._handle_event(event)
+            except Exception:
+                logger.exception("Unhandled error in event loop")
+                play_error()
+                self._state = State.IDLE
 
         self._cleanup()
         logger.info("Daemon stopped")
@@ -90,16 +98,23 @@ class Daemon:
             self._handle_transcription_done(event.payload)
         elif event.type == EventType.PASTE_LAST:
             self._handle_paste_last()
+        elif event.type == EventType.SPEAK_CLIPBOARD:
+            self._handle_speak_clipboard()
         elif event.type == EventType.ERROR:
             self._handle_error(event.payload)
 
     def _handle_toggle(self) -> None:
         if self._state == State.IDLE:
+            try:
+                self._recorder.start_recording()
+            except Exception as exc:
+                logger.error("Failed to open audio device: %s", exc)
+                play_error()
+                return
             self._state = State.RECORDING
             self._recording_started_at = time.monotonic()
             self._pending_text = ""
             self._pending_samples = 0
-            self._recorder.start_recording()
             play_start()
             telemetry.mark("record_start")
             logger.info("State: IDLE -> RECORDING")
@@ -154,10 +169,11 @@ class Daemon:
         audio = self._recorder.stop_recording()
         play_stop()
 
-        # Wait for any in-flight preview to finish (avoid concurrent GPU access)
+        # Wait for any in-flight preview to finish (avoid concurrent GPU access).
+        # No timeout — concurrent MLX/Metal calls cause SIGABRT.
         if self._preview_thread is not None and self._preview_thread.is_alive():
             logger.info("Waiting for preview to finish before final transcription...")
-            self._preview_thread.join(timeout=5.0)
+            self._preview_thread.join()
 
         telemetry.mark("record_stop", audio_sec=round(len(audio) / 16000, 1) if audio.size > 0 else 0)
         logger.info("State: RECORDING -> TRANSCRIBING")
@@ -220,6 +236,41 @@ class Daemon:
             logger.info("Pasted last transcription (%d chars)", len(self._history[0]))
         else:
             logger.info("No transcription history to paste")
+
+    def _handle_speak_clipboard(self) -> None:
+        """Simulate Cmd+C to copy selected text, then speak it via TTS."""
+        from AppKit import NSPasteboard, NSPasteboardTypeString
+        from Quartz import (
+            CGEventCreateKeyboardEvent,
+            CGEventPost,
+            CGEventSetFlags,
+            kCGEventFlagMaskCommand,
+            kCGHIDEventTap,
+        )
+
+        C_KEYCODE = 8
+
+        event_down = CGEventCreateKeyboardEvent(None, C_KEYCODE, True)
+        CGEventSetFlags(event_down, kCGEventFlagMaskCommand)
+        CGEventPost(kCGHIDEventTap, event_down)
+
+        event_up = CGEventCreateKeyboardEvent(None, C_KEYCODE, False)
+        CGEventSetFlags(event_up, kCGEventFlagMaskCommand)
+        CGEventPost(kCGHIDEventTap, event_up)
+
+        time.sleep(0.15)
+
+        pb = NSPasteboard.generalPasteboard()
+        text = pb.stringForType_(NSPasteboardTypeString)
+
+        if text:
+            tts_lang = "auto"
+            if self._settings is not None:
+                tts_lang = getattr(self._settings, "tts_language", "auto")
+            logger.info("Speak clipboard: %d chars (lang=%s)", len(text), tts_lang)
+            speak_text(str(text), language=tts_lang)
+        else:
+            logger.info("Clipboard empty, nothing to speak")
 
     def _handle_error(self, message: str) -> None:
         play_error()

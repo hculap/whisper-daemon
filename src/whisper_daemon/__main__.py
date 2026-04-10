@@ -13,6 +13,8 @@ import click
 CONFIG_DIR = Path.home() / ".config" / "whisper-daemon"
 PID_FILE = CONFIG_DIR / "daemon.pid"
 LOG_FILE = CONFIG_DIR / "daemon.log"
+NATIVE_LOG_FILE = CONFIG_DIR / "daemon.native.log"
+NATIVE_LOG_MAX_BYTES = 10 * 1024 * 1024
 
 
 @click.group(invoke_without_command=True, context_settings={"show_default": True})
@@ -47,11 +49,20 @@ def start(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -
     if verbose:
         cmd.append("--verbose")
 
-    log_handle = open(LOG_FILE, "a")
+    # Capture native stdout/stderr (PortAudio, Metal, crash messages) to a
+    # dedicated file — Python logging goes to daemon.log via a handler, but
+    # anything the C libraries write directly to fd 1/2 bypasses that. If we
+    # dropped it to /dev/null (as this code previously did) a real crash would
+    # leave zero evidence. Simple size-based rotation: on each start, move the
+    # existing file aside if it has grown past the cap.
+    if NATIVE_LOG_FILE.exists() and NATIVE_LOG_FILE.stat().st_size > NATIVE_LOG_MAX_BYTES:
+        NATIVE_LOG_FILE.replace(CONFIG_DIR / "daemon.native.log.old")
+    native_log = open(NATIVE_LOG_FILE, "a", buffering=1)
     proc = subprocess.Popen(
         cmd,
-        stdout=log_handle,
-        stderr=log_handle,
+        stdin=subprocess.DEVNULL,
+        stdout=native_log,
+        stderr=native_log,
         start_new_session=True,
     )
 
@@ -140,7 +151,7 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     logger.info("Initializing components...")
     recorder = AudioRecorder(event_queue, silence_timeout=silence_timeout, device=device)
     hotkey = HotkeyListener(event_queue)
-    daemon = Daemon(event_queue, recorder, model=model)
+    daemon = Daemon(event_queue, recorder, model=model, settings=settings)
 
     preload_model(model)
 
@@ -540,6 +551,7 @@ def record(
     click.echo(f"\nDone — {chunk_count} chunks, {len(merged.get('segments', []))} segments.")
 
 
+
 def _collect_results(
     futures: dict,
     all_results: list[tuple[float, dict]],
@@ -626,17 +638,31 @@ def _is_running() -> bool:
 
 def _setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stderr,
-    )
+    fmt = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    datefmt = "%Y-%m-%d %H:%M:%S"
+    formatter = logging.Formatter(fmt, datefmt=datefmt)
+
+    root = logging.getLogger()
+    # Clear any pre-existing handlers to avoid duplicates
+    root.handlers.clear()
+    root.setLevel(level)
+
+    # Console handler (stderr) — visible in foreground mode
+    console = logging.StreamHandler(sys.stderr)
+    console.setLevel(level)
+    console.setFormatter(formatter)
+    root.addHandler(console)
+
+    # File handler (canonical log location)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+    root.addHandler(file_handler)
+
     for noisy in ("httpcore", "httpx", "urllib3", "huggingface_hub", "filelock"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    # Suppress multiprocessing resource_tracker warnings about leaked semaphores
-    # on shutdown — these come from mlx-whisper internals, not our code.
     import warnings
     warnings.filterwarnings("ignore", message="resource_tracker:.*leaked semaphore", category=UserWarning)
 

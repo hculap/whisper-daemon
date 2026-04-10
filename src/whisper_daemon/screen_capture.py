@@ -2,17 +2,32 @@
 
 Supports multiple displays — each captured separately with independent
 change detection. Files named: {timestamp}_display{N}.png
+
+Uses Quartz CGWindowListCreateImage directly instead of the screencapture
+CLI, which can return empty desktop images on some macOS versions.
 """
 
 import logging
-import subprocess
 import threading
 import time
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
-from Quartz import CGGetActiveDisplayList
+from Quartz import (
+    CGDataProviderCopyData,
+    CGDisplayBounds,
+    CGGetActiveDisplayList,
+    CGImageGetBitsPerPixel,
+    CGImageGetBytesPerRow,
+    CGImageGetDataProvider,
+    CGImageGetHeight,
+    CGImageGetWidth,
+    CGWindowListCreateImage,
+    kCGNullWindowID,
+    kCGWindowImageDefault,
+    kCGWindowListOptionOnScreenOnly,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,32 +102,20 @@ class ScreenCapture:
         elapsed = time.monotonic() - self._start_time
         timestamp_sec = int(elapsed)
 
-        display_count = _get_display_count()
+        display_ids = _get_display_ids()
 
-        for display_num in range(1, display_count + 1):
-            self._capture_display(display_num, timestamp_sec)
+        for i, display_id in enumerate(display_ids):
+            display_num = i + 1
+            self._capture_display(display_id, display_num, timestamp_sec)
 
-    def _capture_display(self, display_num: int, timestamp_sec: int) -> None:
-        temp_path = self._output_dir / f"_temp_d{display_num}.png"
-
-        # screencapture -D uses sequential index (1, 2, 3...), not display IDs
+    def _capture_display(self, display_id: int, display_num: int, timestamp_sec: int) -> None:
         try:
-            result = subprocess.run(
-                ["screencapture", "-x", "-C", "-D", str(display_num), str(temp_path)],
-                capture_output=True,
-                timeout=5,
-            )
-        except subprocess.TimeoutExpired:
-            logger.debug("screencapture timed out for display %d (screen locked?)", display_num)
-            temp_path.unlink(missing_ok=True)
-            return
-        if result.returncode != 0 or not temp_path.exists():
-            return
-
-        try:
-            img = Image.open(temp_path)
+            img = _capture_display_quartz(display_id)
         except Exception:
-            temp_path.unlink(missing_ok=True)
+            logger.debug("Quartz capture failed for display %d", display_num, exc_info=True)
+            return
+
+        if img is None:
             return
 
         current_hash = _dhash(img)
@@ -121,14 +124,41 @@ class ScreenCapture:
         if last_hash is not None:
             distance = _hamming_distance(last_hash, current_hash)
             if distance < self._threshold:
-                temp_path.unlink(missing_ok=True)
                 return
 
         final_path = self._output_dir / f"{timestamp_sec:06d}_display{display_num}.png"
-        temp_path.rename(final_path)
+        img.save(str(final_path), "PNG")
         self._last_hashes[display_num] = current_hash
         self._saved_count += 1
         logger.debug("Screenshot saved: %s", final_path.name)
+
+
+def _capture_display_quartz(display_id: int) -> Image.Image | None:
+    """Capture a single display using Quartz, including all on-screen windows."""
+    bounds = CGDisplayBounds(display_id)
+
+    cg_image = CGWindowListCreateImage(
+        bounds,
+        kCGWindowListOptionOnScreenOnly,
+        kCGNullWindowID,
+        kCGWindowImageDefault,
+    )
+    if cg_image is None:
+        return None
+
+    width = CGImageGetWidth(cg_image)
+    height = CGImageGetHeight(cg_image)
+    bytes_per_row = CGImageGetBytesPerRow(cg_image)
+    bits_per_pixel = CGImageGetBitsPerPixel(cg_image)
+
+    provider = CGImageGetDataProvider(cg_image)
+    raw_data = CGDataProviderCopyData(provider)
+
+    if bits_per_pixel == 32:
+        img = Image.frombuffer("RGBA", (width, height), raw_data, "raw", "BGRA", bytes_per_row, 1)
+        return img.convert("RGB")
+
+    return None
 
 
 def _get_display_ids() -> list[int]:

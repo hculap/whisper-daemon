@@ -11,6 +11,7 @@ class EventType(Enum):
     TRANSCRIBE_PREVIEW = auto()
     TRANSCRIPTION_DONE = auto()
     PASTE_LAST = auto()
+    SPEAK_CLIPBOARD = auto()
     ERROR = auto()
 
 

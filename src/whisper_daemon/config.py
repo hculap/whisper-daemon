@@ -26,8 +26,12 @@ class Settings:
     screenshot_cooldown: float = 5.0  # minimum seconds between captures
     diarize: bool = False  # enable speaker diarization for meeting recordings
     diarize_mode: str = "hybrid"  # batch, realtime, or hybrid
+    auto_record_meetings: bool = True  # auto-start recording on browser meeting detect
+    tts_language: str = "auto"  # auto, pl, or en
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
+    server_host: str = "127.0.0.1"
+    server_port: int = 9876
 
     @property
     def recording_dir_path(self) -> Path:
@@ -51,6 +55,7 @@ def load_settings() -> Settings:
 
         rec = data.get("recording", {})
         trans = data.get("transcription", {})
+        srv = data.get("server", {})
 
         return Settings(
             recording_dir=rec.get("dir", "~/Desktop"),
@@ -64,8 +69,12 @@ def load_settings() -> Settings:
             screenshot_cooldown=rec.get("screenshot_cooldown", 5.0),
             diarize=rec.get("diarize", False),
             diarize_mode=rec.get("diarize_mode", "hybrid"),
+            auto_record_meetings=rec.get("auto_record_meetings", True),
+            tts_language=data.get("tts", {}).get("language", "auto"),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
+            server_host=srv.get("host", "127.0.0.1"),
+            server_port=srv.get("port", 9876),
         )
     except Exception:
         logger.exception("Failed to load config, using defaults")
@@ -89,10 +98,18 @@ def save_settings(settings: Settings) -> None:
         f"screenshot_cooldown = {settings.screenshot_cooldown}",
         f'diarize = {"true" if settings.diarize else "false"}',
         f'diarize_mode = "{settings.diarize_mode}"',
+        f'auto_record_meetings = {"true" if settings.auto_record_meetings else "false"}',
         "",
         "[transcription]",
         f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',
         f'output_dir = "{settings.transcription_output_dir}"',
+        "",
+        "[tts]",
+        f'language = "{settings.tts_language}"',
+        "",
+        "[server]",
+        f'host = "{settings.server_host}"',
+        f"port = {settings.server_port}",
         "",
     ]
 

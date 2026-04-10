@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      width: 320px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      color: #222;
+      padding: 16px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .header h1 {
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .status-dot.idle { background: #9E9E9E; }
+    .status-dot.detected { background: #FF9800; }
+    .status-dot.capturing { background: #F44336; animation: pulse 1.5s infinite; }
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .meeting-info {
+      background: #F5F5F5;
+      border-radius: 6px;
+      padding: 8px 10px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      color: #555;
+      display: none;
+    }
+    .meeting-info.visible { display: block; }
+    .btn {
+      width: 100%;
+      padding: 10px;
+      border: none;
+      border-radius: 6px;
+      font-size: 13px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-record {
+      background: #F44336;
+      color: white;
+    }
+    .btn-record:hover { background: #D32F2F; }
+    .btn-stop {
+      background: #424242;
+      color: white;
+    }
+    .btn-stop:hover { background: #212121; }
+    .btn:disabled {
+      background: #BDBDBD;
+      cursor: not-allowed;
+    }
+    .transcript {
+      margin-top: 12px;
+      max-height: 200px;
+      overflow-y: auto;
+      font-size: 12px;
+      color: #444;
+      line-height: 1.5;
+      display: none;
+    }
+    .transcript.visible { display: block; }
+    .transcript-chunk {
+      padding: 4px 0;
+      border-bottom: 1px solid #EEE;
+    }
+    .timer {
+      text-align: center;
+      font-size: 20px;
+      font-weight: 300;
+      color: #F44336;
+      margin-bottom: 12px;
+      display: none;
+    }
+    .timer.visible { display: block; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span id="statusDot" class="status-dot idle"></span>
+    <h1>Whisper Daemon</h1>
+  </div>
+
+  <div id="meetingInfo" class="meeting-info"></div>
+  <div id="timer" class="timer">00:00</div>
+
+  <button id="actionBtn" class="btn btn-record">Record This Tab</button>
+
+  <div id="transcript" class="transcript"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

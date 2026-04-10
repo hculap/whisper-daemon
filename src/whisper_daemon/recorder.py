@@ -50,7 +50,7 @@ class AudioRecorder:
         self._last_preview_samples: int = 0
 
     def start_recording(self) -> None:
-        """Start capturing audio."""
+        """Start capturing audio. Falls back to system default if preferred device fails."""
         self._chunks = []
         self._voice_detected = False
         self._silence_start = None
@@ -60,17 +60,50 @@ class AudioRecorder:
         self._last_preview_samples = 0
         self._vad.reset_states()
 
+        device, channels = self._open_stream()
+        self._stream.start()
+        logger.info("Recording started (device: %s, channels: %d)", device or "system default", channels)
+
+    def _open_stream(self) -> tuple[str | int | None, int]:
+        """Try preferred device, fall back to system default on failure.
+
+        Note: previously this called ``sd._terminate()`` / ``sd._initialize()``
+        to refresh the PortAudio device list for hot-plugged Bluetooth/USB
+        mics. That turns out to be global: it tears down the whole host
+        API, destroying any other live ``InputStream`` (e.g. a running
+        meeting recording). The ``PortAudioError`` fallback to
+        ``device=None`` below already handles "preferred device
+        disappeared" — which is the only real-world case — so we skip the
+        refresh and keep the other recorders alive.
+        """
+        if self._device is not None:
+            try:
+                self._channels = _detect_channels(self._device)
+                self._stream = sd.InputStream(
+                    device=self._device,
+                    samplerate=SAMPLE_RATE,
+                    channels=self._channels,
+                    dtype=DTYPE,
+                    blocksize=BLOCK_SIZE,
+                    callback=self._audio_callback,
+                )
+                return self._device, self._channels
+            except sd.PortAudioError:
+                logger.warning(
+                    "Device '%s' unavailable, falling back to system default",
+                    self._device,
+                )
+
+        self._channels = 1
         self._stream = sd.InputStream(
-            device=self._device,
+            device=None,
             samplerate=SAMPLE_RATE,
             channels=self._channels,
             dtype=DTYPE,
             blocksize=BLOCK_SIZE,
             callback=self._audio_callback,
         )
-        self._stream.start()
-        device_name = self._device or "system default"
-        logger.info("Recording started (device: %s, channels: %d)", device_name, self._channels)
+        return None, self._channels
 
     def stop_recording(self) -> np.ndarray:
         """Stop recording and return the captured audio as a 1D numpy array."""

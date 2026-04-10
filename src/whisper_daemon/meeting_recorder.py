@@ -21,6 +21,12 @@ RMS_SILENCE_FLOOR = 0.005  # Below this RMS = definitely silence, skip VAD
 DEFAULT_CHUNK_SILENCE = 1.0
 MAX_CHUNK_SEC = 20
 OVERLAP_SEC = 2.0  # seconds of audio overlap between chunks
+# Dead-stream detection: an input stream that keeps delivering exact-zero
+# samples for this many consecutive callback blocks is assumed broken.
+# 900 blocks × 512 samples ÷ 16 kHz ≈ 29 s.
+DEAD_STREAM_BLOCKS = 900
+# Warn on the menubar every N consecutive silent chunks dropped.
+SILENT_CHUNK_WARN_EVERY = 3
 
 
 @dataclass(frozen=True)
@@ -68,6 +74,9 @@ class MeetingRecorder:
         self._device_error_count: int = 0
         self._needs_recovery: bool = False
         self._recovery_attempts: int = 0
+        self._fell_back_to_default: bool = False
+        self._consecutive_silent_chunks: int = 0
+        self._zero_block_count: int = 0
 
     def _reset_state(self) -> None:
         """Reset all recording state for a new session."""
@@ -81,28 +90,37 @@ class MeetingRecorder:
         self._device_error_count = 0
         self._needs_recovery = False
         self._recovery_attempts = 0
+        self._fell_back_to_default = False
+        self._consecutive_silent_chunks = 0
+        self._zero_block_count = 0
         self._vad.reset_states()
 
     @property
     def needs_recovery(self) -> bool:
         return self._needs_recovery
 
-    _MAX_RECOVERY_ATTEMPTS = 3
+    @property
+    def fell_back_to_default(self) -> bool:
+        return self._fell_back_to_default
+
+    def request_recovery(self) -> None:
+        """Signal from outside the audio callback that the stream should be reopened.
+
+        Used by the meeting loop when it detects no chunks are arriving —
+        that case never trips a PortAudio status flag, so the callback
+        itself never arms recovery.
+        """
+        self._needs_recovery = True
 
     def recover_device(self) -> bool:
         """Attempt to reopen audio stream after device failure.
 
-        Returns True if recovery succeeded. Gives up after
-        _MAX_RECOVERY_ATTEMPTS consecutive failures.
+        Returns True if recovery succeeded. On failure, leaves
+        ``_needs_recovery`` set so the caller can retry after a backoff
+        — we never give up permanently, because devices (Bluetooth,
+        USB) can reappear minutes later.
         """
         self._recovery_attempts += 1
-        if self._recovery_attempts > self._MAX_RECOVERY_ATTEMPTS:
-            logger.error(
-                "Device recovery abandoned after %d attempts",
-                self._MAX_RECOVERY_ATTEMPTS,
-            )
-            self._needs_recovery = False
-            return False
 
         # Stop the old stream — set _recording=False first to prevent
         # the callback from racing on _frames during _emit_chunk.
@@ -115,22 +133,32 @@ class MeetingRecorder:
                 logger.debug("Error closing stream during recovery", exc_info=True)
             self._stream = None
 
-        self._emit_chunk()
+        # Flush any buffered audio as a final chunk so speech captured
+        # just before the device died is not discarded as "silent".
+        self._emit_chunk(is_final=True)
         self._device_error_count = 0
+        self._zero_block_count = 0
 
         try:
             device, channels = self._open_stream()
             self._recording = True
             self._stream.start()
             self._needs_recovery = False
+            logger.info(
+                "Device recovered on attempt %d (device: %s, channels: %d)",
+                self._recovery_attempts,
+                device or "system default",
+                channels,
+            )
             self._recovery_attempts = 0
-            logger.info("Device recovered (device: %s, channels: %d)", device or "system default", channels)
             return True
         except Exception:
             logger.error(
-                "Device recovery failed (attempt %d/%d)",
-                self._recovery_attempts, self._MAX_RECOVERY_ATTEMPTS,
+                "Device recovery failed (attempt %d) — will retry",
+                self._recovery_attempts,
+                exc_info=True,
             )
+            # Leave _needs_recovery=True so the meeting loop retries.
             return False
 
     def start(self) -> None:
@@ -145,7 +173,17 @@ class MeetingRecorder:
         )
 
     def _open_stream(self) -> tuple[str | int | None, int]:
-        """Try preferred device, fall back to system default on failure."""
+        """Try preferred device, fall back to system default on failure.
+
+        Note: we deliberately do **not** call ``sd._terminate()`` /
+        ``sd._initialize()`` here to refresh the device list. Those calls
+        tear down the entire PortAudio host API in-process, killing every
+        other live ``InputStream`` as collateral damage (this exact bug
+        hung the meeting recorder when the browser-audio path triggered a
+        second stream open). If a device is stale, the
+        ``PortAudioError`` fallback below will pick the new system
+        default, which is the only case users actually hit.
+        """
         if self._device is not None:
             try:
                 self._channels = self._detect_channels()
@@ -163,6 +201,7 @@ class MeetingRecorder:
                     "Device '%s' unavailable, falling back to system default",
                     self._device,
                 )
+                self._fell_back_to_default = True
 
         self._channels = CHANNELS
         self._stream = sd.InputStream(
@@ -255,7 +294,28 @@ class MeetingRecorder:
         else:
             mono = indata
 
-        self._process_block(mono[:, 0].copy())
+        samples = mono[:, 0].copy()
+
+        # Dead-stream detection: a live PortAudio stream that keeps
+        # delivering exact-zero samples indicates the OS has muted the
+        # device, revoked mic privacy, or re-routed the input behind our
+        # back. None of those cases trip a PortAudio status flag, so the
+        # error-count path would never catch them. A quiet room always
+        # produces ~1e-6 noise, so strict zero is a reliable signal.
+        if np.all(samples == 0.0):
+            self._zero_block_count += 1
+            if self._zero_block_count >= DEAD_STREAM_BLOCKS:
+                logger.error(
+                    "Audio stream delivered all-zero samples for ~%.0fs — requesting recovery",
+                    self._zero_block_count * BLOCK_SIZE / SAMPLE_RATE,
+                )
+                self._needs_recovery = True
+                self._zero_block_count = 0
+                return
+        else:
+            self._zero_block_count = 0
+
+        self._process_block(samples)
 
     def _process_block(self, samples: np.ndarray) -> None:
         """Process a single block of mono audio through VAD and chunk splitting."""
@@ -299,7 +359,22 @@ class MeetingRecorder:
         # Skip silent chunks — no voice detected means only background noise.
         # Whisper hallucinates on silence (e.g. "Thank you.", random words).
         if not self._voice_detected_in_chunk and not is_final:
-            logger.debug("Skipping silent chunk (%.1fs, no voice detected)", duration)
+            self._consecutive_silent_chunks += 1
+            if (
+                self._consecutive_silent_chunks >= SILENT_CHUNK_WARN_EVERY
+                and self._consecutive_silent_chunks % SILENT_CHUNK_WARN_EVERY == 0
+            ):
+                logger.warning(
+                    "Dropped %d silent chunks in a row (~%.0fs of audio) — mic may be muted, quiet, or dead",
+                    self._consecutive_silent_chunks,
+                    self._consecutive_silent_chunks * duration,
+                )
+            else:
+                logger.info(
+                    "Skipping silent chunk (%.1fs, no voice, streak=%d)",
+                    duration,
+                    self._consecutive_silent_chunks,
+                )
             self._frames = []
             self._chunk_start += duration
             self._silence_start = None
@@ -313,6 +388,7 @@ class MeetingRecorder:
             source=self._source_label,
         )
         self._chunk_queue.put(chunk)
+        self._consecutive_silent_chunks = 0
         logger.info(
             "Chunk emitted: start=%.1fs, duration=%.1fs",
             chunk.start_time, chunk.duration,

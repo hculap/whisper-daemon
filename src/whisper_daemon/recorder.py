@@ -65,7 +65,17 @@ class AudioRecorder:
         logger.info("Recording started (device: %s, channels: %d)", device or "system default", channels)
 
     def _open_stream(self) -> tuple[str | int | None, int]:
-        """Try preferred device, fall back to system default on failure."""
+        """Try preferred device, fall back to system default on failure.
+
+        Note: previously this called ``sd._terminate()`` / ``sd._initialize()``
+        to refresh the PortAudio device list for hot-plugged Bluetooth/USB
+        mics. That turns out to be global: it tears down the whole host
+        API, destroying any other live ``InputStream`` (e.g. a running
+        meeting recording). The ``PortAudioError`` fallback to
+        ``device=None`` below already handles "preferred device
+        disappeared" — which is the only real-world case — so we skip the
+        refresh and keep the other recorders alive.
+        """
         if self._device is not None:
             try:
                 self._channels = _detect_channels(self._device)

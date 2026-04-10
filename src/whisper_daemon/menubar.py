@@ -656,6 +656,10 @@ class MenuBarDelegate(NSObject):
             )
             screen_capture.start()
 
+        HEALTH_CHECK_SEC = 120.0  # first warning after 2 min of silence
+        HEALTH_REPEAT_SEC = 120.0  # re-warn every 2 min while still silent
+        RECOVERY_BACKOFF_SEC = 10.0  # min interval between recovery attempts
+
         telemetry.meeting_start()
         try:
             mic_recorder.start()
@@ -667,20 +671,52 @@ class MenuBarDelegate(NSObject):
             self._update_meeting_menu(False)
             return
 
+        if mic_recorder.fell_back_to_default:
+            _notify(
+                "whisper-daemon",
+                "Microphone fallback",
+                "Preferred device unavailable — using system default mic.",
+            )
+
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 futures: dict[concurrent.futures.Future, float] = {}
 
                 partial_path = rec_dir / "transcript_live.txt"
+                last_chunk_time = time.monotonic()
+                last_health_warn = 0.0
+                last_recovery_attempt = 0.0
+                mic_lost_notified = False
 
                 while self._meeting_active:
-                    # Check if mic recorder needs device recovery
-                    if mic_recorder.needs_recovery:
-                        logger.warning("Mic device lost, attempting recovery...")
+                    now = time.monotonic()
+
+                    # Check if mic recorder needs device recovery. Retries
+                    # keep firing on a backoff timer until they succeed or
+                    # the meeting ends — devices (Bluetooth, USB) can
+                    # reappear minutes later, so we never give up.
+                    if mic_recorder.needs_recovery and now - last_recovery_attempt >= RECOVERY_BACKOFF_SEC:
+                        last_recovery_attempt = now
+                        logger.warning("Mic device needs recovery, attempting reopen...")
                         if mic_recorder.recover_device():
                             logger.info("Mic recovered, meeting continues")
-                        else:
-                            logger.error("Mic recovery failed, meeting continues with browser audio only")
+                            mic_lost_notified = False
+                            if mic_recorder.fell_back_to_default:
+                                _notify(
+                                    "whisper-daemon",
+                                    "Mic recovered (fallback)",
+                                    "Original device lost — now using system default mic.",
+                                )
+                        elif not mic_lost_notified:
+                            # Notify once per lost-then-recovered cycle to
+                            # avoid hammering the user during extended outages.
+                            mic_lost_notified = True
+                            logger.error("Mic recovery failed, will keep retrying every %.0fs", RECOVERY_BACKOFF_SEC)
+                            _notify(
+                                "whisper-daemon",
+                                "Mic lost",
+                                "Device recovery failed. Will keep retrying; browser audio continues.",
+                            )
 
                     try:
                         chunk = chunk_queue.get(timeout=0.5)
@@ -688,6 +724,27 @@ class MenuBarDelegate(NSObject):
                         if _collect_futures(futures, all_results):
                             _write_partial(partial_path, all_results)
                             self._send_results_to_browser(all_results, chunk_count)
+                        # Health check: warn repeatedly while silent, and
+                        # ask the mic recorder to try reopening its stream
+                        # — the callback path can't detect "alive but
+                        # delivering silence" reliably, so the loop itself
+                        # has to nudge it when nothing is arriving.
+                        elapsed_silent = now - last_chunk_time
+                        if (
+                            elapsed_silent > HEALTH_CHECK_SEC
+                            and now - last_health_warn >= HEALTH_REPEAT_SEC
+                        ):
+                            last_health_warn = now
+                            logger.warning(
+                                "No audio chunks for %.0fs — mic may not be capturing speech",
+                                elapsed_silent,
+                            )
+                            _notify(
+                                "whisper-daemon",
+                                "No speech detected",
+                                f"No audio for {int(elapsed_silent)}s. Check your microphone.",
+                            )
+                            mic_recorder.request_recovery()
                         continue
 
                     if chunk is None:
@@ -697,6 +754,7 @@ class MenuBarDelegate(NSObject):
                         continue
 
                     chunk_count += 1
+                    last_chunk_time = now
                     logger.info(
                         "Meeting chunk %d: %.1fs [%s]",
                         chunk_count, chunk.duration, chunk.source,

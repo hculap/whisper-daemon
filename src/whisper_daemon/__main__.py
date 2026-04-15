@@ -158,6 +158,8 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     screen_capture = None
     activity_monitor = None
 
+    menubar_delegate = None
+
     def _signal_handler(sig: int, frame: object) -> None:
         logger.info("Received signal %s", signal.Signals(sig).name)
         hotkey.stop()
@@ -165,6 +167,8 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
             activity_monitor.stop()
         if screen_capture:
             screen_capture.stop()
+        if menubar_delegate is not None:
+            menubar_delegate.graceful_stop()
         daemon.shutdown()
         if not no_menubar:
             from PyObjCTools import AppHelper
@@ -217,7 +221,15 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
             if activity_monitor:
                 activity_monitor.start()
 
-        run_with_menubar(daemon, hotkey, on_appkit_ready=on_appkit_ready)
+        def on_delegate_ready(delegate: object) -> None:
+            nonlocal menubar_delegate
+            menubar_delegate = delegate
+
+        run_with_menubar(
+            daemon, hotkey,
+            on_appkit_ready=on_appkit_ready,
+            on_delegate_ready=on_delegate_ready,
+        )
 
 
 @cli.command()

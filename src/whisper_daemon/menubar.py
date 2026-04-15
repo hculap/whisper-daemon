@@ -596,7 +596,7 @@ class MenuBarDelegate(NSObject):
         self._meeting_thread = threading.Thread(
             target=self._meeting_worker,
             args=(browser_triggered, browser_title),
-            daemon=True,
+            daemon=False,
         )
         self._meeting_thread.start()
 
@@ -871,6 +871,22 @@ class MenuBarDelegate(NSObject):
             if text:
                 self._browser_bridge.send_chunk_result(text, start_time, chunk_count)
 
+    def graceful_stop(self, timeout: float = 300.0) -> None:
+        """Stop any active meeting, wait for save/diarize, then quit.
+
+        Called from signal handlers to ensure the meeting is properly saved
+        before the process exits. Runs on the signal-handler thread — must
+        not touch AppKit.
+        """
+        if self._meeting_active:
+            logger.info("Graceful stop: stopping active meeting before exit")
+            self._meeting_active = False
+            if self._meeting_thread is not None and self._meeting_thread.is_alive():
+                self._meeting_thread.join(timeout=timeout)
+                if self._meeting_thread.is_alive():
+                    logger.warning("Meeting worker did not finish within %.0fs", timeout)
+        self._browser_bridge.stop()
+
     def _reset_meeting_ui(self) -> None:
         self._meeting_active = False
         self._meeting_browser_triggered = False
@@ -1016,6 +1032,7 @@ def run_with_menubar(
     daemon: object,
     hotkey_listener: object,
     on_appkit_ready: Callable[[], None] | None = None,
+    on_delegate_ready: Callable[["MenuBarDelegate"], None] | None = None,
 ) -> None:
     """Run the daemon event loop in a background thread, menu bar on main thread.
 
@@ -1025,6 +1042,9 @@ def run_with_menubar(
     ``on_appkit_ready`` is called on the main thread after NSApplication is
     configured but before the event loop starts — use it for APIs that
     require the AppKit run loop (e.g. NSEvent global monitors).
+
+    ``on_delegate_ready`` receives the MenuBarDelegate so callers (e.g. signal
+    handlers) can trigger a graceful meeting stop before exit.
     """
     daemon_thread = threading.Thread(target=daemon.run, daemon=True)
     daemon_thread.start()
@@ -1036,6 +1056,9 @@ def run_with_menubar(
         daemon, hotkey_listener
     )
     app.setDelegate_(delegate)
+
+    if on_delegate_ready is not None:
+        on_delegate_ready(delegate)
 
     if on_appkit_ready is not None:
         on_appkit_ready()

@@ -111,6 +111,9 @@ class BrowserAudioBridge:
             self._handler,
             self._host,
             self._port,
+            ping_interval=10,
+            ping_timeout=15,
+            close_timeout=5,
         ):
             logger.info("Browser bridge listening on ws://%s:%d", self._host, self._port)
             await self._stop_event.wait()

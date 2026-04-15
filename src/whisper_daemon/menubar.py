@@ -668,7 +668,7 @@ class MenuBarDelegate(NSObject):
             if screen_capture:
                 screen_capture.stop()
             self._meeting_active = False
-            self._update_meeting_menu(False)
+            self._meeting_menu_item.setTitle_("Start Meeting Recording")
             return
 
         if mic_recorder.fell_back_to_default:

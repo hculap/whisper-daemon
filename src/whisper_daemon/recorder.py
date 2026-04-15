@@ -65,16 +65,14 @@ class AudioRecorder:
         logger.info("Recording started (device: %s, channels: %d)", device or "system default", channels)
 
     def _open_stream(self) -> tuple[str | int | None, int]:
-        """Try preferred device, fall back to system default on failure.
+        """Try preferred device, fall back to system default, then refresh PortAudio.
 
-        Note: previously this called ``sd._terminate()`` / ``sd._initialize()``
-        to refresh the PortAudio device list for hot-plugged Bluetooth/USB
-        mics. That turns out to be global: it tears down the whole host
-        API, destroying any other live ``InputStream`` (e.g. a running
-        meeting recording). The ``PortAudioError`` fallback to
-        ``device=None`` below already handles "preferred device
-        disappeared" — which is the only real-world case — so we skip the
-        refresh and keep the other recorders alive.
+        We avoid calling ``sd._terminate()`` / ``sd._initialize()`` eagerly
+        because it tears down the entire PortAudio host API, killing any
+        other live ``InputStream`` (e.g. a meeting recording). Instead we
+        only refresh as a last resort — when both the preferred device and
+        the system default have failed. At that point no working streams
+        remain, so the global teardown is safe.
         """
         if self._device is not None:
             try:
@@ -88,9 +86,46 @@ class AudioRecorder:
                     callback=self._audio_callback,
                 )
                 return self._device, self._channels
-            except sd.PortAudioError:
+            except (sd.PortAudioError, ValueError):
                 logger.warning(
                     "Device '%s' unavailable, falling back to system default",
+                    self._device,
+                )
+
+        try:
+            self._channels = 1
+            self._stream = sd.InputStream(
+                device=None,
+                samplerate=SAMPLE_RATE,
+                channels=self._channels,
+                dtype=DTYPE,
+                blocksize=BLOCK_SIZE,
+                callback=self._audio_callback,
+            )
+            return None, self._channels
+        except sd.PortAudioError:
+            logger.warning(
+                "System default also failed — refreshing PortAudio device list",
+            )
+
+        sd._terminate()
+        sd._initialize()
+
+        if self._device is not None:
+            try:
+                self._channels = _detect_channels(self._device)
+                self._stream = sd.InputStream(
+                    device=self._device,
+                    samplerate=SAMPLE_RATE,
+                    channels=self._channels,
+                    dtype=DTYPE,
+                    blocksize=BLOCK_SIZE,
+                    callback=self._audio_callback,
+                )
+                return self._device, self._channels
+            except (sd.PortAudioError, ValueError):
+                logger.warning(
+                    "Device '%s' still unavailable after refresh, trying system default",
                     self._device,
                 )
 

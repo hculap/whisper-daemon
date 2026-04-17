@@ -28,8 +28,8 @@ def enable() -> None:
         ],
         "RunAtLoad": True,
         "KeepAlive": False,
-        "StandardOutPath": str(Path.home() / ".config" / "whisper-daemon" / "daemon.log"),
-        "StandardErrorPath": str(Path.home() / ".config" / "whisper-daemon" / "daemon.log"),
+        "StandardOutPath": str(Path.home() / ".config" / "whisper-daemon" / "daemon.native.log"),
+        "StandardErrorPath": str(Path.home() / ".config" / "whisper-daemon" / "daemon.native.log"),
     }
 
     with open(PLIST_PATH, "wb") as f:

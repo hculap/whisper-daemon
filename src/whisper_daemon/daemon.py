@@ -167,6 +167,7 @@ class Daemon:
     def _start_transcription(self) -> None:
         self._state = State.TRANSCRIBING
         audio = self._recorder.stop_recording()
+        voice_detected = self._recorder.voice_detected
         play_stop()
 
         # Wait for any in-flight preview to finish (avoid concurrent GPU access).
@@ -180,6 +181,18 @@ class Daemon:
 
         if audio.size == 0:
             logger.warning("No audio captured")
+            self._queue.put(Event(EventType.TRANSCRIPTION_DONE, ""))
+            return
+
+        # Skip transcription when VAD never caught voice — on silent input Whisper
+        # hallucinates short English phrases ("Thanks for watching.", etc) and we'd
+        # paste that garbage into the focused app.
+        if not voice_detected:
+            logger.warning(
+                "Discarding %.1fs of audio — no voice detected (check microphone)",
+                len(audio) / 16000,
+            )
+            play_error()
             self._queue.put(Event(EventType.TRANSCRIPTION_DONE, ""))
             return
 

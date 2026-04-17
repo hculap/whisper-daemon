@@ -17,6 +17,7 @@ SAMPLE_RATE = 16000
 DTYPE = "float32"
 BLOCK_SIZE = 512  # Matches Silero VAD expected chunk size (32ms at 16kHz)
 MAX_RECORDING_SEC = 120
+NO_VOICE_TIMEOUT_SEC = 8.0  # Bail out if VAD never detects voice — likely dead/muted input
 VAD_THRESHOLD = 0.5
 RMS_SILENCE_FLOOR = 0.005  # Below this RMS = definitely silence, skip VAD
 DEFAULT_SILENCE_SEC = 0.7
@@ -140,6 +141,11 @@ class AudioRecorder:
         )
         return None, self._channels
 
+    @property
+    def voice_detected(self) -> bool:
+        """Whether VAD detected voice at any point during the last recording."""
+        return self._voice_detected
+
     def stop_recording(self) -> np.ndarray:
         """Stop recording and return the captured audio as a 1D numpy array."""
         self._recording = False
@@ -192,6 +198,18 @@ class AudioRecorder:
         elapsed = time.monotonic() - self._recording_start
         if elapsed > MAX_RECORDING_SEC:
             logger.warning("Max recording time reached (%ds)", MAX_RECORDING_SEC)
+            self._queue.put(Event(EventType.RECORD_STOP))
+            return
+
+        # Dead-mic guard: if VAD never saw voice after a reasonable window,
+        # the input device is probably silent (unplugged BT headset, muted
+        # default input, etc). Stopping here avoids recording indefinitely
+        # and prevents Whisper from hallucinating English phrases on silence.
+        if not self._voice_detected and elapsed > NO_VOICE_TIMEOUT_SEC:
+            logger.warning(
+                "No voice detected after %.1fs — aborting recording (check microphone)",
+                NO_VOICE_TIMEOUT_SEC,
+            )
             self._queue.put(Event(EventType.RECORD_STOP))
             return
 

@@ -50,6 +50,10 @@ class Daemon:
         self._pending_samples: int = 0
         self._preview_thread: threading.Thread | None = None
 
+        # MLX Metal calls are not concurrency-safe — every mlx_whisper inference
+        # (preview + final) acquires this so we never run two at once.
+        self._mlx_lock = threading.Lock()
+
 
     @property
     def history(self) -> list[str]:
@@ -155,6 +159,9 @@ class Daemon:
 
     def _preview_worker(self, audio: np.ndarray, total_samples: int) -> None:
         """Transcribe a snapshot of the audio buffer."""
+        if not self._mlx_lock.acquire(timeout=30.0):
+            logger.warning("Preview skipped — MLX lock busy")
+            return
         try:
             text = transcribe(audio, model=self._model)
             self._pending_text = text
@@ -163,18 +170,14 @@ class Daemon:
             logger.info("Preview done: %d chars", len(text))
         except Exception:
             logger.exception("Preview transcription failed")
+        finally:
+            self._mlx_lock.release()
 
     def _start_transcription(self) -> None:
         self._state = State.TRANSCRIBING
         audio = self._recorder.stop_recording()
         voice_detected = self._recorder.voice_detected
         play_stop()
-
-        # Wait for any in-flight preview to finish (avoid concurrent GPU access).
-        # No timeout — concurrent MLX/Metal calls cause SIGABRT.
-        if self._preview_thread is not None and self._preview_thread.is_alive():
-            logger.info("Waiting for preview to finish before final transcription...")
-            self._preview_thread.join()
 
         telemetry.mark("record_stop", audio_sec=round(len(audio) / 16000, 1) if audio.size > 0 else 0)
         logger.info("State: RECORDING -> TRANSCRIBING")
@@ -219,6 +222,30 @@ class Daemon:
         thread.start()
 
     def _transcribe_worker(self, audio: np.ndarray) -> None:
+        audio_sec = len(audio) / 16000
+        # MLX Whisper runs ~1-2x realtime on Apple Silicon; 5x + 60s headroom
+        # covers GPU pressure and the in-flight preview queued ahead of us.
+        timeout_sec = max(60.0, audio_sec * 5.0 + 60.0)
+
+        if not self._mlx_lock.acquire(timeout=timeout_sec):
+            logger.error("MLX lock timeout (>%.0fs) — prior inference stuck", timeout_sec)
+            self._queue.put(Event(EventType.ERROR, "mlx busy"))
+            return
+
+        done = threading.Event()
+
+        def _watchdog() -> None:
+            if not done.is_set():
+                logger.error(
+                    "Transcription hung >%.0fs (audio=%.1fs) — recovering state; "
+                    "stuck thread will orphan until process exit",
+                    timeout_sec, audio_sec,
+                )
+                self._queue.put(Event(EventType.ERROR, "transcription timeout"))
+
+        watchdog = threading.Timer(timeout_sec, _watchdog)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             text = transcribe(audio, model=self._model)
             telemetry.mark("transcribe_done", chars=len(text))
@@ -226,8 +253,21 @@ class Daemon:
         except Exception as exc:
             logger.exception("Transcription worker failed")
             self._queue.put(Event(EventType.ERROR, str(exc)))
+        finally:
+            done.set()
+            watchdog.cancel()
+            self._mlx_lock.release()
 
     def _handle_transcription_done(self, text: str) -> None:
+        # Late posts arrive if the watchdog already recovered state — drop them
+        # so we don't paste into whatever window has focus post-recovery.
+        if self._state != State.TRANSCRIBING:
+            logger.info(
+                "Discarding late transcription (%d chars) — state=%s",
+                len(text), self._state.name,
+            )
+            return
+
         if text:
             paste_text(text)
             telemetry.mark("paste_done", chars=len(text))

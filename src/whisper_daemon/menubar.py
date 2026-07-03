@@ -6,6 +6,7 @@ multiple phantom icons appear, and @clicked decorators silently fail.
 
 import concurrent.futures
 import logging
+import os
 import queue
 import threading
 import time
@@ -348,8 +349,12 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onQuit_(self, sender):
         logger.info("Quit from menu bar")
+        _start_exit_watchdog(15.0)
         if self._meeting_active:
             self._stop_meeting()
+        if hasattr(self, "_timer") and self._timer is not None:
+            self._timer.invalidate()
+            self._timer = None
         self._browser_bridge.stop()
         self._hotkey.stop()
         self._daemon.shutdown()
@@ -1026,6 +1031,22 @@ def _write_partial(path: Path, results: list[tuple[float, dict]]) -> None:
         path.write_text(text, encoding="utf-8")
     except Exception:
         pass
+
+
+def _start_exit_watchdog(timeout: float) -> None:
+    """Force-exit the process if it's still alive `timeout` seconds from now.
+
+    Backstop for a shutdown that wedges in websockets/MLX/resource_tracker —
+    we have logs showing the process lingering after "Shutdown requested"
+    with no "Daemon stopped" line, so the user has to kill -9 it. This
+    guarantees exit within `timeout` seconds regardless.
+    """
+    def _kill() -> None:
+        time.sleep(timeout)
+        logger.warning("Exit watchdog fired after %.0fs — forcing os._exit(0)", timeout)
+        os._exit(0)
+
+    threading.Thread(target=_kill, name="exit-watchdog", daemon=True).start()
 
 
 def run_with_menubar(

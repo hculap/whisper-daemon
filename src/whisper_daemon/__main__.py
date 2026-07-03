@@ -1,6 +1,7 @@
 """CLI entry point for whisper-daemon."""
 
 import logging
+import logging.handlers
 import os
 import queue
 import signal
@@ -15,6 +16,8 @@ PID_FILE = CONFIG_DIR / "daemon.pid"
 LOG_FILE = CONFIG_DIR / "daemon.log"
 NATIVE_LOG_FILE = CONFIG_DIR / "daemon.native.log"
 NATIVE_LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
 
 
 @click.group(invoke_without_command=True, context_settings={"show_default": True})
@@ -159,6 +162,8 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
 
     def _signal_handler(sig: int, frame: object) -> None:
         logger.info("Received signal %s", signal.Signals(sig).name)
+        from whisper_daemon.menubar import _start_exit_watchdog
+        _start_exit_watchdog(15.0)
         hotkey.stop()
         if menubar_delegate is not None:
             menubar_delegate.graceful_stop()
@@ -194,6 +199,14 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
             on_appkit_ready=on_appkit_ready,
             on_delegate_ready=on_delegate_ready,
         )
+
+    # Skip Python interpreter teardown — past runs have wedged in
+    # multiprocessing.resource_tracker on shutdown (see leaked-semaphore
+    # warnings in daemon.native.log). Everything we care about has already
+    # been flushed by the explicit stop calls above.
+    logger.info("Daemon stopped")
+    logging.shutdown()
+    os._exit(0)
 
 
 @cli.command()
@@ -629,9 +642,16 @@ def _setup_logging(verbose: bool) -> None:
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    # File handler (canonical log location)
+    # File handler (canonical log location). Rotates to cap disk usage and
+    # avoid macOS dirty-page write throttling seen on long-running sessions
+    # (Python_2026-04-18 microstackshot: 2.14 GB file-backed dirty memory).
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)

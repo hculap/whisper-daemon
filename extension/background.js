@@ -69,6 +69,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     relayToContentScript(msg);
     sendResponse({ ok: true });
 
+  } else if (msg.type === "CAPTURE_RECONNECTING") {
+    // Capture continues with buffered audio while the offscreen document
+    // reconnects to the daemon — show a distinct badge so the user can
+    // tell "recording but daemon unreachable" from plain recording.
+    chrome.action.setBadgeText({ text: "···" });
+    chrome.action.setBadgeBackgroundColor({ color: "#FF9800" });
+    relayToContentScript(msg);
+    sendResponse({ ok: true });
+
   } else if (msg.type === "CAPTURE_STOPPED") {
     relayToContentScript(msg);
     transitionTo(State.IDLE);

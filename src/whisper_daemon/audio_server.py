@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import threading
+import time
 from collections.abc import Callable
 
 import websockets
@@ -38,17 +39,26 @@ class BrowserAudioBridge:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_event: asyncio.Event | None = None
         self._ws: websockets.asyncio.server.ServerConnection | None = None
+        self._stopping = False
 
     def start(self) -> None:
         """Start the WebSocket server in a daemon thread."""
-        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._stopping = False
+        self._thread = threading.Thread(
+            target=self._run, name="browser-bridge", daemon=True
+        )
         self._thread.start()
         logger.info("Browser bridge starting on ws://%s:%d", self._host, self._port)
 
     def stop(self) -> None:
         """Shut down the WebSocket server."""
-        if self._loop is not None and self._stop_event is not None:
-            self._loop.call_soon_threadsafe(self._stop_event.set)
+        self._stopping = True
+        loop, stop_event = self._loop, self._stop_event
+        if loop is not None and stop_event is not None:
+            try:
+                loop.call_soon_threadsafe(stop_event.set)
+            except RuntimeError:
+                pass  # loop already closed
         if self._thread is not None:
             self._thread.join(timeout=3)
             self._thread = None
@@ -95,16 +105,33 @@ class BrowserAudioBridge:
             logger.debug("Failed to send to extension", exc_info=True)
 
     def _run(self) -> None:
-        self._loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self._loop)
-        self._stop_event = asyncio.Event()
-        try:
-            self._loop.run_until_complete(self._serve())
-        except Exception:
-            logger.exception("Browser bridge server error")
-        finally:
-            self._loop.close()
-            self._loop = None
+        """Serve forever, restarting after errors.
+
+        A bind failure (port still held after an unclean restart) or an
+        unexpected event-loop death must not kill the extension surface
+        for the daemon's whole lifetime — retry with backoff until
+        stop() is called.
+        """
+        backoff = 1.0
+        while not self._stopping:
+            self._loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self._loop)
+            self._stop_event = asyncio.Event()
+            try:
+                self._loop.run_until_complete(self._serve())
+                break  # clean stop() shutdown
+            except Exception:
+                logger.exception(
+                    "Browser bridge server error — retrying in %.0fs", backoff
+                )
+            finally:
+                self._ws = None
+                self._loop.close()
+                self._loop = None
+            if self._stopping:
+                break
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
 
     async def _serve(self) -> None:
         async with websockets.asyncio.server.serve(
@@ -119,13 +146,18 @@ class BrowserAudioBridge:
             await self._stop_event.wait()
 
     async def _handler(self, ws: websockets.asyncio.server.ServerConnection) -> None:
-        if self._ws is not None:
-            await ws.send(json.dumps({
-                "type": "error",
-                "message": "Another browser session is already connected",
-            }))
-            await ws.close()
-            return
+        old = self._ws
+        if old is not None:
+            # Take over: the previous connection is likely a zombie (MV3
+            # service worker died, network blip) — a live extension only
+            # opens a new socket when the old one is gone. Rejecting the
+            # newcomer would lock the extension out until ping timeout.
+            logger.warning("New browser connection — closing previous one")
+            self._ws = None
+            try:
+                await old.close()
+            except Exception:
+                logger.debug("Error closing previous connection", exc_info=True)
 
         self._ws = ws
         logger.info("Browser extension connected")
@@ -160,6 +192,12 @@ class BrowserAudioBridge:
         except Exception:
             logger.exception("Browser bridge handler error")
         finally:
-            self._ws = None
-            self._on_disconnect()
-            logger.info("Browser extension connection closed")
+            # If another connection already took over, this socket's death
+            # is not a session end — don't clobber the new connection or
+            # stop the meeting it continues.
+            if self._ws is ws:
+                self._ws = None
+                self._on_disconnect()
+                logger.info("Browser extension connection closed")
+            else:
+                logger.info("Superseded browser connection closed")

@@ -2,6 +2,7 @@
 
 import logging
 import os
+import threading
 
 import mlx_whisper
 import numpy as np
@@ -10,7 +11,40 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo-q4"
 
+# MLX Metal calls are not concurrency-safe: two inferences at once
+# (dictation vs meeting chunk vs file transcription) can SIGABRT or hang
+# the GPU queue. Every mlx_whisper call in the process goes through this
+# lock. RLock so a caller that already holds it (the dictation daemon's
+# timeout-guarded acquire) can call transcribe() without deadlocking.
+MLX_LOCK = threading.RLock()
+
 _model_preloaded = False
+
+
+def _hang_watchdog(audio_sec: float) -> threading.Timer:
+    """Arm a timer that force-restarts the daemon if inference wedges.
+
+    A hung MLX call is unrecoverable in-process: the GPU queue is stuck
+    and MLX_LOCK is held forever, so every later transcription would
+    fail too. MLX runs ~1-2x realtime on Apple Silicon; 5x + 60s covers
+    GPU pressure comfortably. The caller must cancel the timer when the
+    inference returns.
+    """
+    from whisper_daemon import supervisor
+
+    timeout_sec = max(60.0, audio_sec * 5.0 + 60.0)
+
+    def _fire() -> None:
+        logger.critical(
+            "MLX inference hung >%.0fs (audio=%.1fs) — restarting daemon",
+            timeout_sec, audio_sec,
+        )
+        supervisor.request_restart("MLX inference hung")
+
+    timer = threading.Timer(timeout_sec, _fire)
+    timer.daemon = True
+    timer.start()
+    return timer
 
 
 def preload_model(model: str = DEFAULT_MODEL) -> None:
@@ -21,7 +55,8 @@ def preload_model(model: str = DEFAULT_MODEL) -> None:
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
     try:
         warmup_audio = np.zeros(16000, dtype=np.float32)
-        mlx_whisper.transcribe(warmup_audio, path_or_hf_repo=model)
+        with MLX_LOCK:
+            mlx_whisper.transcribe(warmup_audio, path_or_hf_repo=model)
     finally:
         if old_hf_verbosity is None:
             os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
@@ -52,13 +87,18 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL) -> str:
 
     try:
         logger.info("Transcribing %.1fs of audio...", len(audio) / 16000)
-        result = mlx_whisper.transcribe(
-            audio,
-            path_or_hf_repo=model,
-            temperature=0,
-            condition_on_previous_text=False,
-            word_timestamps=False,
-        )
+        with MLX_LOCK:
+            watchdog = _hang_watchdog(len(audio) / 16000)
+            try:
+                result = mlx_whisper.transcribe(
+                    audio,
+                    path_or_hf_repo=model,
+                    temperature=0,
+                    condition_on_previous_text=False,
+                    word_timestamps=False,
+                )
+            finally:
+                watchdog.cancel()
         text = result.get("text", "").strip()
         language = result.get("language", "unknown")
         logger.info("Transcription done — lang=%s, len=%d chars", language, len(text))
@@ -88,13 +128,18 @@ def transcribe_full(audio: np.ndarray, model: str = DEFAULT_MODEL) -> dict:
 
     try:
         logger.info("Transcribing %.1fs of audio...", len(audio) / 16000)
-        result = mlx_whisper.transcribe(
-            audio,
-            path_or_hf_repo=model,
-            temperature=0,
-            condition_on_previous_text=False,
-            word_timestamps=False,
-        )
+        with MLX_LOCK:
+            watchdog = _hang_watchdog(len(audio) / 16000)
+            try:
+                result = mlx_whisper.transcribe(
+                    audio,
+                    path_or_hf_repo=model,
+                    temperature=0,
+                    condition_on_previous_text=False,
+                    word_timestamps=False,
+                )
+            finally:
+                watchdog.cancel()
         # Strip leading whitespace from segment texts
         for seg in result.get("segments", []):
             seg["text"] = seg["text"].strip()
@@ -137,7 +182,8 @@ def transcribe_file(
     if language is not None:
         kwargs["language"] = language
 
-    result = mlx_whisper.transcribe(path, **kwargs)
+    with MLX_LOCK:
+        result = mlx_whisper.transcribe(path, **kwargs)
     language_detected = result.get("language", "unknown")
     text_len = len(result.get("text", ""))
     segments_count = len(result.get("segments", []))

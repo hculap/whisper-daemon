@@ -225,7 +225,7 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
         raise SystemExit(0)
     PID_FILE.write_text(str(os.getpid()))
 
-    from whisper_daemon import audio_system, supervisor
+    from whisper_daemon import audio_system, permissions, supervisor
     from whisper_daemon.daemon import Daemon
     from whisper_daemon.events import Event
     from whisper_daemon.hotkey import HotkeyListener
@@ -246,6 +246,10 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
 
     audio_system.install_topology_listener()
     supervisor.start()
+
+    # Global hotkeys need Accessibility trust; warn loudly (and prompt) if
+    # it's missing so a silent dead-monitor is never a mystery again.
+    permissions.check_and_warn()
 
     preload_model(model)
 

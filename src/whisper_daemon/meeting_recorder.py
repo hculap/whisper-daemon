@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import numpy as np
 import sounddevice as sd
 
+from whisper_daemon import audio_system
 from whisper_daemon.vad import SileroVAD
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,11 @@ OVERLAP_SEC = 2.0  # seconds of audio overlap between chunks
 DEAD_STREAM_BLOCKS = 900
 # Warn on the menubar every N consecutive silent chunks dropped.
 SILENT_CHUNK_WARN_EVERY = 3
+# A mic stream producing this many consecutive voiceless chunks (~2 min at
+# 20s chunks) is treated as dead even when samples are non-zero noise —
+# the zero-block detector can't see a stale device that still delivers a
+# low noise floor. Triggers a stream reopen on a fresh device list.
+SILENT_CHUNK_RECOVERY_STREAK = 6
 
 
 @dataclass(frozen=True)
@@ -77,6 +83,8 @@ class MeetingRecorder:
         self._fell_back_to_default: bool = False
         self._consecutive_silent_chunks: int = 0
         self._zero_block_count: int = 0
+        self._silent_recovery_done: bool = False
+        self._last_audio_at: float = 0.0
 
     def _reset_state(self) -> None:
         """Reset all recording state for a new session."""
@@ -93,11 +101,26 @@ class MeetingRecorder:
         self._fell_back_to_default = False
         self._consecutive_silent_chunks = 0
         self._zero_block_count = 0
+        self._silent_recovery_done = False
+        # Seed to "now" so the health check doesn't fire before the first
+        # callback has had a chance to arrive.
+        self._last_audio_at = time.monotonic()
         self._vad.reset_states()
 
     @property
     def needs_recovery(self) -> bool:
         return self._needs_recovery
+
+    @property
+    def last_audio_at(self) -> float:
+        """monotonic() of the last callback that delivered any samples.
+
+        Distinct from "last voice chunk": this advances even during
+        silence, so the meeting loop can tell a genuinely dead stream (no
+        callbacks at all) from a live mic in a quiet room. 0.0 until the
+        first callback.
+        """
+        return self._last_audio_at
 
     @property
     def fell_back_to_default(self) -> bool:
@@ -125,13 +148,7 @@ class MeetingRecorder:
         # Stop the old stream — set _recording=False first to prevent
         # the callback from racing on _frames during _emit_chunk.
         self._recording = False
-        if self._stream is not None:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                logger.debug("Error closing stream during recovery", exc_info=True)
-            self._stream = None
+        self._close_stream()
 
         # Flush any buffered audio as a final chunk so speech captured
         # just before the device died is not discarded as "silent".
@@ -139,10 +156,19 @@ class MeetingRecorder:
         self._device_error_count = 0
         self._zero_block_count = 0
 
+        # The stream died behind PortAudio's back — its device snapshot is
+        # stale. Refresh it (refused automatically if another stream, e.g.
+        # a dictation recording, is still live) so the reopen below binds
+        # real hardware instead of the same dead entry.
+        audio_system.mark_dirty("meeting stream recovery")
+
         try:
-            device, channels = self._open_stream()
-            self._recording = True
-            self._stream.start()
+            with audio_system.stream_open():
+                audio_system.ensure_fresh()
+                device, channels = self._open_stream()
+                self._recording = True
+                self._stream.start()
+                audio_system.register_stream(self._stream)
             self._needs_recovery = False
             logger.info(
                 "Device recovered on attempt %d (device: %s, channels: %d)",
@@ -153,6 +179,9 @@ class MeetingRecorder:
             self._recovery_attempts = 0
             return True
         except Exception:
+            # Close any half-open stream so it can't linger unregistered.
+            self._recording = False
+            self._close_stream()
             logger.error(
                 "Device recovery failed (attempt %d) — will retry",
                 self._recovery_attempts,
@@ -165,36 +194,49 @@ class MeetingRecorder:
         """Start continuous recording. Falls back to system default if preferred device fails."""
         self._reset_state()
 
-        device, channels = self._open_stream()
-        self._stream.start()
+        with audio_system.stream_open():
+            audio_system.ensure_fresh()
+            device, channels = self._open_stream()
+            self._stream.start()
+            audio_system.register_stream(self._stream)
         logger.info(
             "Meeting recording started (device: %s, channels: %d)",
             device or "system default", channels,
         )
 
-    def _open_stream(self) -> tuple[str | int | None, int]:
-        """Try preferred device, fall back to system default, then refresh PortAudio.
+    def _close_stream(self) -> None:
+        if self._stream is None:
+            return
+        audio_system.unregister_stream(self._stream)
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            logger.debug("Error closing stream", exc_info=True)
+        self._stream = None
 
-        We avoid calling ``sd._terminate()`` / ``sd._initialize()`` eagerly
-        because it tears down the entire PortAudio host API, killing any
-        other live ``InputStream`` (e.g. the dictation recorder). Instead we
-        only refresh as a last resort — when both the preferred device and
-        the system default have failed. At that point no working streams
-        remain, so the global teardown is safe.
+    def _open_stream(self) -> tuple[str | int | None, int]:
+        """Open the input stream, preferring the configured device.
+
+        Any open failure means the PortAudio device snapshot is suspect:
+        mark it dirty and refresh (refused automatically while another
+        stream — e.g. a dictation recording — is live), retry the
+        preferred device once on a fresh list, then fall back to the
+        system default.
         """
         if self._device is not None:
             try:
-                self._channels = self._detect_channels()
-                self._stream = sd.InputStream(
-                    device=self._device,
-                    samplerate=SAMPLE_RATE,
-                    channels=self._channels,
-                    dtype=DTYPE,
-                    blocksize=BLOCK_SIZE,
-                    callback=self._callback,
-                )
-                return self._device, self._channels
+                return self._try_open(self._device)
             except (sd.PortAudioError, ValueError):
+                audio_system.mark_dirty(f"device '{self._device}' failed to open")
+                if audio_system.ensure_fresh():
+                    try:
+                        return self._try_open(self._device)
+                    except (sd.PortAudioError, ValueError):
+                        logger.warning(
+                            "Device '%s' still unavailable after refresh",
+                            self._device,
+                        )
                 logger.warning(
                     "Device '%s' unavailable, falling back to system default",
                     self._device,
@@ -202,52 +244,27 @@ class MeetingRecorder:
                 self._fell_back_to_default = True
 
         try:
-            self._channels = CHANNELS
-            self._stream = sd.InputStream(
-                device=None,
-                samplerate=SAMPLE_RATE,
-                channels=self._channels,
-                dtype=DTYPE,
-                blocksize=BLOCK_SIZE,
-                callback=self._callback,
-            )
-            return None, self._channels
+            return self._try_open(None)
         except sd.PortAudioError:
+            audio_system.mark_dirty("system default failed to open")
             logger.warning(
                 "System default also failed — refreshing PortAudio device list",
             )
+            if not audio_system.ensure_fresh():
+                raise
+        return self._try_open(None)
 
-        sd._terminate()
-        sd._initialize()
-
-        if self._device is not None:
-            try:
-                self._channels = self._detect_channels()
-                self._stream = sd.InputStream(
-                    device=self._device,
-                    samplerate=SAMPLE_RATE,
-                    channels=self._channels,
-                    dtype=DTYPE,
-                    blocksize=BLOCK_SIZE,
-                    callback=self._callback,
-                )
-                return self._device, self._channels
-            except (sd.PortAudioError, ValueError):
-                logger.warning(
-                    "Device '%s' still unavailable after refresh, trying system default",
-                    self._device,
-                )
-
-        self._channels = CHANNELS
+    def _try_open(self, device: str | int | None) -> tuple[str | int | None, int]:
+        self._channels = self._detect_channels() if device is not None else CHANNELS
         self._stream = sd.InputStream(
-            device=None,
+            device=device,
             samplerate=SAMPLE_RATE,
             channels=self._channels,
             dtype=DTYPE,
             blocksize=BLOCK_SIZE,
             callback=self._callback,
         )
-        return None, self._channels
+        return device, self._channels
 
     def start_without_device(self) -> None:
         """Start recording state without an audio device.
@@ -261,12 +278,20 @@ class MeetingRecorder:
         """Stop recording from audio device and emit remaining audio."""
         self._recording = False
 
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        self._close_stream()
 
         self._finalize()
+
+    def abort(self) -> None:
+        """Close the device stream without finalizing (error-path cleanup).
+
+        Idempotent: safe to call after stop() (the stream is already gone)
+        so a `finally` block can guarantee the stream is never leaked
+        registered — a leaked registration would disable PortAudio refresh
+        for the rest of the process lifetime.
+        """
+        self._recording = False
+        self._close_stream()
 
     def stop_without_device(self) -> None:
         """Stop recording state for external audio sources."""
@@ -323,6 +348,8 @@ class MeetingRecorder:
 
         if not self._recording:
             return
+
+        self._last_audio_at = time.monotonic()
 
         if indata.shape[1] > 1:
             mono = indata.mean(axis=1, keepdims=True)
@@ -393,23 +420,44 @@ class MeetingRecorder:
 
         # Skip silent chunks — no voice detected means only background noise.
         # Whisper hallucinates on silence (e.g. "Thank you.", random words).
-        if not self._voice_detected_in_chunk and not is_final:
-            self._consecutive_silent_chunks += 1
-            if (
-                self._consecutive_silent_chunks >= SILENT_CHUNK_WARN_EVERY
-                and self._consecutive_silent_chunks % SILENT_CHUNK_WARN_EVERY == 0
-            ):
-                logger.warning(
-                    "Dropped %d silent chunks in a row (~%.0fs of audio) — mic may be muted, quiet, or dead",
-                    self._consecutive_silent_chunks,
-                    self._consecutive_silent_chunks * duration,
-                )
-            else:
-                logger.info(
-                    "Skipping silent chunk (%.1fs, no voice, streak=%d)",
-                    duration,
-                    self._consecutive_silent_chunks,
-                )
+        # Applies to final flushes too: a silent tail buffer is still silence.
+        if not self._voice_detected_in_chunk:
+            if not is_final:
+                self._consecutive_silent_chunks += 1
+                if (
+                    self._consecutive_silent_chunks >= SILENT_CHUNK_WARN_EVERY
+                    and self._consecutive_silent_chunks % SILENT_CHUNK_WARN_EVERY == 0
+                ):
+                    logger.warning(
+                        "Dropped %d silent chunks in a row (~%.0fs of audio) [%s] — mic may be muted, quiet, or dead",
+                        self._consecutive_silent_chunks,
+                        self._consecutive_silent_chunks * duration,
+                        self._source_label,
+                    )
+                else:
+                    logger.info(
+                        "Skipping silent chunk (%.1fs, no voice, streak=%d) [%s]",
+                        duration,
+                        self._consecutive_silent_chunks,
+                        self._source_label,
+                    )
+                # A device-backed stream stuck on voiceless noise for this
+                # long is likely a stale binding: reopen on a fresh list.
+                # Once per silence episode — the user may simply not be
+                # speaking, so don't churn the stream every chunk.
+                # feed_audio sources (browser) have no device to recover.
+                if (
+                    self._stream is not None
+                    and self._consecutive_silent_chunks >= SILENT_CHUNK_RECOVERY_STREAK
+                    and not self._needs_recovery
+                    and not self._silent_recovery_done
+                ):
+                    logger.warning(
+                        "%d consecutive voiceless chunks — requesting stream recovery",
+                        self._consecutive_silent_chunks,
+                    )
+                    self._silent_recovery_done = True
+                    self._needs_recovery = True
             self._frames = []
             self._chunk_start += duration
             self._silence_start = None
@@ -424,6 +472,7 @@ class MeetingRecorder:
         )
         self._chunk_queue.put(chunk)
         self._consecutive_silent_chunks = 0
+        self._silent_recovery_done = False
         logger.info(
             "Chunk emitted: start=%.1fs, duration=%.1fs",
             chunk.start_time, chunk.duration,

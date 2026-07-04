@@ -8,12 +8,12 @@ from enum import Enum, auto
 
 import numpy as np
 
-from whisper_daemon import telemetry
+from whisper_daemon import audio_system, supervisor, telemetry
 from whisper_daemon.events import Event, EventType
 from whisper_daemon.paster import paste_text
 from whisper_daemon.recorder import AudioRecorder
 from whisper_daemon.sounds import play_error, play_start, play_stop
-from whisper_daemon.transcriber import transcribe
+from whisper_daemon.transcriber import MLX_LOCK, transcribe
 from whisper_daemon.tts import speak_text
 
 logger = logging.getLogger(__name__)
@@ -49,10 +49,14 @@ class Daemon:
         self._pending_text: str = ""
         self._pending_samples: int = 0
         self._preview_thread: threading.Thread | None = None
+        # Incremented per recording so a preview finishing late can't leak
+        # its text into the next recording's result.
+        self._recording_gen: int = 0
+        self._reopen_attempts: int = 0
 
-        # MLX Metal calls are not concurrency-safe — every mlx_whisper inference
-        # (preview + final) acquires this so we never run two at once.
-        self._mlx_lock = threading.Lock()
+        # Shared with transcriber: serializes ALL MLX inference in the
+        # process (dictation, meeting chunks, file transcription).
+        self._mlx_lock = MLX_LOCK
 
 
     @property
@@ -75,6 +79,7 @@ class Daemon:
         logger.info("Daemon running (state=IDLE)")
 
         while self._running:
+            supervisor.beat("event-loop")
             try:
                 event = self._queue.get(timeout=0.5)
             except queue.Empty:
@@ -86,6 +91,13 @@ class Daemon:
             except Exception:
                 logger.exception("Unhandled error in event loop")
                 play_error()
+                # Close any open recording stream so it isn't leaked
+                # registered — that would permanently disable the PortAudio
+                # device refresh and keep the mic hot.
+                try:
+                    self._recorder.stop_recording()
+                except Exception:
+                    logger.debug("Recorder cleanup after error failed", exc_info=True)
                 self._state = State.IDLE
 
         self._cleanup()
@@ -96,6 +108,8 @@ class Daemon:
             self._handle_toggle()
         elif event.type == EventType.RECORD_STOP:
             self._handle_record_stop()
+        elif event.type == EventType.RECORD_DEVICE_DEAD:
+            self._handle_device_dead()
         elif event.type == EventType.TRANSCRIBE_PREVIEW:
             self._handle_preview()
         elif event.type == EventType.TRANSCRIPTION_DONE:
@@ -119,6 +133,8 @@ class Daemon:
             self._recording_started_at = time.monotonic()
             self._pending_text = ""
             self._pending_samples = 0
+            self._recording_gen += 1
+            self._reopen_attempts = 0
             play_start()
             telemetry.mark("record_start")
             logger.info("State: IDLE -> RECORDING")
@@ -134,6 +150,28 @@ class Daemon:
     def _handle_record_stop(self) -> None:
         if self._state == State.RECORDING:
             self._start_transcription()
+
+    def _handle_device_dead(self) -> None:
+        """Recover a dictation stream that went silent mid-recording.
+
+        Reopens the stream on a refreshed PortAudio device list so the
+        recording continues. If the reopen fails twice, abort the
+        recording — the audio so far is all zeros anyway.
+        """
+        if self._state != State.RECORDING:
+            return
+
+        self._reopen_attempts += 1
+        if self._reopen_attempts <= 2 and self._recorder.reopen_stream():
+            logger.info("Dictation stream recovered mid-recording")
+            return
+
+        logger.error("Could not recover audio stream — aborting recording")
+        telemetry.mark("device_dead_abort")
+        self._recorder.stop_recording()
+        play_error()
+        self._state = State.IDLE
+        logger.info("State: RECORDING -> IDLE (device dead)")
 
     def _handle_preview(self) -> None:
         """Snapshot audio buffer and transcribe in background while recording continues."""
@@ -152,18 +190,21 @@ class Daemon:
         logger.info("Preview: transcribing %.1fs snapshot", len(audio) / 16000)
         self._preview_thread = threading.Thread(
             target=self._preview_worker,
-            args=(audio, total_samples),
+            args=(audio, total_samples, self._recording_gen),
             daemon=True,
         )
         self._preview_thread.start()
 
-    def _preview_worker(self, audio: np.ndarray, total_samples: int) -> None:
+    def _preview_worker(self, audio: np.ndarray, total_samples: int, gen: int) -> None:
         """Transcribe a snapshot of the audio buffer."""
         if not self._mlx_lock.acquire(timeout=30.0):
             logger.warning("Preview skipped — MLX lock busy")
             return
         try:
             text = transcribe(audio, model=self._model)
+            if gen != self._recording_gen:
+                logger.info("Discarding preview from previous recording")
+                return
             self._pending_text = text
             self._pending_samples = total_samples
             telemetry.mark("preview_done", chars=len(text))
@@ -195,6 +236,11 @@ class Daemon:
                 "Discarding %.1fs of audio — no voice detected (check microphone)",
                 len(audio) / 16000,
             )
+            if audio.size > 0 and float(np.max(np.abs(audio))) < 1e-6:
+                # All-zero capture = dead device binding, not a quiet room.
+                # Refresh the device list so the next attempt works.
+                audio_system.mark_dirty("recording captured only zeros")
+                audio_system.ensure_fresh()
             play_error()
             self._queue.put(Event(EventType.TRANSCRIPTION_DONE, ""))
             return
@@ -223,29 +269,15 @@ class Daemon:
 
     def _transcribe_worker(self, audio: np.ndarray) -> None:
         audio_sec = len(audio) / 16000
-        # MLX Whisper runs ~1-2x realtime on Apple Silicon; 5x + 60s headroom
-        # covers GPU pressure and the in-flight preview queued ahead of us.
+        # Generous wait for whatever inference is queued ahead of us
+        # (preview, meeting chunk). A genuinely hung holder is handled by
+        # the transcriber's own hang watchdog, which restarts the daemon.
         timeout_sec = max(60.0, audio_sec * 5.0 + 60.0)
 
         if not self._mlx_lock.acquire(timeout=timeout_sec):
             logger.error("MLX lock timeout (>%.0fs) — prior inference stuck", timeout_sec)
             self._queue.put(Event(EventType.ERROR, "mlx busy"))
             return
-
-        done = threading.Event()
-
-        def _watchdog() -> None:
-            if not done.is_set():
-                logger.error(
-                    "Transcription hung >%.0fs (audio=%.1fs) — recovering state; "
-                    "stuck thread will orphan until process exit",
-                    timeout_sec, audio_sec,
-                )
-                self._queue.put(Event(EventType.ERROR, "transcription timeout"))
-
-        watchdog = threading.Timer(timeout_sec, _watchdog)
-        watchdog.daemon = True
-        watchdog.start()
         try:
             text = transcribe(audio, model=self._model)
             telemetry.mark("transcribe_done", chars=len(text))
@@ -254,8 +286,6 @@ class Daemon:
             logger.exception("Transcription worker failed")
             self._queue.put(Event(EventType.ERROR, str(exc)))
         finally:
-            done.set()
-            watchdog.cancel()
             self._mlx_lock.release()
 
     def _handle_transcription_done(self, text: str) -> None:

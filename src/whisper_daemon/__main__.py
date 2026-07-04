@@ -1,20 +1,43 @@
 """CLI entry point for whisper-daemon."""
 
+import fcntl
 import logging
+import logging.handlers
 import os
 import queue
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import click
 
 CONFIG_DIR = Path.home() / ".config" / "whisper-daemon"
 PID_FILE = CONFIG_DIR / "daemon.pid"
+LOCK_FILE = CONFIG_DIR / "daemon.lock"
 LOG_FILE = CONFIG_DIR / "daemon.log"
 NATIVE_LOG_FILE = CONFIG_DIR / "daemon.native.log"
 NATIVE_LOG_MAX_BYTES = 10 * 1024 * 1024
+LOG_MAX_BYTES = 2 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+LAUNCHD_LABEL = "com.whisper-daemon"
+
+# Held for the process lifetime by run() — the OS releases it on ANY exit,
+# including kill -9, so it can never go stale like a PID file.
+_instance_lock_fd = None
+
+
+def _acquire_instance_lock() -> bool:
+    """Take the single-instance lock. False if another daemon holds it."""
+    global _instance_lock_fd
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    _instance_lock_fd = open(LOCK_FILE, "w")
+    try:
+        fcntl.flock(_instance_lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
 
 
 @click.group(invoke_without_command=True, context_settings={"show_default": True})
@@ -38,6 +61,15 @@ def start(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -
         raise SystemExit(1)
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Prefer launchd when the autostart job is loaded — the daemon then
+    # runs SUPERVISED (KeepAlive restarts it after crashes/hangs), which a
+    # bare subprocess never is.
+    domain = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+    if subprocess.run(["launchctl", "print", domain], capture_output=True).returncode == 0:
+        subprocess.run(["launchctl", "kickstart", domain], check=False)
+        click.echo("Started via launchd (supervised). Logs: " + str(LOG_FILE))
+        return
 
     cmd = [
         sys.executable, "-m", "whisper_daemon", "run",
@@ -85,8 +117,56 @@ def stop() -> None:
         click.echo(f"Sent SIGTERM to PID {pid}")
     except ProcessLookupError:
         click.echo(f"Process {pid} not found (stale PID file)")
+        PID_FILE.unlink(missing_ok=True)
+        return
 
-    PID_FILE.unlink(missing_ok=True)
+    # Wait briefly for the process to exit. A meeting save can take
+    # minutes, so don't block forever — just report honestly. The PID
+    # file is only removed once the process is actually gone.
+    for _ in range(20):
+        if not _pid_is_daemon(pid):
+            PID_FILE.unlink(missing_ok=True)
+            click.echo("Stopped.")
+            return
+        time.sleep(0.5)
+    click.echo(
+        "Still shutting down (a meeting save may be in progress). "
+        "Check with: whisper-daemon status"
+    )
+
+
+@cli.command()
+def restart() -> None:
+    """Restart the daemon (one-shot recovery for a wedged or stale instance)."""
+    domain = f"gui/{os.getuid()}/{LAUNCHD_LABEL}"
+    loaded = subprocess.run(
+        ["launchctl", "print", domain], capture_output=True,
+    ).returncode == 0
+
+    if loaded:
+        subprocess.run(["launchctl", "kickstart", "-k", domain], check=False)
+        click.echo("Restarted via launchd.")
+        return
+
+    if _is_running():
+        pid = _read_pid()
+        os.kill(pid, signal.SIGTERM)
+        click.echo(f"Sent SIGTERM to PID {pid}, waiting for exit...")
+        for _ in range(40):
+            if not _pid_is_daemon(pid):
+                break
+            time.sleep(0.5)
+        else:
+            click.echo("Old process did not exit in 20s — killing it.")
+            try:
+                os.kill(pid, signal.SIGKILL)
+                time.sleep(1.0)
+            except ProcessLookupError:
+                pass
+        PID_FILE.unlink(missing_ok=True)
+
+    ctx = click.get_current_context()
+    ctx.invoke(start)
 
 
 @cli.command()
@@ -100,17 +180,19 @@ def autostart(action: str) -> None:
       whisper-daemon autostart disable
       whisper-daemon autostart status
     """
-    from whisper_daemon.autostart import disable, enable, is_enabled
+    from whisper_daemon.autostart import disable, enable, is_enabled, is_loaded
 
     if action == "enable":
         enable()
-        click.echo("Autostart enabled. whisper-daemon will start at login.")
+        click.echo("Autostart enabled. whisper-daemon runs supervised: launchd")
+        click.echo("restarts it automatically after any crash or hang.")
     elif action == "disable":
         disable()
         click.echo("Autostart disabled.")
     elif action == "status":
         if is_enabled():
-            click.echo("Autostart: enabled")
+            loaded = "loaded" if is_loaded() else "NOT LOADED (run 'autostart enable' to fix)"
+            click.echo(f"Autostart: enabled, launchd job {loaded}")
         else:
             click.echo("Autostart: disabled")
 
@@ -135,10 +217,19 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     _setup_logging(verbose)
     logger = logging.getLogger("whisper_daemon")
 
+    if not _acquire_instance_lock():
+        logger.error("Another whisper-daemon instance is already running — exiting")
+        click.echo("Another instance is already running.")
+        # Exit 0 so a launchd KeepAlive job doesn't respawn-loop against
+        # a manually started instance.
+        raise SystemExit(0)
+    PID_FILE.write_text(str(os.getpid()))
+
+    from whisper_daemon import audio_system, supervisor
     from whisper_daemon.daemon import Daemon
     from whisper_daemon.events import Event
     from whisper_daemon.hotkey import HotkeyListener
-    from whisper_daemon.menubar import run_with_menubar
+    from whisper_daemon.menubar import _start_exit_watchdog, run_with_menubar
     from whisper_daemon.config import load_settings
     from whisper_daemon.recorder import AudioRecorder
     from whisper_daemon.transcriber import preload_model
@@ -153,12 +244,23 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     hotkey = HotkeyListener(event_queue)
     daemon = Daemon(event_queue, recorder, model=model, settings=settings)
 
+    audio_system.install_topology_listener()
+    supervisor.start()
+
     preload_model(model)
 
     menubar_delegate = None
 
     def _signal_handler(sig: int, frame: object) -> None:
         logger.info("Received signal %s", signal.Signals(sig).name)
+        supervisor.suspend(f"signal {signal.Signals(sig).name}")
+        meeting_active = bool(
+            menubar_delegate is not None
+            and getattr(menubar_delegate, "_meeting_active", False)
+        )
+        # Long timeout while a meeting save may be running; exit code 0 so
+        # launchd treats this as a requested stop and does not restart.
+        _start_exit_watchdog(330.0 if meeting_active else 15.0, exit_code=0)
         hotkey.stop()
         if menubar_delegate is not None:
             menubar_delegate.graceful_stop()
@@ -194,6 +296,14 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
             on_appkit_ready=on_appkit_ready,
             on_delegate_ready=on_delegate_ready,
         )
+
+    # Skip Python interpreter teardown — past runs have wedged in
+    # multiprocessing.resource_tracker on shutdown (see leaked-semaphore
+    # warnings in daemon.native.log). Everything we care about has already
+    # been flushed by the explicit stop calls above.
+    logger.info("Daemon stopped")
+    logging.shutdown()
+    os._exit(0)
 
 
 @cli.command()
@@ -600,16 +710,37 @@ def _read_pid() -> int:
     return int(PID_FILE.read_text().strip())
 
 
+def _pid_is_daemon(pid: int) -> bool:
+    """Check the PID is alive AND actually a whisper-daemon process.
+
+    Plain ``os.kill(pid, 0)`` lies twice: PermissionError for someone
+    else's recycled PID, and success for any unrelated process that got
+    our old number.
+    """
+    try:
+        out = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True, text=True, timeout=5,
+        )
+        # Matches both `python -m whisper_daemon` (launchd/start) and the
+        # `whisper-daemon` console script (foreground `run`).
+        return "whisper_daemon" in out.stdout or "whisper-daemon" in out.stdout
+    except Exception:
+        return False
+
+
 def _is_running() -> bool:
     if not PID_FILE.exists():
         return False
     try:
         pid = _read_pid()
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, ValueError):
+    except ValueError:
         PID_FILE.unlink(missing_ok=True)
         return False
+    if not _pid_is_daemon(pid):
+        PID_FILE.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -629,9 +760,16 @@ def _setup_logging(verbose: bool) -> None:
     console.setFormatter(formatter)
     root.addHandler(console)
 
-    # File handler (canonical log location)
+    # File handler (canonical log location). Rotates to cap disk usage and
+    # avoid macOS dirty-page write throttling seen on long-running sessions
+    # (Python_2026-04-18 microstackshot: 2.14 GB file-backed dirty memory).
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)

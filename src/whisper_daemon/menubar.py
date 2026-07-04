@@ -6,6 +6,7 @@ multiple phantom icons appear, and @clicked decorators silently fail.
 
 import concurrent.futures
 import logging
+import os
 import queue
 import threading
 import time
@@ -30,6 +31,7 @@ from AppKit import (
 from Foundation import NSRunLoop, NSRunLoopCommonModes
 from PyObjCTools import AppHelper
 
+from whisper_daemon import supervisor
 from whisper_daemon.config import VALID_FORMATS, Settings, load_settings, save_settings
 from whisper_daemon.daemon import State
 
@@ -47,6 +49,11 @@ ICONS = {
 }
 
 MEETING_RECORDING_SYMBOL = "🔴"
+
+# Cap on browser PCM staged before the meeting recorder exists (~2 min of
+# 16kHz float32 mono). Bounds memory if the extension streams with no
+# meeting starting.
+BROWSER_PREBUFFER_MAX_BYTES = 8 * 1024 * 1024
 
 TITLES = {
     State.IDLE: "Ready",
@@ -83,6 +90,11 @@ class MenuBarDelegate(NSObject):
             on_disconnect=self._on_browser_disconnect,
         )
         self._browser_recorder = None  # set during meeting with browser source
+        # Staging buffer for browser PCM that arrives after a reconnect's
+        # 'start' but before the meeting worker has created the browser
+        # recorder — otherwise the extension's flushed buffer is dropped.
+        self._browser_prebuffer: list[bytes] = []
+        self._browser_prebuffer_bytes = 0
 
         return self
 
@@ -279,6 +291,7 @@ class MenuBarDelegate(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def pollState_(self, timer):
+        supervisor.beat("main-thread")
         if self._meeting_active:
             elapsed = time.monotonic() - self._meeting_start
             mins, secs = divmod(int(elapsed), 60)
@@ -347,21 +360,58 @@ class MenuBarDelegate(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def onQuit_(self, sender):
+        """Quit gracefully: finish any in-flight meeting save FIRST.
+
+        AppHelper.stopEventLoop() ends in NSApp.terminate_, which exits the
+        process immediately — so it must be the very last step, called only
+        after the meeting worker has saved its transcript. The shutdown work
+        happens on a helper thread; the exit watchdog guarantees the process
+        dies even if that thread wedges (long timeout while a meeting save
+        is running, short otherwise).
+        """
+        if getattr(self, "_quitting", False):
+            return
+        self._quitting = True
         logger.info("Quit from menu bar")
-        if self._meeting_active:
-            self._stop_meeting()
-        self._browser_bridge.stop()
+
+        supervisor.suspend("quit from menu bar")
+        meeting_active = self._meeting_active
+        _start_exit_watchdog(330.0 if meeting_active else 15.0, exit_code=0)
+
         self._hotkey.stop()
-        self._daemon.shutdown()
-        AppHelper.stopEventLoop()
+        if hasattr(self, "_timer") and self._timer is not None:
+            self._timer.invalidate()
+            self._timer = None
+        self._set_icon_by_name("⏳")
+
+        threading.Thread(
+            target=self._shutdown_worker, name="quit-shutdown", daemon=True
+        ).start()
+
+    def _shutdown_worker(self) -> None:
+        try:
+            self.graceful_stop()
+            self._daemon.shutdown()
+        except Exception:
+            logger.exception("Error during shutdown")
+        finally:
+            AppHelper.callAfter(AppHelper.stopEventLoop)
 
     def _set_icon(self, state: State) -> None:
-        """Set the menu bar icon emoji for the given state."""
+        """Set the menu bar icon emoji for the given state (main thread only)."""
         self._status_item.button().setTitle_(ICONS.get(state, "🎙"))
 
     def _set_icon_by_name(self, icon_text: str, _fallback: str = "") -> None:
-        """Set the menu bar icon to the given text."""
+        """Set the menu bar icon to the given text (main thread only)."""
         self._status_item.button().setTitle_(icon_text)
+
+    def _set_icon_safe(self, state: State) -> None:
+        """Set the menu bar icon from any thread."""
+        AppHelper.callAfter(self._set_icon, state)
+
+    def _set_status_safe(self, text: str) -> None:
+        """Set the status menu item title from any thread."""
+        AppHelper.callAfter(self._status_menu_item.setTitle_, text)
 
     # -- Recent transcriptions --
 
@@ -571,9 +621,19 @@ class MenuBarDelegate(NSObject):
 
     def _on_browser_audio(self, data: bytes) -> None:
         """Raw PCM audio from browser tab."""
-        if self._browser_recorder is not None:
-            samples = np.frombuffer(data, dtype=np.float32)
-            self._browser_recorder.feed_audio(samples)
+        rec = self._browser_recorder
+        if rec is not None:
+            rec.feed_audio(np.frombuffer(data, dtype=np.float32))
+            return
+        # No recorder yet: stage a bounded amount so the extension's flushed
+        # reconnect buffer isn't lost while the meeting worker spins up. The
+        # worker drains this when it creates the browser recorder; if no
+        # meeting starts it's cleared on the next reset. Drop-oldest keeps
+        # recent speech.
+        self._browser_prebuffer.append(data)
+        self._browser_prebuffer_bytes += len(data)
+        while self._browser_prebuffer_bytes > BROWSER_PREBUFFER_MAX_BYTES and self._browser_prebuffer:
+            self._browser_prebuffer_bytes -= len(self._browser_prebuffer.pop(0))
 
     def _on_browser_disconnect(self) -> None:
         """Extension disconnected or stopped capture."""
@@ -584,6 +644,14 @@ class MenuBarDelegate(NSObject):
     # -- Meeting recording --
 
     def _start_meeting(self, browser_triggered: bool = False, browser_title: str = "") -> None:
+        # Guard against duplicate starts: two rapid browser 'start' messages
+        # each schedule _start_meeting via callAfter, and _on_browser_connect
+        # checks _meeting_active before the first one has run — so the check
+        # there is not enough. A second concurrent meeting would open a
+        # second mic stream and corrupt the chunk pipeline.
+        if self._meeting_active:
+            logger.info("Meeting already active — ignoring duplicate start")
+            return
         self._meeting_active = True
         self._meeting_browser_triggered = browser_triggered
         self._meeting_start = time.monotonic()
@@ -601,6 +669,10 @@ class MenuBarDelegate(NSObject):
         self._meeting_thread.start()
 
     def _stop_meeting(self) -> None:
+        if not self._meeting_active:
+            # Second stop for the same meeting (e.g. browser 'stop' message
+            # plus the connection-closed callback) — nothing to do.
+            return
         self._meeting_active = False
         logger.info("Meeting recording stop requested")
 
@@ -632,6 +704,14 @@ class MenuBarDelegate(NSObject):
         if browser_triggered and self._browser_bridge.connected:
             browser_recorder = MeetingRecorder(chunk_queue, source_label="browser")
             browser_recorder.start_without_device()
+            # Drain PCM staged between the extension's 'start' and now so a
+            # reconnect's flushed buffer (or the first frames of a fresh
+            # session) isn't lost.
+            staged = self._browser_prebuffer
+            self._browser_prebuffer = []
+            self._browser_prebuffer_bytes = 0
+            for data in staged:
+                browser_recorder.feed_audio(np.frombuffer(data, dtype=np.float32))
             self._browser_recorder = browser_recorder
 
         # Number of recorders determines how many None sentinels to expect
@@ -661,14 +741,15 @@ class MenuBarDelegate(NSObject):
         RECOVERY_BACKOFF_SEC = 10.0  # min interval between recovery attempts
 
         telemetry.meeting_start()
+        devices_stopped = False
         try:
             mic_recorder.start()
         except Exception as exc:
             logger.error("Failed to open mic for meeting: %s", exc)
             if screen_capture:
                 screen_capture.stop()
-            self._meeting_active = False
-            self._meeting_menu_item.setTitle_("Start Meeting Recording")
+            _notify("whisper-daemon", "Error", "Could not open microphone for meeting.")
+            self._reset_meeting_ui()
             return
 
         if mic_recorder.fell_back_to_default:
@@ -683,7 +764,9 @@ class MenuBarDelegate(NSObject):
                 futures: dict[concurrent.futures.Future, float] = {}
 
                 partial_path = rec_dir / "transcript_live.txt"
-                last_chunk_time = time.monotonic()
+                # Mic liveness is read from the recorder's callback clock
+                # (last_audio_at), not from emitted chunks — steady browser
+                # audio no longer masks a dead microphone.
                 last_health_warn = 0.0
                 last_recovery_attempt = 0.0
                 mic_lost_notified = False
@@ -724,25 +807,28 @@ class MenuBarDelegate(NSObject):
                         if _collect_futures(futures, all_results):
                             _write_partial(partial_path, all_results)
                             self._send_results_to_browser(all_results, chunk_count)
-                        # Health check: warn repeatedly while silent, and
-                        # ask the mic recorder to try reopening its stream
-                        # — the callback path can't detect "alive but
-                        # delivering silence" reliably, so the loop itself
-                        # has to nudge it when nothing is arriving.
-                        elapsed_silent = now - last_chunk_time
+                        # Health check keyed on the mic CALLBACK, not on
+                        # emitted chunks: a quiet room emits no chunks (VAD
+                        # drops silence) yet the callback keeps firing, so
+                        # keying on chunks would false-alarm every 2 min
+                        # while the user is merely listening. last_audio_at
+                        # only goes stale when the stream genuinely stops
+                        # delivering samples — a real dead device.
+                        mic_last_audio = mic_recorder.last_audio_at
+                        elapsed_silent = now - mic_last_audio if mic_last_audio else 0.0
                         if (
                             elapsed_silent > HEALTH_CHECK_SEC
                             and now - last_health_warn >= HEALTH_REPEAT_SEC
                         ):
                             last_health_warn = now
                             logger.warning(
-                                "No audio chunks for %.0fs — mic may not be capturing speech",
+                                "No mic audio callbacks for %.0fs — mic stream appears dead",
                                 elapsed_silent,
                             )
                             _notify(
                                 "whisper-daemon",
-                                "No speech detected",
-                                f"No audio for {int(elapsed_silent)}s. Check your microphone.",
+                                "Microphone stopped",
+                                f"No mic audio for {int(elapsed_silent)}s. Attempting to recover.",
                             )
                             mic_recorder.request_recovery()
                         continue
@@ -754,7 +840,6 @@ class MenuBarDelegate(NSObject):
                         continue
 
                     chunk_count += 1
-                    last_chunk_time = now
                     logger.info(
                         "Meeting chunk %d: %.1fs [%s]",
                         chunk_count, chunk.duration, chunk.source,
@@ -781,6 +866,7 @@ class MenuBarDelegate(NSObject):
                     self._browser_recorder = None
                 if screen_capture is not None:
                     screen_capture.stop()
+                devices_stopped = True
 
                 # Wait for in-flight transcription to finish FIRST
                 _collect_futures(futures, all_results, wait=True)
@@ -805,6 +891,18 @@ class MenuBarDelegate(NSObject):
             _notify("whisper-daemon", "Error", "Meeting recording failed.")
             self._reset_meeting_ui()
             return
+        finally:
+            # Safety net for exception paths that skipped the normal
+            # cleanup: a leaked registered mic stream permanently disables
+            # the PortAudio device refresh for the rest of the process life.
+            # Skipped after a clean stop() (devices_stopped=True).
+            if not devices_stopped:
+                mic_recorder.abort()
+                if browser_recorder is not None:
+                    browser_recorder.stop_without_device()
+                    self._browser_recorder = None
+                if screen_capture is not None:
+                    screen_capture.stop()
 
         if not all_results:
             _notify("whisper-daemon", "Done", "No speech detected.")
@@ -881,19 +979,32 @@ class MenuBarDelegate(NSObject):
         if self._meeting_active:
             logger.info("Graceful stop: stopping active meeting before exit")
             self._meeting_active = False
-            if self._meeting_thread is not None and self._meeting_thread.is_alive():
-                self._meeting_thread.join(timeout=timeout)
-                if self._meeting_thread.is_alive():
-                    logger.warning("Meeting worker did not finish within %.0fs", timeout)
+        # Join whenever the worker is alive — not only when _meeting_active.
+        # If the user already clicked Stop, _meeting_active is False but the
+        # worker is still saving/diarizing; skipping the join here would let
+        # the exit path kill the save mid-write.
+        if self._meeting_thread is not None and self._meeting_thread.is_alive():
+            logger.info("Graceful stop: waiting for meeting save to finish")
+            self._meeting_thread.join(timeout=timeout)
+            if self._meeting_thread.is_alive():
+                logger.warning("Meeting worker did not finish within %.0fs", timeout)
         self._browser_bridge.stop()
 
     def _reset_meeting_ui(self) -> None:
+        """Reset meeting state and UI. Safe to call from any thread —
+        AppKit mutations are dispatched to the main thread."""
         self._meeting_active = False
         self._meeting_browser_triggered = False
         self._browser_recorder = None
-        self._meeting_menu_item.setTitle_("Start Meeting Recording")
-        self._set_icon(State.IDLE)
-        self._status_menu_item.setTitle_("Status: Ready")
+        self._browser_prebuffer = []
+        self._browser_prebuffer_bytes = 0
+
+        def _update_ui() -> None:
+            self._meeting_menu_item.setTitle_("Start Meeting Recording")
+            self._set_icon(State.IDLE)
+            self._status_menu_item.setTitle_("Status: Ready")
+
+        AppHelper.callAfter(_update_ui)
 
     # -- File transcription --
 
@@ -903,8 +1014,8 @@ class MenuBarDelegate(NSObject):
 
         model = self._daemon._model
 
-        self._set_icon(State.TRANSCRIBING)
-        self._status_menu_item.setTitle_("Transcribing files...")
+        self._set_icon_safe(State.TRANSCRIBING)
+        self._set_status_safe("Transcribing files...")
 
         files: list[Path] = []
         ext_set = {"." + e for e in AUDIO_VIDEO_EXTENSIONS}
@@ -929,9 +1040,7 @@ class MenuBarDelegate(NSObject):
         done = 0
         for file_path in files:
             try:
-                self._status_menu_item.setTitle_(
-                    f"Transcribing {file_path.name}..."
-                )
+                self._set_status_safe(f"Transcribing {file_path.name}...")
                 result = transcribe_file(str(file_path), model=model)
 
                 dest = out_dir or file_path.parent
@@ -1026,6 +1135,30 @@ def _write_partial(path: Path, results: list[tuple[float, dict]]) -> None:
         path.write_text(text, encoding="utf-8")
     except Exception:
         pass
+
+
+def _start_exit_watchdog(timeout: float, exit_code: int = 0) -> None:
+    """Force-exit the process if it's still alive `timeout` seconds from now.
+
+    Backstop for a shutdown that wedges in websockets/MLX/resource_tracker —
+    we have logs showing the process lingering after "Shutdown requested"
+    with no "Daemon stopped" line, so the user has to kill -9 it. This
+    guarantees exit within `timeout` seconds regardless.
+
+    ``exit_code`` 0 means "user asked us to quit" (launchd will NOT
+    restart); non-zero means "we died wedged" (launchd restarts us).
+    Callers stopping a meeting must pass a timeout that accommodates the
+    meeting save (minutes), not just socket teardown.
+    """
+    def _kill() -> None:
+        time.sleep(timeout)
+        logger.warning(
+            "Exit watchdog fired after %.0fs — forcing os._exit(%d)",
+            timeout, exit_code,
+        )
+        os._exit(exit_code)
+
+    threading.Thread(target=_kill, name="exit-watchdog", daemon=True).start()
 
 
 def run_with_menubar(

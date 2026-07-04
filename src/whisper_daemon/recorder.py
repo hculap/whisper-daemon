@@ -7,7 +7,7 @@ import time
 import numpy as np
 import sounddevice as sd
 
-from whisper_daemon import telemetry
+from whisper_daemon import audio_system, telemetry
 from whisper_daemon.events import Event, EventType
 from whisper_daemon.vad import SileroVAD
 
@@ -23,6 +23,11 @@ RMS_SILENCE_FLOOR = 0.005  # Below this RMS = definitely silence, skip VAD
 DEFAULT_SILENCE_SEC = 0.7
 PREVIEW_START_SEC = 2.0  # Start previews after 2s of voice
 PREVIEW_INTERVAL_SEC = 3.0  # Send preview every 3s
+# A live stream delivering exact-zero samples is a dead device (stale
+# PortAudio binding after a Bluetooth topology change, revoked mic
+# permission, OS-level mute). A real quiet room always has ~1e-6 noise.
+# 63 blocks × 512 samples ÷ 16 kHz ≈ 2 s.
+DEAD_STREAM_BLOCKS = 63
 
 
 class AudioRecorder:
@@ -49,6 +54,8 @@ class AudioRecorder:
         self._recording = False
         self._last_preview_time: float = 0.0
         self._last_preview_samples: int = 0
+        self._zero_block_count = 0
+        self._device_dead_reported = False
 
     def start_recording(self) -> None:
         """Start capturing audio. Falls back to system default if preferred device fails."""
@@ -59,87 +66,109 @@ class AudioRecorder:
         self._recording = True
         self._last_preview_time = 0.0
         self._last_preview_samples = 0
+        self._zero_block_count = 0
+        self._device_dead_reported = False
         self._vad.reset_states()
 
-        device, channels = self._open_stream()
-        self._stream.start()
+        with audio_system.stream_open():
+            audio_system.ensure_fresh()
+            device, channels = self._open_stream()
+            self._stream.start()
+            audio_system.register_stream(self._stream)
         logger.info("Recording started (device: %s, channels: %d)", device or "system default", channels)
 
-    def _open_stream(self) -> tuple[str | int | None, int]:
-        """Try preferred device, fall back to system default, then refresh PortAudio.
+    def reopen_stream(self) -> bool:
+        """Replace a dead stream mid-recording, keeping buffered audio.
 
-        We avoid calling ``sd._terminate()`` / ``sd._initialize()`` eagerly
-        because it tears down the entire PortAudio host API, killing any
-        other live ``InputStream`` (e.g. a meeting recording). Instead we
-        only refresh as a last resort — when both the preferred device and
-        the system default have failed. At that point no working streams
-        remain, so the global teardown is safe.
+        Called by the daemon when the callback reports a dead device
+        (all-zero samples). Closes the old stream, refreshes the PortAudio
+        device list, and opens a new stream so the recording continues
+        transparently. Returns True on success.
+        """
+        self._close_stream()
+        audio_system.mark_dirty("dead stream during dictation")
+        with audio_system.stream_open():
+            audio_system.ensure_fresh()
+            try:
+                device, channels = self._open_stream()
+                self._stream.start()
+            except Exception:
+                logger.exception("Stream reopen failed")
+                # Don't leave a half-open stream behind — close it so it
+                # can't linger unregistered and keep the mic hot.
+                self._close_stream()
+                return False
+            audio_system.register_stream(self._stream)
+        self._zero_block_count = 0
+        self._device_dead_reported = False
+        # Extend the no-voice deadline — the user gets a fresh window on
+        # the recovered device instead of an instant abort.
+        self._recording_start = time.monotonic()
+        logger.info(
+            "Recording stream reopened (device: %s, channels: %d)",
+            device or "system default", channels,
+        )
+        return True
+
+    def _close_stream(self) -> None:
+        if self._stream is None:
+            return
+        audio_system.unregister_stream(self._stream)
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            logger.debug("Error closing stream", exc_info=True)
+        self._stream = None
+
+    def _open_stream(self) -> tuple[str | int | None, int]:
+        """Open the input stream, preferring the configured device.
+
+        Any open failure means the PortAudio device snapshot is suspect:
+        mark it dirty and refresh (refused automatically while another
+        stream — e.g. a meeting recording — is live), retry the preferred
+        device once on a fresh list, then fall back to the system default.
         """
         if self._device is not None:
             try:
-                self._channels = _detect_channels(self._device)
-                self._stream = sd.InputStream(
-                    device=self._device,
-                    samplerate=SAMPLE_RATE,
-                    channels=self._channels,
-                    dtype=DTYPE,
-                    blocksize=BLOCK_SIZE,
-                    callback=self._audio_callback,
-                )
-                return self._device, self._channels
+                return self._try_open(self._device)
             except (sd.PortAudioError, ValueError):
+                audio_system.mark_dirty(f"device '{self._device}' failed to open")
+                if audio_system.ensure_fresh():
+                    try:
+                        return self._try_open(self._device)
+                    except (sd.PortAudioError, ValueError):
+                        logger.warning(
+                            "Device '%s' still unavailable after refresh",
+                            self._device,
+                        )
                 logger.warning(
                     "Device '%s' unavailable, falling back to system default",
                     self._device,
                 )
 
         try:
-            self._channels = 1
-            self._stream = sd.InputStream(
-                device=None,
-                samplerate=SAMPLE_RATE,
-                channels=self._channels,
-                dtype=DTYPE,
-                blocksize=BLOCK_SIZE,
-                callback=self._audio_callback,
-            )
-            return None, self._channels
+            return self._try_open(None)
         except sd.PortAudioError:
+            audio_system.mark_dirty("system default failed to open")
             logger.warning(
                 "System default also failed — refreshing PortAudio device list",
             )
+            if not audio_system.ensure_fresh():
+                raise
+        return self._try_open(None)
 
-        sd._terminate()
-        sd._initialize()
-
-        if self._device is not None:
-            try:
-                self._channels = _detect_channels(self._device)
-                self._stream = sd.InputStream(
-                    device=self._device,
-                    samplerate=SAMPLE_RATE,
-                    channels=self._channels,
-                    dtype=DTYPE,
-                    blocksize=BLOCK_SIZE,
-                    callback=self._audio_callback,
-                )
-                return self._device, self._channels
-            except (sd.PortAudioError, ValueError):
-                logger.warning(
-                    "Device '%s' still unavailable after refresh, trying system default",
-                    self._device,
-                )
-
-        self._channels = 1
+    def _try_open(self, device: str | int | None) -> tuple[str | int | None, int]:
+        self._channels = _detect_channels(device) if device is not None else 1
         self._stream = sd.InputStream(
-            device=None,
+            device=device,
             samplerate=SAMPLE_RATE,
             channels=self._channels,
             dtype=DTYPE,
             blocksize=BLOCK_SIZE,
             callback=self._audio_callback,
         )
-        return None, self._channels
+        return device, self._channels
 
     @property
     def voice_detected(self) -> bool:
@@ -150,10 +179,7 @@ class AudioRecorder:
         """Stop recording and return the captured audio as a 1D numpy array."""
         self._recording = False
 
-        if self._stream is not None:
-            self._stream.stop()
-            self._stream.close()
-            self._stream = None
+        self._close_stream()
 
         self._vad.reset_states()
 
@@ -194,6 +220,25 @@ class AudioRecorder:
         else:
             mono = indata
         self._chunks.append(mono.copy())
+
+        # Dead-stream detection: exact-zero samples mean the device behind
+        # this stream is gone (stale binding after a Bluetooth reconnect,
+        # revoked permission). Report once; the daemon reopens the stream
+        # on a refreshed device list and the recording continues.
+        if np.all(mono[:, 0] == 0.0):
+            self._zero_block_count += 1
+            if (
+                self._zero_block_count >= DEAD_STREAM_BLOCKS
+                and not self._device_dead_reported
+            ):
+                self._device_dead_reported = True
+                logger.warning(
+                    "Stream delivering only zeros for ~%.1fs — device dead, requesting reopen",
+                    self._zero_block_count * BLOCK_SIZE / SAMPLE_RATE,
+                )
+                self._queue.put(Event(EventType.RECORD_DEVICE_DEAD))
+        else:
+            self._zero_block_count = 0
 
         elapsed = time.monotonic() - self._recording_start
         if elapsed > MAX_RECORDING_SEC:

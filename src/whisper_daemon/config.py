@@ -19,22 +19,41 @@ def _validate_screenshot_displays(value: str) -> str:
     return value if value in VALID_SCREENSHOT_DISPLAYS else "all"
 
 
+_TOML_SIMPLE_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
 def _toml_str(value: str) -> str:
     """Serialize a Python string as a safe TOML basic string.
 
-    Escapes backslashes, double-quotes and control characters so free-form
-    values (e.g. recording_dir/device coming from the extension) cannot inject
-    extra keys or corrupt config.toml.
+    Escapes per the TOML spec — backslash, double-quote, the named control
+    escapes (\\b \\t \\n \\f \\r) and any remaining control character as
+    ``\\uXXXX`` — so free-form values (e.g. recording_dir/device coming from
+    the extension) cannot inject extra keys or corrupt config.toml even if a
+    value slips past upstream validation. Lone UTF-16 surrogate codepoints
+    (``U+D800``–``U+DFFF``) are dropped: they are not valid Unicode scalars,
+    are not utf-8 encodable, and a bare ``\\uD800`` TOML escape is itself
+    invalid — so emitting them would still corrupt the file on write.
     """
-    escaped = (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace('"', '\\"')
-        .replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-    )
-    return f'"{escaped}"'
+    out: list[str] = []
+    for ch in str(value):
+        escape = _TOML_SIMPLE_ESCAPES.get(ch)
+        if escape is not None:
+            out.append(escape)
+        elif 0xD800 <= ord(ch) <= 0xDFFF:
+            continue  # drop lone surrogate — not utf-8 encodable
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
 
 
 @dataclass

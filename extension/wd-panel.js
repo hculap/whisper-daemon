@@ -122,10 +122,28 @@
     }
   }
 
-  function coldNote() {
-    return recordingActive
+  // Show the "applies next recording" note next to a COLD field while a
+  // recording is active. Driven by WD.logic.isColdSetting so the cold/hot
+  // classification lives in one place (wd-logic.js).
+  function coldNote(key) {
+    const logic = WD.logic;
+    const isCold = logic && typeof logic.isColdSetting === "function"
+      ? logic.isColdSetting(key)
+      : false;
+    return recordingActive && isCold
       ? '<div class="note wd-show">od następnego nagrania</div>'
       : "";
+  }
+
+  // True while a text input or select inside the (open) panel holds focus, so a
+  // WD_SETTINGS echo does not blow away the caret mid-typing (F13). Checkboxes/
+  // radios hold no caret, so they don't block re-render.
+  function isEditingInPanel() {
+    if (!popEl || !popEl.classList.contains("wd-open") || !shadow) return false;
+    const el = shadow.activeElement;
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === "SELECT" || (tag === "INPUT" && el.type === "text");
   }
 
   function devicesOptions(devices, selected) {
@@ -153,6 +171,10 @@
     buildHost();
     if (settings && typeof settings === "object") currentSettings = settings;
     if (Array.isArray(devices)) lastDevices = devices;
+    // Preserve the caret: skip the wholesale innerHTML rebuild while the user is
+    // typing in / focused on a text input or select. State is already stored
+    // above, so the next open (or a non-focused render) reflects it (F13).
+    if (isEditingInPanel()) return;
     devices = lastDevices;
     const s = currentSettings || {};
     const formats = Array.isArray(s.recording_formats) ? s.recording_formats : ["txt"];
@@ -169,18 +191,18 @@
         <label>Mikrofon</label>
         <select data-key="recording_device">${devicesOptions(devices, s.recording_device || "")}</select>
       </div>
-      ${coldNote()}
+      ${coldNote("recording_device")}
 
       <div class="row">
         <label>Nagrywaj mnie (Ja)</label>
         <input type="checkbox" data-key="capture_mic" ${s.capture_mic ? "checked" : ""}>
       </div>
-      ${coldNote()}
+      ${coldNote("capture_mic")}
       <div class="row">
         <label>Nagrywaj uczestników</label>
         <input type="checkbox" data-key="capture_tab" ${s.capture_tab ? "checked" : ""}>
       </div>
-      ${coldNote()}
+      ${coldNote("capture_tab")}
 
       <hr>
 
@@ -194,7 +216,7 @@
       <div class="row sub">
         <label><input type="radio" name="wd-disp" data-disp="primary" ${s.screenshot_displays === "primary" ? "checked" : ""}> Tylko główny</label>
       </div>
-      ${coldNote()}
+      ${coldNote("screenshot_displays")}
 
       <hr>
 
@@ -215,7 +237,7 @@
           <option value="realtime" ${s.diarize_mode === "realtime" ? "selected" : ""}>realtime</option>
         </select>
       </div>
-      ${coldNote()}
+      ${coldNote("diarize_mode")}
 
       <hr>
 
@@ -223,11 +245,11 @@
         <label>Katalog zapisu</label>
         <input type="text" data-key="recording_dir" value="${escapeAttr(s.recording_dir || "~/Desktop")}">
       </div>
-      ${coldNote()}
+      ${coldNote("recording_dir")}
 
       <div class="row"><label>Formaty</label></div>
       <div class="formats">${formatBoxes}</div>
-      ${coldNote()}
+      ${coldNote("recording_formats")}
 
       <div class="actions">
         <button class="wd-action ${recordingActive ? "wd-recording" : ""}" data-role="action">

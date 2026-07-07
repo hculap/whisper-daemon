@@ -103,20 +103,8 @@ class BrowserAudioBridge:
             "chunk_index": chunk_index,
         }))
 
-    def send_status(self, recording: bool, chunks_transcribed: int) -> None:
-        """Send a status update to the extension (thread-safe)."""
-        self._schedule_send(json.dumps({
-            "type": "status",
-            "recording": recording,
-            "chunks_transcribed": chunks_transcribed,
-        }))
-
-    def send_settings(self, msg: str) -> None:
-        """Send a pre-built 'settings' JSON message (thread-safe)."""
-        self._schedule_send(msg)
-
-    def send_status_msg(self, msg: str) -> None:
-        """Send a pre-built 'status' JSON message (thread-safe)."""
+    def send_json_str(self, msg: str) -> None:
+        """Send a pre-built JSON message (settings/status) — thread-safe."""
         self._schedule_send(msg)
 
     async def _safe_send(self, msg: str) -> None:

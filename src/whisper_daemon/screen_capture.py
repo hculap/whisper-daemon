@@ -34,6 +34,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_INTERVAL = 5.0  # seconds between capture attempts
 DHASH_SIZE = 16  # 16x16 grid = 256-bit hash
 CHANGE_THRESHOLD = 0.12  # hamming distance — ignores cursor/clock, catches slide changes
+# Stop capturing after this many consecutive failures (deleted output dir,
+# full disk) instead of logging a traceback every interval for hours.
+MAX_CONSECUTIVE_FAILURES = 5
 
 
 class ScreenCapture:
@@ -48,16 +51,20 @@ class ScreenCapture:
         output_dir: Path,
         interval: float = DEFAULT_INTERVAL,
         threshold: float = CHANGE_THRESHOLD,
+        displays: str = "all",
     ) -> None:
         self._output_dir = output_dir / "screenshots"
         self._interval = interval
         self._threshold = threshold
+        # "all" captures every active display; "primary" only the first one.
+        self._displays = displays
         self._running = False
         self._thread: threading.Thread | None = None
         self._start_time: float = 0.0
         self._last_hashes: dict[int, np.ndarray] = {}  # display_id → last hash
         self._saved_count = 0
         self._capture_lock = threading.Lock()
+        self._consecutive_failures = 0
 
     @property
     def saved_count(self) -> int:
@@ -87,11 +94,22 @@ class ScreenCapture:
 
     def capture_now(self) -> None:
         """Capture all displays immediately (called by activity monitor)."""
+        if not self._running:
+            return
         with self._capture_lock:
             try:
                 self._capture_all_displays()
+                self._consecutive_failures = 0
             except Exception:
-                logger.exception("Event-triggered screenshot capture failed")
+                self._consecutive_failures += 1
+                if self._consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                    logger.error(
+                        "Screen capture failed %d times in a row — disabling for this recording",
+                        self._consecutive_failures, exc_info=True,
+                    )
+                    self._running = False
+                else:
+                    logger.exception("Screenshot capture failed")
 
     def _capture_loop(self) -> None:
         while self._running:
@@ -103,6 +121,11 @@ class ScreenCapture:
         timestamp_sec = int(elapsed)
 
         display_ids = _get_display_ids()
+
+        # "primary" restricts capture to the first (main) display; any other
+        # value keeps the default all-displays behavior.
+        if self._displays == "primary" and display_ids:
+            display_ids = display_ids[:1]
 
         for i, display_id in enumerate(display_ids):
             display_num = i + 1

@@ -7,6 +7,8 @@ import threading
 import mlx_whisper
 import numpy as np
 
+from whisper_daemon.ffmpeg_path import ensure_ffmpeg_on_path
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo-q4"
@@ -189,6 +191,15 @@ def transcribe_file(
     }
     if language is not None:
         kwargs["language"] = language
+
+    # ffmpeg decodes the file; under launchd the daemon's PATH excludes
+    # Homebrew/MacPorts, so make sure the binary is discoverable first and
+    # fail with an actionable message instead of a bare FileNotFoundError.
+    if ensure_ffmpeg_on_path() is None:
+        raise RuntimeError(
+            "ffmpeg not found — it is required to decode audio/video files "
+            "(m4a, mp4, mp3, …). Install it with: brew install ffmpeg"
+        )
 
     # Decode to an array BEFORE taking the GPU lock: a stalled ffmpeg on a
     # corrupt file then can't block dictation/meeting inference, and the

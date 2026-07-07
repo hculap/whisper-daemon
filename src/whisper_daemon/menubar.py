@@ -1329,6 +1329,7 @@ class MenuBarDelegate(NSObject):
             out_dir.mkdir(parents=True, exist_ok=True)
 
         done = 0
+        last_error: str | None = None
         for file_path in files:
             try:
                 self._set_status_safe(f"Transcribing {file_path.name}...")
@@ -1343,14 +1344,20 @@ class MenuBarDelegate(NSObject):
                             FORMATTERS[fmt](result), encoding="utf-8"
                         )
                 done += 1
-            except Exception:
+            except Exception as exc:
+                last_error = str(exc) or exc.__class__.__name__
                 logger.exception("Failed to transcribe %s", file_path)
 
-        _notify(
-            "whisper-daemon",
-            "Transcription complete",
-            f"{done}/{len(files)} files transcribed.",
-        )
+        # Surface the actual reason when nothing succeeded (e.g. missing ffmpeg)
+        # instead of a bare "0/N" that reads like the format is unsupported.
+        if done == 0 and last_error is not None:
+            _notify("whisper-daemon", "Transcription failed", last_error[:200])
+        else:
+            _notify(
+                "whisper-daemon",
+                "Transcription complete",
+                f"{done}/{len(files)} files transcribed.",
+            )
         self._reset_meeting_ui()
 
 

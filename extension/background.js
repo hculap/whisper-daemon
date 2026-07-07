@@ -35,6 +35,21 @@ function updateBadge() {
   chrome.action.setBadgeBackgroundColor({ color: badge.color });
 }
 
+// Paint the badge from a daemon status phase (idle | recording | transcribing)
+// rather than the background's own state machine, so it tracks the real
+// recording phase across an owned stop that keeps the session's socket alive.
+function updateBadgeForPhase(phase) {
+  const map = {
+    idle: { text: "", color: "#000" },
+    recording: { text: "REC", color: "#F44336" },
+    transcribing: { text: "…", color: "#FF9800" },
+  };
+  const badge = map[phase];
+  if (!badge) return;
+  chrome.action.setBadgeText({ text: badge.text });
+  chrome.action.setBadgeBackgroundColor({ color: badge.color });
+}
+
 // --- Messages ---
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -62,9 +77,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "MEET_LEFT") {
-    if (state === State.CAPTURING || state === State.STARTING) {
-      stopCapture();
-    }
+    // Leaving the call ends the session: fully tear down the offscreen socket
+    // (persistent control channel) regardless of state. Safe if idle — the
+    // offscreen just closes the socket.
+    stopCapture();
     // Tell the in-page orchestrator to stop any local capture and tear down its
     // observer + shadow hosts (Meet is an SPA; the content script is not
     // reloaded when the user leaves the call).
@@ -78,7 +94,6 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   } else if (msg.type === "CAPTURE_STARTED") {
     transitionTo(State.CAPTURING);
-    relayToContentScript(msg);
     sendResponse({ ok: true });
 
   } else if (msg.type === "CAPTURE_RECONNECTING") {
@@ -87,11 +102,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // tell "recording but daemon unreachable" from plain recording.
     chrome.action.setBadgeText({ text: "···" });
     chrome.action.setBadgeBackgroundColor({ color: "#FF9800" });
-    relayToContentScript(msg);
     sendResponse({ ok: true });
 
   } else if (msg.type === "CAPTURE_STOPPED") {
-    relayToContentScript(msg);
     transitionTo(State.IDLE);
     meetTabId = null;
     sendResponse({ ok: true });
@@ -103,13 +116,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       title: "Capture Error",
       message: msg.message || "Failed to capture audio",
     });
-    relayToContentScript(msg);
     relayWD("WD_ERROR", { message: msg.message });
     transitionTo(State.IDLE);
     sendResponse({ ok: true });
 
   } else if (msg.type === "CHUNK_TRANSCRIBED") {
-    relayToContentScript(msg);
     relayWD("WD_CHUNK", {
       text: msg.text,
       startTime: msg.startTime,
@@ -124,6 +135,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       elapsed: msg.elapsed,
       chunks: msg.chunks,
     });
+    // Track the real recording phase on the toolbar badge (finding 4). WD_STOP
+    // now keeps the socket open and no longer transitions the background out of
+    // CAPTURING, so without this the badge would stay red "REC" for the rest of
+    // the session after an owned stop. Map the daemon phase directly.
+    updateBadgeForPhase(msg.state);
     sendResponse({ ok: true });
 
   } else if (msg.type === "SETTINGS") {
@@ -140,8 +156,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     }
     sendResponse({ ok: true });
 
+  } else if (msg.type === "WD_STOP") {
+    // A trailing stop must NOT resurrect meetTabId after MEET_LEFT cleared it,
+    // or the status relay would re-point at a left tab (F15). Only refresh the
+    // pointer if we still have a live meeting; always forward the stop so the
+    // daemon finalizes.
+    if (meetTabId !== null && sender.tab?.id) meetTabId = sender.tab.id;
+    forwardToOffscreen(msg);
+    sendResponse({ ok: true });
+
   } else if (
-    msg.type === "WD_STOP" ||
     msg.type === "WD_STOP_MEETING" ||
     msg.type === "WD_GET_SETTINGS" ||
     msg.type === "WD_SET_SETTINGS"
@@ -153,9 +177,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_PCM") {
-    // High-frequency audio relay; offscreen already exists by now.
+    // High-frequency audio relay. Once the offscreen document is known to exist
+    // relay synchronously (preserves frame order); before that, await creation
+    // so the first frames aren't dropped in the boot gap (F11/F23).
     if (sender.tab?.id) {
-      chrome.runtime.sendMessage(msg).catch(() => {});
+      if (offscreenReady) {
+        chrome.runtime.sendMessage(msg).catch(() => {});
+      } else {
+        ensureOffscreenDocument()
+          .then(() => {
+            offscreenReady = true;
+            return chrome.runtime.sendMessage(msg).catch(() => {});
+          })
+          .catch(() => {});
+      }
     }
     sendResponse({ ok: true });
 
@@ -214,7 +249,9 @@ async function startCaptureWithStream(streamId) {
 }
 
 function stopCapture() {
-  chrome.runtime.sendMessage({ type: "STOP_CAPTURE" });
+  // Reaches the offscreen document if it exists; a missing receiver rejects,
+  // which we ignore (nothing to tear down).
+  chrome.runtime.sendMessage({ type: "STOP_CAPTURE" }).catch(() => {});
 }
 
 // In-flight createDocument promise. Concurrent callers (e.g. two Meet tabs both
@@ -223,12 +260,19 @@ function stopCapture() {
 // with "Only a single offscreen document may be created". Memoize the creation
 // so everyone awaits the same promise.
 let offscreenCreating = null;
+// Fast-path flag so the hot WD_PCM relay doesn't await getContexts per frame
+// once the offscreen document exists. The document is never closed here, so
+// this stays true for the life of the service worker.
+let offscreenReady = false;
 
 async function ensureOffscreenDocument() {
   const contexts = await chrome.runtime.getContexts({
     contextTypes: ["OFFSCREEN_DOCUMENT"],
   });
-  if (contexts.length > 0) return;
+  if (contexts.length > 0) {
+    offscreenReady = true;
+    return;
+  }
 
   if (!offscreenCreating) {
     offscreenCreating = chrome.offscreen
@@ -250,14 +294,7 @@ async function ensureOffscreenDocument() {
   }
 
   await offscreenCreating;
-}
-
-// --- Relay to content script ---
-
-function relayToContentScript(msg) {
-  if (meetTabId) {
-    chrome.tabs.sendMessage(meetTabId, msg).catch(() => {});
-  }
+  offscreenReady = true;
 }
 
 // Relay a WD_* message to the Meet tab's content orchestrator.
@@ -292,9 +329,8 @@ if (chrome.commands && chrome.commands.onCommand) {
 
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (tabId === meetTabId) {
-    if (state === State.CAPTURING) {
-      stopCapture();
-    }
+    // Tab gone — close the persistent offscreen socket unconditionally.
+    stopCapture();
     meetTabId = null;
     transitionTo(State.IDLE);
   }

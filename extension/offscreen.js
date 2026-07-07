@@ -8,6 +8,12 @@
  *
  * Resilience is unchanged: if the socket drops mid-capture, PCM is buffered
  * (bounded) and a reconnect loop runs for up to RECONNECT_WINDOW_MS.
+ *
+ * The socket is a PERSISTENT per-session control channel: WD_STOP ends the
+ * *meeting* (stops forwarding PCM) but KEEPS the socket open so the daemon's
+ * terminal transcribing→idle status still lands and resets the in-bar button.
+ * The socket is only closed on a full teardown (STOP_CAPTURE — meet-left / tab
+ * close) or when the reconnect window is exhausted.
  */
 
 const WS_URL = "ws://127.0.0.1:9876";
@@ -27,6 +33,10 @@ let meetTitle = "";
 let meetUrl = "";
 let capturing = false;
 let reconnecting = false;
+// True from the moment a session begins bringing up (WD_START) until it is
+// fully capturing. Lets us buffer the first PCM frames instead of dropping
+// them while the socket opens and the 'start' message is sent.
+let sessionStarting = false;
 let externalMode = false; // true = PCM arrives via WD_PCM (content script)
 let pcmBuffer = [];
 let pcmBufferedBytes = 0;
@@ -58,7 +68,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_STOP") {
-    stopCapture();
+    // Meeting ended — stop forwarding PCM but KEEP the socket open so the
+    // daemon's terminal transcribing→idle status still reaches the content
+    // script and resets the button.
+    stopForwarding();
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_PCM") {
@@ -138,17 +151,25 @@ async function startExternal() {
   }
   const gen = ++captureGen;
   externalMode = true;
+  sessionStarting = true;
   try {
     await beginSession(gen);
   } catch (err) {
     console.error("External session failed:", err);
     cleanup();
     chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: err.message });
+  } finally {
+    // Only clear if we still own the generation — a racing start/stop that
+    // bumped captureGen owns the flag now.
+    if (gen === captureGen) sessionStarting = false;
   }
 }
 
 function ingestExternalPcm(samples) {
-  if (!capturing || !Array.isArray(samples) || samples.length === 0) return;
+  if (!Array.isArray(samples) || samples.length === 0) return;
+  // Buffer even before the session is fully up so the first ~256-500ms of
+  // audio is not lost while the socket opens and 'start' is sent.
+  if (!capturing && !sessionStarting) return;
   const buffer = Float32Array.from(samples).buffer;
   sendPcm(buffer);
 }
@@ -172,7 +193,10 @@ async function beginSession(gen) {
   }
 
   capturing = true;
+  sessionStarting = false;
   sendStartMessage();
+  // Ship any audio buffered while the socket was coming up.
+  flushPcmBuffer();
 
   clearInterval(pingInterval);
   pingInterval = setInterval(() => {
@@ -195,9 +219,9 @@ function sendStartMessage() {
 }
 
 function sendPcm(buffer) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === WebSocket.OPEN && capturing) {
     ws.send(buffer);
-  } else if (capturing) {
+  } else if (capturing || sessionStarting) {
     bufferPcm(buffer);
   }
 }
@@ -224,18 +248,77 @@ function flushPcmBuffer() {
   }
 }
 
+// WD_STOP: end the meeting but KEEP the socket open. Stop forwarding PCM and
+// tear down only the (legacy) capture pipeline; the daemon keeps pushing status
+// over the live socket. Does NOT notify background (state stays CAPTURING until
+// a real teardown) so the WD_STATUS relay tab pointer is preserved.
+function stopForwarding() {
+  const wasActive = capturing || sessionStarting;
+  // Only invalidate in-flight connect/reconnect callbacks when we actually end
+  // an active session. On a meet-left race the full-teardown STOP_CAPTURE runs
+  // first (capturing already false); an unconditional bump here would advance
+  // captureGen past the generation its delayed cleanup() timer captured, so the
+  // timer would no-op and the socket + ping would leak (finding 1).
+  if (wasActive) captureGen++;
+  capturing = false;
+  reconnecting = false;
+  sessionStarting = false;
+  externalMode = false;
+
+  if (wasActive && ws && ws.readyState === WebSocket.OPEN) {
+    flushPcmBuffer();
+    ws.send(JSON.stringify({ type: "stop" }));
+  } else if (wasActive) {
+    // Ended an active session but the socket is not OPEN (mid-reconnect or
+    // dropped): no 'stop' can be delivered and the daemon will never push a
+    // terminal status. Surface an error so background relays WD_ERROR and the
+    // in-bar button's optimistic 'transcribing' paint is reset (finding 2).
+    chrome.runtime.sendMessage({
+      type: "CAPTURE_ERROR",
+      message: "Połączenie z whisper-daemon zostało utracone.",
+    });
+  }
+  // A new session must not inherit audio that never made it out.
+  pcmBuffer = [];
+  pcmBufferedBytes = 0;
+
+  // Tear down ONLY the capture pipeline (legacy tab-capture path). Keep ws +
+  // ping alive so status/settings continue to flow.
+  if (audioContext) {
+    audioContext.close().catch(() => {});
+    audioContext = null;
+  }
+  if (mediaStream) {
+    mediaStream.getTracks().forEach((track) => track.stop());
+    mediaStream = null;
+  }
+}
+
+// STOP_CAPTURE (meet-left / tab close / popup stop): full teardown — close the
+// socket and everything else.
 function stopCapture() {
+  if (!capturing) {
+    // Already stopped forwarding (WD_STOP keep-alive) — just close the socket.
+    cleanup();
+    chrome.runtime.sendMessage({ type: "CAPTURE_STOPPED" });
+    return;
+  }
   captureGen++;  // invalidate any in-flight connect/reconnect callbacks
   capturing = false;
   reconnecting = false;
+  sessionStarting = false;
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     flushPcmBuffer();
     ws.send(JSON.stringify({ type: "stop" }));
   }
 
-  // Small delay to let the stop message arrive before closing
+  // Small delay to let the stop message arrive before closing. Generation-check
+  // (F8): a start within 500ms of this stop must not be torn down by the stale
+  // timer.
+  const gen = captureGen;
   setTimeout(() => {
+    if (gen !== captureGen) return;
     cleanup();
     chrome.runtime.sendMessage({ type: "CAPTURE_STOPPED" });
   }, 500);
@@ -244,6 +327,7 @@ function stopCapture() {
 function cleanup() {
   capturing = false;
   reconnecting = false;
+  sessionStarting = false;
   externalMode = false;
   pcmBuffer = [];
   pcmBufferedBytes = 0;
@@ -272,9 +356,25 @@ function cleanup() {
 
 async function ensureControlConnection() {
   if (ws && ws.readyState === WebSocket.OPEN) return true;
+  // A capture reconnect loop already owns the single socket (ws is transiently
+  // null between attempts). Opening a competing control socket would race past
+  // the daemon's single-connection slot — wait for the reconnecting socket
+  // instead (F7-js/F12-js).
+  if (reconnecting) return await waitForReconnect();
   const gen = captureGen; // do NOT bump — this must not invalidate a capture
   const connected = await connectWebSocket(1, gen);
   return connected && ws && ws.readyState === WebSocket.OPEN;
+}
+
+// Wait (bounded) for an in-progress capture reconnect to re-establish the
+// single socket, so queued control messages ride the reconnecting connection.
+async function waitForReconnect(timeoutMs = RECONNECT_INTERVAL_MS * 3) {
+  const deadline = Date.now() + timeoutMs;
+  while (reconnecting && Date.now() < deadline) {
+    if (ws && ws.readyState === WebSocket.OPEN) return true;
+    await sleep(100);
+  }
+  return !!(ws && ws.readyState === WebSocket.OPEN);
 }
 
 async function sendControl(obj) {

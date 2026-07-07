@@ -298,9 +298,32 @@ async function ensureOffscreenDocument() {
 }
 
 // Relay a WD_* message to the Meet tab's content orchestrator.
-function relayWD(type, payload) {
-  if (!meetTabId) return;
-  chrome.tabs.sendMessage(meetTabId, { type, ...payload }).catch(() => {});
+//
+// meetTabId lives in the service worker's memory, which MV3 wipes on eviction.
+// A long transcription (diarization can take minutes) easily outlasts the SW's
+// ~30s idle timeout once PCM stops flowing at 'stop'. The daemon's terminal
+// 'idle' status then arrives AFTER eviction — it wakes the SW, but meetTabId is
+// back to null, so the status is dropped and the in-bar button is stranded on
+// the yellow 'transcribing' state. Recover the tab by querying open Meet tabs.
+async function relayWD(type, payload) {
+  const tabId = await resolveMeetTab();
+  if (!tabId) return;
+  chrome.tabs.sendMessage(tabId, { type, ...payload }).catch(() => {});
+}
+
+async function resolveMeetTab() {
+  if (meetTabId) return meetTabId;
+  try {
+    const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
+    if (tabs && tabs.length) {
+      const t = tabs.find((x) => x.active) || tabs[0];
+      meetTabId = t.id ?? null;
+      return meetTabId;
+    }
+  } catch (err) {
+    console.warn("wd: resolveMeetTab failed", err);
+  }
+  return null;
 }
 
 // Ensure the offscreen document exists, then forward a message to it.

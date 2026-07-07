@@ -60,9 +60,11 @@
       appearance: none;
     }
     #${CONTROL_ID} .wd-main { width: 48px; }
-    #${CONTROL_ID} .wd-chevron { width: 30px; }
+    /* Chevron on the LEFT, darker like Meet's camera "video settings" split. */
+    #${CONTROL_ID} .wd-chevron { width: 30px; background: #282a2c; }
     /* Material state layer: subtle white overlay on hover, matching Meet. */
-    #${CONTROL_ID} .wd-btn:hover { background: #3c3e41; }
+    #${CONTROL_ID} .wd-main:hover { background: #3c3e41; }
+    #${CONTROL_ID} .wd-chevron:hover { background: #313336; }
     #${CONTROL_ID} .wd-btn:active { background: #43454a; }
     #${CONTROL_ID} .wd-dot {
       width: 14px; height: 14px; border-radius: 50%;
@@ -142,8 +144,9 @@
       if (typeof onChevron === "function") onChevron();
     });
 
-    control.appendChild(main);
+    // Chevron LEFT, record button RIGHT — mirrors Meet's camera + settings split.
     control.appendChild(chevron);
+    control.appendChild(main);
     return control;
   }
 

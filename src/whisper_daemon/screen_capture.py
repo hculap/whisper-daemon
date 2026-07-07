@@ -51,10 +51,13 @@ class ScreenCapture:
         output_dir: Path,
         interval: float = DEFAULT_INTERVAL,
         threshold: float = CHANGE_THRESHOLD,
+        displays: str = "all",
     ) -> None:
         self._output_dir = output_dir / "screenshots"
         self._interval = interval
         self._threshold = threshold
+        # "all" captures every active display; "primary" only the first one.
+        self._displays = displays
         self._running = False
         self._thread: threading.Thread | None = None
         self._start_time: float = 0.0
@@ -118,6 +121,11 @@ class ScreenCapture:
         timestamp_sec = int(elapsed)
 
         display_ids = _get_display_ids()
+
+        # "primary" restricts capture to the first (main) display; any other
+        # value keeps the default all-displays behavior.
+        if self._displays == "primary" and display_ids:
+            display_ids = display_ids[:1]
 
         for i, display_id in enumerate(display_ids):
             display_num = i + 1

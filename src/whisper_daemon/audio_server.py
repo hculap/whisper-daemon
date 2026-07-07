@@ -15,7 +15,13 @@ from collections.abc import Callable
 import websockets
 import websockets.asyncio.server
 
+from .bridge_protocol import is_allowed_origin
+
 logger = logging.getLogger(__name__)
+
+# Control message types routed to the on_control callback instead of the
+# start/stop/ping audio-session handlers.
+_CONTROL_TYPES = frozenset({"get_settings", "set_settings", "stop_meeting"})
 
 
 class BrowserAudioBridge:
@@ -28,12 +34,14 @@ class BrowserAudioBridge:
         on_connect: Callable[[str, str], None],
         on_audio: Callable[[bytes], None],
         on_disconnect: Callable[[], None],
+        on_control: Callable[[dict], None] | None = None,
     ) -> None:
         self._host = host
         self._port = port
         self._on_connect = on_connect
         self._on_audio = on_audio
         self._on_disconnect = on_disconnect
+        self._on_control = on_control
 
         self._thread: threading.Thread | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -102,6 +110,14 @@ class BrowserAudioBridge:
             "chunks_transcribed": chunks_transcribed,
         }))
 
+    def send_settings(self, msg: str) -> None:
+        """Send a pre-built 'settings' JSON message (thread-safe)."""
+        self._schedule_send(msg)
+
+    def send_status_msg(self, msg: str) -> None:
+        """Send a pre-built 'status' JSON message (thread-safe)."""
+        self._schedule_send(msg)
+
     async def _safe_send(self, msg: str) -> None:
         try:
             if self._ws is not None:
@@ -150,7 +166,37 @@ class BrowserAudioBridge:
             logger.info("Browser bridge listening on ws://%s:%d", self._host, self._port)
             await self._stop_event.wait()
 
+    async def _origin_allowed(
+        self, ws: websockets.asyncio.server.ServerConnection
+    ) -> bool:
+        """Close and reject the socket unless its Origin is a chrome extension."""
+        origin = None
+        try:
+            request = getattr(ws, "request", None)
+            if request is not None:
+                origin = request.headers.get("Origin")
+        except Exception:
+            logger.debug("Could not read Origin header", exc_info=True)
+            origin = None
+
+        if is_allowed_origin(origin):
+            return True
+
+        logger.warning("Rejecting connection from disallowed origin: %r", origin)
+        try:
+            await ws.close(1008, "forbidden origin")
+        except Exception:
+            logger.debug("Error closing rejected connection", exc_info=True)
+        return False
+
     async def _handler(self, ws: websockets.asyncio.server.ServerConnection) -> None:
+        # Reject any non-extension origin (websites, missing header) BEFORE
+        # registering this socket as the active connection, so a malicious web
+        # page cannot drive the daemon. The real extension's Origin is
+        # chrome-extension://<id> and passes.
+        if not await self._origin_allowed(ws):
+            return
+
         old = self._ws
         if old is not None:
             # Take over: the previous connection is likely a zombie (MV3
@@ -191,6 +237,13 @@ class BrowserAudioBridge:
 
                 elif msg_type == "ping":
                     await ws.send(json.dumps({"type": "pong"}))
+
+                elif msg_type in _CONTROL_TYPES:
+                    if self._on_control is not None:
+                        try:
+                            self._on_control(data)
+                        except Exception:
+                            logger.exception("on_control handler failed")
 
         except websockets.exceptions.ConnectionClosed:
             logger.info("Browser extension disconnected")

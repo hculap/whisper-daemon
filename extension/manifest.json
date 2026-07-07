@@ -11,13 +11,29 @@
   "content_scripts": [
     {
       "matches": ["https://meet.google.com/*"],
-      "js": ["content.js", "overlay.js"],
+      "js": [
+        "content.js",
+        "wd-logic.js",
+        "wd-injector.js",
+        "wd-panel.js",
+        "wd-captions.js",
+        "wd-content.js"
+      ],
       "run_at": "document_idle"
     }
   ],
   "action": {
     "default_popup": "popup.html",
     "default_title": "Whisper Daemon"
+  },
+  "commands": {
+    "toggle-capture": {
+      "suggested_key": {
+        "default": "Ctrl+Shift+M",
+        "mac": "Command+Shift+M"
+      },
+      "description": "Rozpocznij / zatrzymaj nagrywanie Whisper"
+    }
   },
   "web_accessible_resources": [
     {

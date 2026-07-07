@@ -11,6 +11,30 @@ CONFIG_DIR = Path.home() / ".config" / "whisper-daemon"
 CONFIG_FILE = CONFIG_DIR / "config.toml"
 
 VALID_FORMATS = {"txt", "srt", "vtt", "json"}
+VALID_SCREENSHOT_DISPLAYS = {"all", "primary"}
+
+
+def _validate_screenshot_displays(value: str) -> str:
+    """Coerce screenshot_displays to a valid value, defaulting to 'all'."""
+    return value if value in VALID_SCREENSHOT_DISPLAYS else "all"
+
+
+def _toml_str(value: str) -> str:
+    """Serialize a Python string as a safe TOML basic string.
+
+    Escapes backslashes, double-quotes and control characters so free-form
+    values (e.g. recording_dir/device coming from the extension) cannot inject
+    extra keys or corrupt config.toml.
+    """
+    escaped = (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+    )
+    return f'"{escaped}"'
 
 
 @dataclass
@@ -18,6 +42,10 @@ class Settings:
     recording_dir: str = "~/Desktop"
     recording_formats: list[str] = field(default_factory=lambda: ["txt"])
     recording_device: str = ""  # empty = system default
+    capture_mic: bool = True  # capture local microphone during meetings
+    capture_tab: bool = True  # capture browser tab audio during meetings
+    live_captions: bool = False  # show live captions in the extension UI
+    screenshot_displays: str = "all"  # "all" or "primary"
     save_audio: bool = False  # save raw audio alongside transcripts
     capture_screenshots: bool = False  # capture screenshots during recording
     screenshot_interval: float = 30.0  # seconds between fallback captures
@@ -61,6 +89,12 @@ def load_settings() -> Settings:
             recording_dir=rec.get("dir", "~/Desktop"),
             recording_formats=_validate_formats(rec.get("formats", ["txt"])),
             recording_device=rec.get("device", ""),
+            capture_mic=rec.get("capture_mic", True),
+            capture_tab=rec.get("capture_tab", True),
+            live_captions=rec.get("live_captions", False),
+            screenshot_displays=_validate_screenshot_displays(
+                rec.get("screenshot_displays", "all")
+            ),
             save_audio=rec.get("save_audio", False),
             capture_screenshots=rec.get("capture_screenshots", False),
             screenshot_interval=rec.get("screenshot_interval", 30.0),
@@ -85,11 +119,18 @@ def save_settings(settings: Settings) -> None:
     """Save settings to config.toml."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
+    rec_formats = ", ".join(_toml_str(f) for f in settings.recording_formats)
+    trans_formats = ", ".join(_toml_str(f) for f in settings.transcription_formats)
+
     lines = [
         "[recording]",
-        f'dir = "{settings.recording_dir}"',
-        f'formats = [{", ".join(f"\"{f}\"" for f in settings.recording_formats)}]',
-        f'device = "{settings.recording_device}"',
+        f"dir = {_toml_str(settings.recording_dir)}",
+        f"formats = [{rec_formats}]",
+        f"device = {_toml_str(settings.recording_device)}",
+        f'capture_mic = {"true" if settings.capture_mic else "false"}',
+        f'capture_tab = {"true" if settings.capture_tab else "false"}',
+        f'live_captions = {"true" if settings.live_captions else "false"}',
+        f"screenshot_displays = {_toml_str(settings.screenshot_displays)}",
         f'save_audio = {"true" if settings.save_audio else "false"}',
         f'capture_screenshots = {"true" if settings.capture_screenshots else "false"}',
         f"screenshot_interval = {settings.screenshot_interval}",
@@ -97,18 +138,18 @@ def save_settings(settings: Settings) -> None:
         f"screenshot_debounce = {settings.screenshot_debounce}",
         f"screenshot_cooldown = {settings.screenshot_cooldown}",
         f'diarize = {"true" if settings.diarize else "false"}',
-        f'diarize_mode = "{settings.diarize_mode}"',
+        f"diarize_mode = {_toml_str(settings.diarize_mode)}",
         f'auto_record_meetings = {"true" if settings.auto_record_meetings else "false"}',
         "",
         "[transcription]",
-        f'formats = [{", ".join(f"\"{f}\"" for f in settings.transcription_formats)}]',
-        f'output_dir = "{settings.transcription_output_dir}"',
+        f"formats = [{trans_formats}]",
+        f"output_dir = {_toml_str(settings.transcription_output_dir)}",
         "",
         "[tts]",
-        f'language = "{settings.tts_language}"',
+        f"language = {_toml_str(settings.tts_language)}",
         "",
         "[server]",
-        f'host = "{settings.server_host}"',
+        f"host = {_toml_str(settings.server_host)}",
         f"port = {settings.server_port}",
         "",
     ]

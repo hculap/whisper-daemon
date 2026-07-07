@@ -8,6 +8,7 @@ import concurrent.futures
 import logging
 import os
 import queue
+import re
 import threading
 import time
 import wave
@@ -32,6 +33,11 @@ from Foundation import NSRunLoop, NSRunLoopCommonModes
 from PyObjCTools import AppHelper
 
 from whisper_daemon import supervisor
+from whisper_daemon.bridge_protocol import (
+    apply_settings_patch,
+    build_settings_message,
+    build_status_message,
+)
 from whisper_daemon.config import VALID_FORMATS, Settings, load_settings, save_settings
 from whisper_daemon.daemon import State
 
@@ -88,6 +94,7 @@ class MenuBarDelegate(NSObject):
             on_connect=self._on_browser_connect,
             on_audio=self._on_browser_audio,
             on_disconnect=self._on_browser_disconnect,
+            on_control=self._on_browser_control,
         )
         self._browser_recorder = None  # set during meeting with browser source
         # Staging buffer for browser PCM that arrives after a reconnect's
@@ -641,6 +648,121 @@ class MenuBarDelegate(NSObject):
         if self._meeting_active and self._meeting_browser_triggered:
             AppHelper.callAfter(self._stop_meeting)
 
+    def _list_input_devices(self) -> list[str]:
+        """Return the names of available input devices (best-effort)."""
+        try:
+            import sounddevice as sd
+
+            return [
+                d["name"]
+                for d in sd.query_devices()
+                if d["max_input_channels"] > 0
+            ]
+        except Exception:
+            logger.exception("Failed to query input devices")
+            return []
+
+    def _push_settings_snapshot(self) -> None:
+        """Send the current settings + device list to the extension."""
+        try:
+            msg = build_settings_message(
+                self._settings, self._list_input_devices()
+            )
+            self._browser_bridge.send_settings(msg)
+        except Exception:
+            logger.exception("Failed to push settings snapshot")
+
+    def _run_off_bridge(self, fn: Callable[[], None]) -> None:
+        """Run blocking work off the bridge event-loop thread.
+
+        Device enumeration (sounddevice) and disk I/O must never run inline on
+        the WebSocket coroutine thread — while they block, the async-for loop
+        can't read the next audio frame, silently starving a live meeting.
+        """
+        threading.Thread(target=fn, daemon=True).start()
+
+    def _handle_get_settings(self) -> None:
+        """Push the settings snapshot + idle status (runs on a worker thread)."""
+        self._push_settings_snapshot()
+        # When idle, tell the newly-connected control surface so its
+        # button/timer reflect the daemon's single source of truth.
+        if not self._meeting_active:
+            try:
+                self._browser_bridge.send_status_msg(
+                    build_status_message("idle", 0.0, 0)
+                )
+            except Exception:
+                logger.exception("Failed to push idle status")
+
+    def _persist_and_push_settings(self) -> None:
+        """Persist settings to disk and echo the snapshot (worker thread)."""
+        try:
+            save_settings(self._settings)
+        except Exception:
+            logger.exception("Failed to persist settings from extension")
+        self._push_settings_snapshot()
+
+    def _on_browser_control(self, data: dict) -> None:
+        """Handle control messages (get_settings/set_settings/stop_meeting).
+
+        Runs on the bridge asyncio thread. Blocking work (device enumeration,
+        disk I/O) is offloaded to a worker thread so the audio loop never
+        stalls; AppKit-touching work is dispatched to the main thread.
+        """
+        msg_type = data.get("type")
+
+        if msg_type == "get_settings":
+            # _push_settings_snapshot enumerates PortAudio devices (blocking);
+            # never run it on the bridge loop or audio reception stalls.
+            self._run_off_bridge(self._handle_get_settings)
+
+        elif msg_type == "set_settings":
+            patch = data.get("patch")
+            if not isinstance(patch, dict):
+                logger.warning("set_settings without a dict patch — ignoring")
+                return
+            # Immutable in-memory update is fast; do it inline so ordering is
+            # deterministic. Disk persistence + device enumeration are offloaded.
+            self._settings = apply_settings_patch(self._settings, patch)
+            self._daemon._settings = self._settings
+            # COLD settings (mic/formats/dir/diarize/displays/capture_mic/tab)
+            # take effect on the next recording — no live swap attempted. Hot
+            # settings (live_captions is UI-only; capture_screenshots' local
+            # capturer isn't reachable from here) also apply next recording.
+            self._run_off_bridge(self._persist_and_push_settings)
+            # Keep the native menu bar checkmarks/labels in sync (main thread).
+            AppHelper.callAfter(self._sync_menu_from_settings)
+
+        elif msg_type == "stop_meeting":
+            if self._meeting_active:
+                AppHelper.callAfter(self._stop_meeting)
+
+    def _sync_menu_from_settings(self) -> None:
+        """Re-apply menu checkmarks/labels from self._settings (main thread).
+
+        Called after a set_settings patch from the extension so the native
+        macOS menu doesn't disagree with the daemon's actual settings.
+        """
+        s = self._settings
+        try:
+            self._save_audio_item.setState_(1 if s.save_audio else 0)
+            self._capture_screenshots_item.setState_(
+                1 if s.capture_screenshots else 0
+            )
+            self._diarize_item.setState_(1 if s.diarize else 0)
+            self._auto_record_item.setState_(1 if s.auto_record_meetings else 0)
+            self._rec_dir_item.setTitle_(
+                self._format_dir_label("Recording Folder", s.recording_dir)
+            )
+            for fmt, item in self._rec_fmt_items.items():
+                item.setState_(1 if fmt in s.recording_formats else 0)
+            # Device list itself is unchanged by a patch; only re-mark the
+            # selected device to avoid a blocking re-query on the UI thread.
+            for name, item in self._rec_dev_items.items():
+                item.setState_(1 if name == s.recording_device else 0)
+        except Exception:
+            logger.exception("Failed to sync menu from settings")
+
     # -- Meeting recording --
 
     def _start_meeting(self, browser_triggered: bool = False, browser_title: str = "") -> None:
@@ -696,12 +818,31 @@ class MenuBarDelegate(NSObject):
         device = self._settings.recording_device or None
         chunk_queue: queue.Queue[AudioChunk | None] = queue.Queue()
 
-        # Mic recorder (local device)
-        mic_recorder = MeetingRecorder(chunk_queue, device=device, source_label="mic")
+        # Which sources to capture (settings snapshot; may be toggled from the
+        # extension between meetings — cold, so read here at meeting start).
+        capture_mic = self._settings.capture_mic
+        capture_tab = self._settings.capture_tab
 
-        # Browser recorder (Chrome extension tab audio)
+        # Snapshot the remaining COLD settings the worker consumes, so a
+        # mid-meeting set_settings from the extension cannot alter this
+        # in-progress meeting's output (contract section D).
+        diarize = self._settings.diarize
+        save_audio = self._settings.save_audio
+        recording_formats = list(self._settings.recording_formats)
+        recording_dir_path = self._settings.recording_dir_path
+        capture_screenshots = self._settings.capture_screenshots
+        screenshot_displays = self._settings.screenshot_displays
+        screenshot_interval = self._settings.screenshot_interval
+
+        # Mic recorder (local device) — only when capture_mic is enabled.
+        mic_recorder: MeetingRecorder | None = None
+        if capture_mic:
+            mic_recorder = MeetingRecorder(chunk_queue, device=device, source_label="mic")
+
+        # Browser recorder (Chrome extension tab audio) — only when capture_tab
+        # is enabled AND a browser-triggered connection is live.
         browser_recorder: MeetingRecorder | None = None
-        if browser_triggered and self._browser_bridge.connected:
+        if capture_tab and browser_triggered and self._browser_bridge.connected:
             browser_recorder = MeetingRecorder(chunk_queue, source_label="browser")
             browser_recorder.start_without_device()
             # Drain PCM staged between the extension's 'start' and now so a
@@ -714,25 +855,54 @@ class MenuBarDelegate(NSObject):
                 browser_recorder.feed_audio(np.frombuffer(data, dtype=np.float32))
             self._browser_recorder = browser_recorder
 
+        # No source at all: nothing to record — abort cleanly rather than
+        # spinning an empty meeting that never produces chunks.
+        if mic_recorder is None and browser_recorder is None:
+            logger.warning(
+                "Both capture_mic and capture_tab are disabled — aborting meeting"
+            )
+            _notify(
+                "whisper-daemon",
+                "Nothing to record",
+                "Enable microphone or tab capture to start a meeting.",
+            )
+            self._reset_meeting_ui()
+            return
+
         # Number of recorders determines how many None sentinels to expect
-        sentinel_expected = 1 + (1 if browser_recorder else 0)
+        sentinel_expected = (1 if mic_recorder else 0) + (1 if browser_recorder else 0)
         sentinel_count = 0
 
         all_results: list[tuple[float, dict]] = []
         all_audio: list[np.ndarray] = []
         chunk_count = 0
 
-        # Prepare output dir early for screenshots
+        # Prepare output dir early for screenshots. The meeting title is
+        # untrusted (comes from the extension's 'start' message), so strip it
+        # to a safe filename component — keep only [A-Za-z0-9_-] to prevent
+        # path traversal (e.g. "../../tmp/pwn") out of recording_dir.
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        title_slug = browser_title.replace(" ", "_")[:30] if browser_title else ""
+        title_slug = (
+            re.sub(r"[^A-Za-z0-9_-]", "", browser_title.replace(" ", "_"))[:30]
+            if browser_title
+            else ""
+        )
         dir_name = f"recording_{title_slug}_{timestamp}" if title_slug else f"recording_{timestamp}"
-        rec_dir = self._settings.recording_dir_path / dir_name
+        base_dir = recording_dir_path
+        rec_dir = base_dir / dir_name
+        # Defense in depth: ensure the resolved dir stays under the configured
+        # recording folder even if the slug logic is ever weakened.
+        if not rec_dir.resolve().is_relative_to(base_dir.resolve()):
+            logger.warning("Meeting dir escaped recording folder — using base dir")
+            rec_dir = base_dir / f"recording_{timestamp}"
         rec_dir.mkdir(parents=True, exist_ok=True)
 
         screen_capture: ScreenCapture | None = None
-        if self._settings.capture_screenshots:
+        if capture_screenshots:
             screen_capture = ScreenCapture(
-                rec_dir, interval=self._settings.screenshot_interval
+                rec_dir,
+                interval=screenshot_interval,
+                displays=screenshot_displays,
             )
             screen_capture.start()
 
@@ -742,17 +912,28 @@ class MenuBarDelegate(NSObject):
 
         telemetry.meeting_start()
         devices_stopped = False
-        try:
-            mic_recorder.start()
-        except Exception as exc:
-            logger.error("Failed to open mic for meeting: %s", exc)
-            if screen_capture:
-                screen_capture.stop()
-            _notify("whisper-daemon", "Error", "Could not open microphone for meeting.")
-            self._reset_meeting_ui()
-            return
+        if mic_recorder is not None:
+            try:
+                mic_recorder.start()
+            except Exception as exc:
+                logger.error("Failed to open mic for meeting: %s", exc)
+                # If the browser tab is still feeding audio, keep the meeting
+                # alive on that source alone instead of aborting.
+                if browser_recorder is None:
+                    if screen_capture:
+                        screen_capture.stop()
+                    _notify(
+                        "whisper-daemon",
+                        "Error",
+                        "Could not open microphone for meeting.",
+                    )
+                    self._reset_meeting_ui()
+                    return
+                logger.warning("Mic failed to open — continuing with tab audio only")
+                mic_recorder = None
+                sentinel_expected = 1 if browser_recorder else 0
 
-        if mic_recorder.fell_back_to_default:
+        if mic_recorder is not None and mic_recorder.fell_back_to_default:
             _notify(
                 "whisper-daemon",
                 "Microphone fallback",
@@ -769,16 +950,34 @@ class MenuBarDelegate(NSObject):
                 # audio no longer masks a dead microphone.
                 last_health_warn = 0.0
                 last_recovery_attempt = 0.0
+                last_status_push = 0.0
                 mic_lost_notified = False
 
                 while self._meeting_active:
                     now = time.monotonic()
 
+                    # Push a recording status to the extension about once/sec so
+                    # the in-bar button + timer track the daemon (single source
+                    # of truth) even for menu-bar-started meetings.
+                    if now - last_status_push >= 1.0:
+                        last_status_push = now
+                        elapsed = now - self._meeting_start
+                        try:
+                            self._browser_bridge.send_status_msg(
+                                build_status_message("recording", elapsed, chunk_count)
+                            )
+                        except Exception:
+                            logger.debug("Failed to push recording status", exc_info=True)
+
                     # Check if mic recorder needs device recovery. Retries
                     # keep firing on a backoff timer until they succeed or
                     # the meeting ends — devices (Bluetooth, USB) can
                     # reappear minutes later, so we never give up.
-                    if mic_recorder.needs_recovery and now - last_recovery_attempt >= RECOVERY_BACKOFF_SEC:
+                    if (
+                        mic_recorder is not None
+                        and mic_recorder.needs_recovery
+                        and now - last_recovery_attempt >= RECOVERY_BACKOFF_SEC
+                    ):
                         last_recovery_attempt = now
                         logger.warning("Mic device needs recovery, attempting reopen...")
                         if mic_recorder.recover_device():
@@ -814,10 +1013,13 @@ class MenuBarDelegate(NSObject):
                         # while the user is merely listening. last_audio_at
                         # only goes stale when the stream genuinely stops
                         # delivering samples — a real dead device.
-                        mic_last_audio = mic_recorder.last_audio_at
+                        mic_last_audio = (
+                            mic_recorder.last_audio_at if mic_recorder is not None else 0.0
+                        )
                         elapsed_silent = now - mic_last_audio if mic_last_audio else 0.0
                         if (
-                            elapsed_silent > HEALTH_CHECK_SEC
+                            mic_recorder is not None
+                            and elapsed_silent > HEALTH_CHECK_SEC
                             and now - last_health_warn >= HEALTH_REPEAT_SEC
                         ):
                             last_health_warn = now
@@ -845,7 +1047,7 @@ class MenuBarDelegate(NSObject):
                         chunk_count, chunk.duration, chunk.source,
                     )
                     telemetry.meeting_chunk_queued(chunk_count, chunk.duration, chunk.start_time)
-                    if self._settings.save_audio or self._settings.diarize:
+                    if save_audio or diarize:
                         all_audio.append(chunk.audio.copy())
                     cn = chunk_count  # capture for closure
                     def _transcribe_and_track(audio, m, n):
@@ -860,7 +1062,17 @@ class MenuBarDelegate(NSObject):
                         _write_partial(partial_path, all_results)
                         self._send_results_to_browser(all_results, chunk_count)
 
-                mic_recorder.stop()
+                # Recording finished — tell the extension we're now finishing
+                # transcription so its button reflects the transcribing state.
+                try:
+                    self._browser_bridge.send_status_msg(
+                        build_status_message("transcribing", 0.0, chunk_count)
+                    )
+                except Exception:
+                    logger.debug("Failed to push transcribing status", exc_info=True)
+
+                if mic_recorder is not None:
+                    mic_recorder.stop()
                 if browser_recorder is not None:
                     browser_recorder.stop_without_device()
                     self._browser_recorder = None
@@ -880,7 +1092,7 @@ class MenuBarDelegate(NSObject):
                     if chunk is None:
                         continue
                     chunk_count += 1
-                    if self._settings.save_audio or self._settings.diarize:
+                    if save_audio or diarize:
                         all_audio.append(chunk.audio.copy())
                     result = transcribe_full(chunk.audio, model)
                     if result.get("text", "").strip():
@@ -897,7 +1109,8 @@ class MenuBarDelegate(NSObject):
             # the PortAudio device refresh for the rest of the process life.
             # Skipped after a clean stop() (devices_stopped=True).
             if not devices_stopped:
-                mic_recorder.abort()
+                if mic_recorder is not None:
+                    mic_recorder.abort()
                 if browser_recorder is not None:
                     browser_recorder.stop_without_device()
                     self._browser_recorder = None
@@ -912,7 +1125,7 @@ class MenuBarDelegate(NSObject):
         from whisper_daemon.formats import merge_chunk_results
         merged_result = merge_chunk_results(all_results)
 
-        if self._settings.diarize and all_audio:
+        if diarize and all_audio:
             try:
                 from whisper_daemon.diarizer import diarize_batch
                 from whisper_daemon.diarize_merge import merge_speakers_with_transcript
@@ -931,13 +1144,13 @@ class MenuBarDelegate(NSObject):
         from whisper_daemon.formats import FORMATTERS
 
         written: list[str] = []
-        for fmt in self._settings.recording_formats:
+        for fmt in recording_formats:
             if fmt in FORMATTERS:
                 out = rec_dir / f"transcript.{fmt}"
                 out.write_text(FORMATTERS[fmt](merged_result), encoding="utf-8")
                 written.append(str(out))
 
-        if self._settings.save_audio and all_audio:
+        if save_audio and all_audio:
             audio_path = rec_dir / "recording.wav"
             full_audio = np.concatenate(all_audio)
             _save_wav(audio_path, full_audio, 16000)
@@ -998,6 +1211,14 @@ class MenuBarDelegate(NSObject):
         self._browser_recorder = None
         self._browser_prebuffer = []
         self._browser_prebuffer_bytes = 0
+
+        # Tell the extension the meeting is over so its in-bar button goes idle.
+        try:
+            self._browser_bridge.send_status_msg(
+                build_status_message("idle", 0.0, 0)
+            )
+        except Exception:
+            logger.debug("Failed to push idle status", exc_info=True)
 
         def _update_ui() -> None:
             self._meeting_menu_item.setTitle_("Start Meeting Recording")

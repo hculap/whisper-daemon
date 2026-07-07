@@ -1,11 +1,13 @@
 /**
- * Offscreen document — captures tab audio, extracts PCM via AudioWorklet,
- * and streams to whisper-daemon over WebSocket.
+ * Offscreen document — owns the WebSocket to whisper-daemon (extension CSP
+ * requires ws:// to originate here, not from the content script).
  *
- * Resilience: if the socket drops mid-capture (daemon restart, network
- * blip), capture continues — PCM is buffered (bounded) and a reconnect
- * loop runs for up to RECONNECT_WINDOW_MS. Only when that window is
- * exhausted does the capture stop with a visible error.
+ * Audio no longer originates here for the Meet flow: PCM arrives as WD_PCM
+ * messages relayed from the content script's AudioWorklet. The legacy popup
+ * fallback still captures via getUserMedia(streamId) below.
+ *
+ * Resilience is unchanged: if the socket drops mid-capture, PCM is buffered
+ * (bounded) and a reconnect loop runs for up to RECONNECT_WINDOW_MS.
  */
 
 const WS_URL = "ws://127.0.0.1:9876";
@@ -25,6 +27,7 @@ let meetTitle = "";
 let meetUrl = "";
 let capturing = false;
 let reconnecting = false;
+let externalMode = false; // true = PCM arrives via WD_PCM (content script)
 let pcmBuffer = [];
 let pcmBufferedBytes = 0;
 // Bumped on every start AND stop. Async callbacks (connect attempts,
@@ -37,30 +40,57 @@ let captureGen = 0;
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.type === "START_CAPTURE") {
+    // Legacy popup fallback: capture the tab here via getUserMedia.
     meetTitle = msg.meetTitle || "";
     meetUrl = msg.meetUrl || "";
-    startCapture(msg.streamId);
+    startCaptureFromStream(msg.streamId);
     sendResponse({ ok: true });
 
   } else if (msg.type === "STOP_CAPTURE") {
     stopCapture();
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_START") {
+    // New Meet flow: audio arrives externally as WD_PCM.
+    meetTitle = msg.title || "";
+    meetUrl = msg.url || "";
+    startExternal();
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_STOP") {
+    stopCapture();
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_PCM") {
+    ingestExternalPcm(msg.samples);
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_GET_SETTINGS") {
+    sendControl({ type: "get_settings" });
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_SET_SETTINGS") {
+    sendControl({ type: "set_settings", patch: msg.patch || {} });
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_STOP_MEETING") {
+    sendControl({ type: "stop_meeting" });
     sendResponse({ ok: true });
   }
 
   return true;
 });
 
-// --- Capture pipeline ---
+// --- Capture pipeline (legacy popup tab-capture) ---
 
-async function startCapture(streamId) {
+async function startCaptureFromStream(streamId) {
   if (capturing) {
     console.warn("START_CAPTURE while already capturing — ignoring");
-    // Resync the service worker so it doesn't hang in STARTING if its
-    // state was reset (MV3 eviction) while capture was actually running.
     chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
     return;
   }
   const gen = ++captureGen;
+  externalMode = false;
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
@@ -72,7 +102,6 @@ async function startCapture(streamId) {
       video: false,
     });
 
-    // Stop cleanly if the tab capture ends underneath us (tab closed).
     mediaStream.getAudioTracks().forEach((track) => {
       track.onended = () => {
         console.warn("Capture track ended");
@@ -80,57 +109,84 @@ async function startCapture(streamId) {
       };
     });
 
-    // 16kHz to match whisper-daemon's expected sample rate
     audioContext = new AudioContext({ sampleRate: 16000 });
     const source = audioContext.createMediaStreamSource(mediaStream);
-
     await audioContext.audioWorklet.addModule("pcm-processor.js");
     const workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
-
-    // Connect source -> worklet -> destination (destination plays audio back)
     source.connect(workletNode);
     workletNode.connect(audioContext.destination);
 
-    const connected = await connectWebSocket(CONNECT_ATTEMPTS, gen);
-    if (gen !== captureGen) {
-      // A stop (or newer start) happened while we were connecting.
-      return;
-    }
-    if (!connected) {
-      cleanup();
-      chrome.runtime.sendMessage({
-        type: "CAPTURE_ERROR",
-        message: "Cannot connect to whisper-daemon. Is it running? Try: whisper-daemon restart",
-      });
-      return;
-    }
-
-    capturing = true;
-    sendStartMessage();
+    const ok = await beginSession(gen);
+    if (!ok) return;
 
     workletNode.port.onmessage = (event) => {
       sendPcm(event.data.buffer);
     };
-
-    pingInterval = setInterval(() => {
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "ping" }));
-      }
-    }, PING_INTERVAL_MS);
-
-    chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
-
   } catch (err) {
     console.error("Capture failed:", err);
     cleanup();
-    chrome.runtime.sendMessage({
-      type: "CAPTURE_ERROR",
-      message: err.message,
-    });
+    chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: err.message });
   }
 }
 
+// --- External capture (content-script PCM) ---
+
+async function startExternal() {
+  if (capturing) {
+    chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
+    return;
+  }
+  const gen = ++captureGen;
+  externalMode = true;
+  try {
+    await beginSession(gen);
+  } catch (err) {
+    console.error("External session failed:", err);
+    cleanup();
+    chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: err.message });
+  }
+}
+
+function ingestExternalPcm(samples) {
+  if (!capturing || !Array.isArray(samples) || samples.length === 0) return;
+  const buffer = Float32Array.from(samples).buffer;
+  sendPcm(buffer);
+}
+
+// --- Shared session bring-up (connect + start + ping) ---
+
+async function beginSession(gen) {
+  // Reuse an already-open socket (e.g. a control connection opened for
+  // settings) instead of racing a second connection past the daemon's
+  // single-connection slot.
+  const alreadyOpen = ws && ws.readyState === WebSocket.OPEN;
+  const connected = alreadyOpen || (await connectWebSocket(CONNECT_ATTEMPTS, gen));
+  if (gen !== captureGen) return false; // stop/newer-start raced us
+  if (!connected) {
+    cleanup();
+    chrome.runtime.sendMessage({
+      type: "CAPTURE_ERROR",
+      message: "Cannot connect to whisper-daemon. Is it running? Try: whisper-daemon restart",
+    });
+    return false;
+  }
+
+  capturing = true;
+  sendStartMessage();
+
+  clearInterval(pingInterval);
+  pingInterval = setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify({ type: "ping" }));
+    }
+  }, PING_INTERVAL_MS);
+
+  chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
+  return true;
+}
+
 function sendStartMessage() {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
   ws.send(JSON.stringify({
     type: "start",
     meeting_title: meetTitle,
@@ -188,6 +244,7 @@ function stopCapture() {
 function cleanup() {
   capturing = false;
   reconnecting = false;
+  externalMode = false;
   pcmBuffer = [];
   pcmBufferedBytes = 0;
 
@@ -211,6 +268,31 @@ function cleanup() {
   }
 }
 
+// --- Control-only connection (settings / status without recording) ---
+
+async function ensureControlConnection() {
+  if (ws && ws.readyState === WebSocket.OPEN) return true;
+  const gen = captureGen; // do NOT bump — this must not invalidate a capture
+  const connected = await connectWebSocket(1, gen);
+  return connected && ws && ws.readyState === WebSocket.OPEN;
+}
+
+async function sendControl(obj) {
+  try {
+    const ok = await ensureControlConnection();
+    if (!ok) {
+      chrome.runtime.sendMessage({
+        type: "CAPTURE_ERROR",
+        message: "whisper-daemon unreachable for settings.",
+      });
+      return;
+    }
+    ws.send(JSON.stringify(obj));
+  } catch (err) {
+    console.warn("Control message failed:", err);
+  }
+}
+
 // --- WebSocket ---
 
 async function connectWebSocket(attempts, gen) {
@@ -218,8 +300,6 @@ async function connectWebSocket(attempts, gen) {
     try {
       const socket = await openWebSocket(WS_URL);
       if (gen !== captureGen) {
-        // Session ended while this socket was opening — discard it so it
-        // doesn't occupy the daemon's single connection slot as a zombie.
         try { socket.close(); } catch {}
         return false;
       }
@@ -237,26 +317,38 @@ async function connectWebSocket(attempts, gen) {
 }
 
 function handleServerMessage(event) {
+  let data;
   try {
-    const data = JSON.parse(event.data);
-    if (data.type === "chunk_transcribed") {
-      // Forward live transcription to popup via service worker
-      chrome.runtime.sendMessage({
-        type: "CHUNK_TRANSCRIBED",
-        text: data.text,
-        startTime: data.start_time,
-        chunkIndex: data.chunk_index,
-      });
-    } else if (data.type === "error") {
-      console.warn("Daemon error:", data.message);
-      chrome.runtime.sendMessage({
-        type: "CAPTURE_ERROR",
-        message: data.message,
-      });
-    }
+    data = JSON.parse(event.data);
   } catch {
-    // binary or unparseable — ignore
+    return; // binary or unparseable — ignore
   }
+
+  if (data.type === "chunk_transcribed") {
+    chrome.runtime.sendMessage({
+      type: "CHUNK_TRANSCRIBED",
+      text: data.text,
+      startTime: data.start_time,
+      chunkIndex: data.chunk_index,
+    });
+  } else if (data.type === "status") {
+    chrome.runtime.sendMessage({
+      type: "STATUS",
+      state: data.state,
+      elapsed: data.elapsed,
+      chunks: data.chunks,
+    });
+  } else if (data.type === "settings") {
+    chrome.runtime.sendMessage({
+      type: "SETTINGS",
+      settings: data.settings,
+      devices: data.devices,
+    });
+  } else if (data.type === "error") {
+    console.warn("Daemon error:", data.message);
+    chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: data.message });
+  }
+  // "pong" — ignore
 }
 
 function handleUnexpectedClose() {

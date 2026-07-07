@@ -92,11 +92,59 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       message: msg.message || "Failed to capture audio",
     });
     relayToContentScript(msg);
+    relayWD("WD_ERROR", { message: msg.message });
     transitionTo(State.IDLE);
     sendResponse({ ok: true });
 
   } else if (msg.type === "CHUNK_TRANSCRIBED") {
     relayToContentScript(msg);
+    relayWD("WD_CHUNK", {
+      text: msg.text,
+      startTime: msg.startTime,
+      chunkIndex: msg.chunkIndex,
+    });
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "STATUS") {
+    // Daemon status push (from offscreen) drives the in-bar button/timer.
+    relayWD("WD_STATUS", {
+      state: msg.state,
+      elapsed: msg.elapsed,
+      chunks: msg.chunks,
+    });
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "SETTINGS") {
+    relayWD("WD_SETTINGS", { settings: msg.settings, devices: msg.devices });
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_START") {
+    // From content script (page gesture). Forward to offscreen.
+    if (sender.tab?.id) {
+      meetTabId = sender.tab.id;
+      meetTitle = msg.title || "";
+      meetUrl = msg.url || "";
+      forwardToOffscreen({ type: "WD_START", title: meetTitle, url: meetUrl });
+    }
+    sendResponse({ ok: true });
+
+  } else if (
+    msg.type === "WD_STOP" ||
+    msg.type === "WD_STOP_MEETING" ||
+    msg.type === "WD_GET_SETTINGS" ||
+    msg.type === "WD_SET_SETTINGS"
+  ) {
+    if (sender.tab?.id) {
+      meetTabId = sender.tab.id;
+      forwardToOffscreen(msg);
+    }
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_PCM") {
+    // High-frequency audio relay; offscreen already exists by now.
+    if (sender.tab?.id) {
+      chrome.runtime.sendMessage(msg).catch(() => {});
+    }
     sendResponse({ ok: true });
 
   } else if (msg.type === "GET_STATE") {
@@ -176,6 +224,34 @@ function relayToContentScript(msg) {
   if (meetTabId) {
     chrome.tabs.sendMessage(meetTabId, msg).catch(() => {});
   }
+}
+
+// Relay a WD_* message to the Meet tab's content orchestrator.
+function relayWD(type, payload) {
+  if (!meetTabId) return;
+  chrome.tabs.sendMessage(meetTabId, { type, ...payload }).catch(() => {});
+}
+
+// Ensure the offscreen document exists, then forward a message to it.
+async function forwardToOffscreen(msg) {
+  try {
+    await ensureOffscreenDocument();
+    chrome.runtime.sendMessage(msg).catch(() => {});
+  } catch (err) {
+    console.error("Failed to forward to offscreen:", err);
+    relayWD("WD_ERROR", { message: "Nie udało się połączyć z offscreen." });
+  }
+}
+
+// --- Keyboard command (optional): toggle capture on the Meet tab ---
+
+if (chrome.commands && chrome.commands.onCommand) {
+  chrome.commands.onCommand.addListener((command) => {
+    if (command !== "toggle-capture") return;
+    if (meetTabId) {
+      chrome.tabs.sendMessage(meetTabId, { type: "WD_COMMAND_TOGGLE" }).catch(() => {});
+    }
+  });
 }
 
 // --- Cleanup on tab close ---

@@ -28,6 +28,8 @@
   let captionLines = [];
   let currentSettings = null;
   let localCapture = null; // {audioContext, stream, worklet} when WE capture
+  let starting = false; // re-entrancy guard for startCapture (F4)
+  let sessionOwned = false; // true once WE issued WD_START (tab OR mic-only)
 
   const meetingMeta = () => ({
     title: (document.title || "Google Meet").replace(" - Google Meet", "").trim(),
@@ -62,60 +64,93 @@
 
   // --- Capture (page gesture required, runs in content script) ---
   async function startCapture() {
-    if (localCapture) return;
-    let stream;
-    try {
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { preferCurrentTab: true },
-        audio: true,
-      });
-    } catch (err) {
-      console.warn("wd: getDisplayMedia denied", err);
-      toast("Nagrywanie anulowane");
-      injector.setButtonState("idle");
+    // Re-entrancy guard (F4): a double click or a WD_COMMAND_TOGGLE while the
+    // getDisplayMedia picker is open must not open a second picker. sessionOwned
+    // extends the guard to the mic-only (capture_tab=false) path, where there is
+    // no localCapture and `starting` clears synchronously — without it a rapid
+    // double-activation before the daemon's 'recording' status lands would fire
+    // two WD_START messages (findings 5 & 7). sessionOwned is cleared on the
+    // daemon idle status, WD_ERROR, and meet-left, re-opening the guard.
+    if (starting || localCapture || sessionOwned) return;
+    // Do not act on a default while settings are unknown (finding 3): with
+    // currentSettings still null the capture_tab default would be `true` and a
+    // capture_tab=false user's early click would pop the screen picker. Defer:
+    // (re)request settings and bail so the click can be retried once they land.
+    if (currentSettings === null) {
+      chrome.runtime.sendMessage({ type: "WD_GET_SETTINGS" });
+      toast("Ładowanie ustawień — spróbuj ponownie za chwilę");
       return;
     }
-
+    starting = true;
     try {
-      // We only need audio — drop the video track immediately.
-      stream.getVideoTracks().forEach((t) => t.stop());
+      // Honor capture_tab (F9): when participant capture is off, do not open the
+      // screen picker at all — start a mic-only meeting and let the daemon record
+      // the local mic natively.
+      const captureTab = currentSettings.capture_tab !== false;
+      if (!captureTab) {
+        const { title, url } = meetingMeta();
+        sessionOwned = true;
+        chrome.runtime.sendMessage({ type: "WD_START", title, url });
+        return;
+      }
 
-      if (!stream.getAudioTracks().length) {
-        stream.getTracks().forEach((t) => t.stop());
-        toast("Brak dźwięku — zaznacz „Udostępnij dźwięk kartę”");
+      let stream;
+      try {
+        stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { preferCurrentTab: true },
+          audio: true,
+        });
+      } catch (err) {
+        console.warn("wd: getDisplayMedia denied", err);
+        toast("Nagrywanie anulowane");
         injector.setButtonState("idle");
         return;
       }
 
-      const audioContext = new AudioContext({ sampleRate: 16000 });
-      const source = audioContext.createMediaStreamSource(stream);
-      await audioContext.audioWorklet.addModule(
-        chrome.runtime.getURL("pcm-processor.js")
-      );
-      const worklet = new AudioWorkletNode(audioContext, "pcm-processor");
-      source.connect(worklet);
-      // Do NOT connect to destination — avoid echoing meeting audio locally.
+      try {
+        // We only need audio — drop the video track immediately.
+        stream.getVideoTracks().forEach((t) => t.stop());
 
-      worklet.port.onmessage = (event) => {
-        const f32 = event.data;
-        // runtime messaging serializes via JSON, so ship a plain number array.
-        chrome.runtime.sendMessage({ type: "WD_PCM", samples: Array.from(f32) });
-      };
+        if (!stream.getAudioTracks().length) {
+          stream.getTracks().forEach((t) => t.stop());
+          toast("Brak dźwięku — zaznacz „Udostępnij dźwięk kartę”");
+          injector.setButtonState("idle");
+          return;
+        }
 
-      // The user (or another audio track) ending the share stops recording.
-      stream.getAudioTracks().forEach((track) => {
-        track.onended = () => stopCapture();
-      });
+        const audioContext = new AudioContext({ sampleRate: 16000 });
+        const source = audioContext.createMediaStreamSource(stream);
+        await audioContext.audioWorklet.addModule(
+          chrome.runtime.getURL("pcm-processor.js")
+        );
+        const worklet = new AudioWorkletNode(audioContext, "pcm-processor");
+        source.connect(worklet);
+        // Do NOT connect to destination — avoid echoing meeting audio locally.
 
-      localCapture = { audioContext, stream, worklet };
+        worklet.port.onmessage = (event) => {
+          const f32 = event.data;
+          // runtime messaging serializes via JSON, so ship a plain number array.
+          chrome.runtime.sendMessage({ type: "WD_PCM", samples: Array.from(f32) });
+        };
 
-      const { title, url } = meetingMeta();
-      chrome.runtime.sendMessage({ type: "WD_START", title, url });
-    } catch (err) {
-      console.error("wd: startCapture failed", err);
-      try { stream.getTracks().forEach((t) => t.stop()); } catch {}
-      toast("Nie udało się rozpocząć nagrywania");
-      injector.setButtonState("idle");
+        // The user (or another audio track) ending the share stops recording.
+        stream.getAudioTracks().forEach((track) => {
+          track.onended = () => stopCapture();
+        });
+
+        localCapture = { audioContext, stream, worklet };
+
+        const { title, url } = meetingMeta();
+        sessionOwned = true;
+        chrome.runtime.sendMessage({ type: "WD_START", title, url });
+      } catch (err) {
+        console.error("wd: startCapture failed", err);
+        try { stream.getTracks().forEach((t) => t.stop()); } catch {}
+        toast("Nie udało się rozpocząć nagrywania");
+        injector.setButtonState("idle");
+      }
+    } finally {
+      starting = false;
     }
   }
 
@@ -129,13 +164,20 @@
   }
 
   function stopCapture() {
-    if (localCapture) {
-      teardownLocalCapture();
+    const owned = sessionOwned;
+    sessionOwned = false;
+    teardownLocalCapture(); // no-op for a mic-only or menu-bar meeting
+    if (owned) {
+      // We started this meeting (tab OR mic-only) — end it via WD_STOP.
       chrome.runtime.sendMessage({ type: "WD_STOP" });
     } else {
       // Meeting was started elsewhere (menu bar) — stop it at the daemon.
       chrome.runtime.sendMessage({ type: "WD_STOP_MEETING" });
     }
+    // Optimistic instant feedback: the socket stays open, so the daemon's real
+    // transcribing→idle status will correct this shortly.
+    injector.setButtonState("transcribing");
+    panel.setRecording(true);
   }
 
   // --- Main toggle (button + panel action share this) ---
@@ -192,7 +234,10 @@
         // out and the worklet stops posting PCM to a closed session. Guarded:
         // no-ops if the self-stop path already tore it down.
         teardownLocalCapture();
-        if (daemonState === "idle") captionLines = [];
+        if (daemonState === "idle") {
+          captionLines = [];
+          sessionOwned = false; // meeting fully finished
+        }
       }
       applyCaptionsVisibility();
     } else if (msg.type === "WD_SETTINGS") {
@@ -215,6 +260,7 @@
       // instead of start (state is the single source of truth).
       teardownLocalCapture();
       daemonState = "idle";
+      sessionOwned = false;
       captionLines = [];
       toast(msg.message || "Błąd nagrywania");
       injector.setButtonState("idle");
@@ -245,26 +291,31 @@
   // running (or scanning the DOM) after the meeting UI is gone.
   function onMeetLeft() {
     if (localCapture) stopCapture();
+    // Background also fully tears down the offscreen socket on MEET_LEFT; clear
+    // ownership so a later re-join starts clean.
+    sessionOwned = false;
     injector.teardown();
     panel.teardown();
     captions.teardown();
   }
 
-  // Re-join in the same tab: rebuild the control, observer, and panel wiring.
-  function onMeetJoined() {
+  // Build the control, observer, and panel wiring, then hydrate settings. Also
+  // opens the control connection so the daemon pushes status — lighting the
+  // in-bar button for a menu-bar-started meeting.
+  function initUi() {
     panel.init({ onPatch: sendPatch, onAction: onToggle, onReset });
     reinject();
     injector.startObserver(reinject);
     chrome.runtime.sendMessage({ type: "WD_GET_SETTINGS" });
   }
 
+  // Re-join in the same tab: rebuild everything.
+  function onMeetJoined() {
+    initUi();
+  }
+
   function boot() {
-    panel.init({ onPatch: sendPatch, onAction: onToggle, onReset });
-    reinject();
-    injector.startObserver(reinject);
-    // Open a control connection + hydrate settings; also makes the daemon push
-    // status so a menu-bar-started meeting lights the in-bar button.
-    chrome.runtime.sendMessage({ type: "WD_GET_SETTINGS" });
+    initUi();
   }
 
   if (document.body) boot();

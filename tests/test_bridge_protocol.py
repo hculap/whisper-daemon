@@ -211,6 +211,91 @@ def test_bridge_protocol_has_no_heavy_imports():
     assert out.stdout.strip() == "", f"heavy modules imported: {out.stdout.strip()}"
 
 
+# --- F12: control-char rejection at the patch boundary -------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["with\ttab", "form\x0cfeed", "bell\x07", "del\x7f", "vtab\x0b"],
+)
+def test_apply_patch_rejects_control_chars_in_str_fields(bad):
+    # A free-form string carrying any control char is rejected (old kept),
+    # so it can never reach config.toml.
+    s = Settings(recording_dir="~/Meetings", recording_device="Mic")
+    assert bp.apply_settings_patch(s, {"recording_dir": bad}).recording_dir == "~/Meetings"
+    assert bp.apply_settings_patch(s, {"recording_device": bad}).recording_device == "Mic"
+
+
+def test_is_safe_str_control_chars():
+    assert bp._is_safe_str("~/Meetings") is True
+    assert bp._is_safe_str("plain device name 2ch") is True
+    assert bp._is_safe_str("has\ttab") is False
+    assert bp._is_safe_str("has\x0cformfeed") is False
+    assert bp._is_safe_str("has\x7fdel") is False
+    assert bp._is_safe_str('has"quote') is False
+    assert bp._is_safe_str("has\\backslash") is False
+
+
+@pytest.mark.parametrize("surrogate", ["\ud800", "\udfff", "pre\udc00post"])
+def test_is_safe_str_rejects_lone_surrogates(surrogate):
+    # Lone UTF-16 surrogates are not utf-8 encodable and would truncate
+    # config.toml to zero bytes on save — reject them at the patch boundary.
+    assert bp._is_safe_str(surrogate) is False
+
+
+def test_apply_patch_rejects_surrogate_in_str_fields():
+    s = Settings(recording_dir="~/Meetings", recording_device="Mic")
+    patched = bp.apply_settings_patch(s, {"recording_dir": "\ud800"})
+    assert patched.recording_dir == "~/Meetings"
+    patched2 = bp.apply_settings_patch(s, {"recording_device": "bad\udfffdev"})
+    assert patched2.recording_device == "Mic"
+
+
+# --- CLEANUP-PY: screenshot_displays dedup -------------------------------
+
+
+def test_screenshot_displays_uses_config_source_of_truth():
+    from whisper_daemon import config
+
+    # No local duplicate set — the validator reuses config's constant.
+    assert not hasattr(bp, "_VALID_SCREENSHOT_DISPLAYS")
+    assert bp.VALID_SCREENSHOT_DISPLAYS is config.VALID_SCREENSHOT_DISPLAYS
+    # And it still validates correctly through the single source.
+    s = Settings()
+    for v in config.VALID_SCREENSHOT_DISPLAYS:
+        assert bp.apply_settings_patch(s, {"screenshot_displays": v}).screenshot_displays == v
+
+
+# --- F5: send-once caption selection -------------------------------------
+
+
+def _res(text):
+    return {"text": text}
+
+
+def test_select_unsent_results_returns_only_new_tail():
+    all_results = [(0.0, _res("a")), (1.0, _res("b"))]
+    out = bp.select_unsent_results(all_results, 0)
+    assert out == [(0, 0.0, "a"), (1, 1.0, "b")]
+    # After marking two sent, appending one yields only the new one at its
+    # true index — no duplicates, no reordering.
+    all_results.append((2.0, _res("c")))
+    out2 = bp.select_unsent_results(all_results, 2)
+    assert out2 == [(2, 2.0, "c")]
+
+
+def test_select_unsent_results_skips_empty_text():
+    all_results = [(0.0, _res("  ")), (1.0, _res("")), (2.0, _res("real"))]
+    out = bp.select_unsent_results(all_results, 0)
+    assert out == [(2, 2.0, "real")]
+
+
+def test_select_unsent_results_nothing_new():
+    all_results = [(0.0, _res("a"))]
+    assert bp.select_unsent_results(all_results, 1) == []
+    assert bp.select_unsent_results([], 0) == []
+
+
 def test_apply_patch_never_mutates_via_replace():
     # sanity: apply uses dataclasses.replace semantics (fields equal except patched)
     s = Settings()

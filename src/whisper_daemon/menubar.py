@@ -82,7 +82,22 @@ class MenuBarDelegate(NSObject):
         self._meeting_start = 0.0
         self._meeting_thread = None
         self._meeting_browser_triggered = False
+        # Meeting lifecycle phase reported to the extension's control surface:
+        # "idle" -> "recording" -> "transcribing" -> "idle". Distinct from
+        # _meeting_active (which is False during the transcription tail) so a
+        # get_settings arriving mid-transcription reports "transcribing", not
+        # "idle", and the in-bar button stays correct until the real terminal
+        # status lands.
+        self._meeting_phase = "idle"
+        self._meeting_chunk_count = 0
+        # How many entries of the meeting's all_results list have already been
+        # forwarded to the extension — captions are send-once + append (F5).
+        self._results_sent_count = 0
         self._last_state = State.IDLE
+        # Guards cross-thread access to self._settings: set_settings applies on
+        # the bridge/worker thread while native menu toggles mutate on the main
+        # thread (F14).
+        self._settings_lock = threading.Lock()
         self._settings = load_settings()
         self._daemon._settings = self._settings
 
@@ -457,7 +472,8 @@ class MenuBarDelegate(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def onToggleSaveAudio_(self, sender):
-        self._settings.save_audio = not self._settings.save_audio
+        with self._settings_lock:
+            self._settings.save_audio = not self._settings.save_audio
         sender.setState_(1 if self._settings.save_audio else 0)
         save_settings(self._settings)
         logger.info("Save audio: %s", self._settings.save_audio)
@@ -474,21 +490,24 @@ class MenuBarDelegate(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def onToggleScreenshots_(self, sender):
-        self._settings.capture_screenshots = not self._settings.capture_screenshots
+        with self._settings_lock:
+            self._settings.capture_screenshots = not self._settings.capture_screenshots
         sender.setState_(1 if self._settings.capture_screenshots else 0)
         save_settings(self._settings)
         logger.info("Capture screenshots: %s", self._settings.capture_screenshots)
 
     @objc.typedSelector(b"v@:@")
     def onToggleDiarize_(self, sender):
-        self._settings.diarize = not self._settings.diarize
+        with self._settings_lock:
+            self._settings.diarize = not self._settings.diarize
         sender.setState_(1 if self._settings.diarize else 0)
         save_settings(self._settings)
         logger.info("Speaker diarization: %s", self._settings.diarize)
 
     @objc.typedSelector(b"v@:@")
     def onToggleAutoRecord_(self, sender):
-        self._settings.auto_record_meetings = not self._settings.auto_record_meetings
+        with self._settings_lock:
+            self._settings.auto_record_meetings = not self._settings.auto_record_meetings
         sender.setState_(1 if self._settings.auto_record_meetings else 0)
         save_settings(self._settings)
         logger.info("Auto-record meetings: %s", self._settings.auto_record_meetings)
@@ -499,7 +518,8 @@ class MenuBarDelegate(NSObject):
         for item in self._tts_lang_items.values():
             item.setState_(0)
         sender.setState_(1)
-        self._settings.tts_language = lang_code
+        with self._settings_lock:
+            self._settings.tts_language = lang_code
         save_settings(self._settings)
         logger.info("TTS language changed to: %s", lang_code)
 
@@ -517,7 +537,8 @@ class MenuBarDelegate(NSObject):
             return
 
         path = str(panel.URLs()[0].path())
-        self._settings.recording_dir = path
+        with self._settings_lock:
+            self._settings.recording_dir = path
         save_settings(self._settings)
         self._rec_dir_item.setTitle_(
             self._format_dir_label("Recording Folder", path)
@@ -526,13 +547,14 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleRecFmt_(self, sender):
         fmt = str(sender.title())
-        if fmt in self._settings.recording_formats:
-            if len(self._settings.recording_formats) > 1:
-                self._settings.recording_formats.remove(fmt)
-                sender.setState_(0)
-        else:
-            self._settings.recording_formats.append(fmt)
-            sender.setState_(1)
+        with self._settings_lock:
+            if fmt in self._settings.recording_formats:
+                if len(self._settings.recording_formats) > 1:
+                    self._settings.recording_formats.remove(fmt)
+                    sender.setState_(0)
+            else:
+                self._settings.recording_formats.append(fmt)
+                sender.setState_(1)
         save_settings(self._settings)
 
     @objc.typedSelector(b"v@:@")
@@ -549,7 +571,8 @@ class MenuBarDelegate(NSObject):
             return
 
         path = str(panel.URLs()[0].path())
-        self._settings.transcription_output_dir = path
+        with self._settings_lock:
+            self._settings.transcription_output_dir = path
         save_settings(self._settings)
         self._trans_dir_item.setTitle_(
             self._format_dir_label("Transcription Output", path)
@@ -558,13 +581,14 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleTransFmt_(self, sender):
         fmt = str(sender.title())
-        if fmt in self._settings.transcription_formats:
-            if len(self._settings.transcription_formats) > 1:
-                self._settings.transcription_formats.remove(fmt)
-                sender.setState_(0)
-        else:
-            self._settings.transcription_formats.append(fmt)
-            sender.setState_(1)
+        with self._settings_lock:
+            if fmt in self._settings.transcription_formats:
+                if len(self._settings.transcription_formats) > 1:
+                    self._settings.transcription_formats.remove(fmt)
+                    sender.setState_(0)
+            else:
+                self._settings.transcription_formats.append(fmt)
+                sender.setState_(1)
         save_settings(self._settings)
 
     def _build_device_menu(self):
@@ -609,7 +633,8 @@ class MenuBarDelegate(NSObject):
             item.setState_(0)
         sender.setState_(1)
 
-        self._settings.recording_device = device_name
+        with self._settings_lock:
+            self._settings.recording_device = device_name
         save_settings(self._settings)
         logger.info("Recording device changed to: %s", device_name or "system default")
 
@@ -621,9 +646,16 @@ class MenuBarDelegate(NSObject):
     # -- Browser bridge callbacks (called from asyncio thread) --
 
     def _on_browser_connect(self, title: str, url: str) -> None:
-        """Extension started a capture session."""
+        """Extension started a capture session.
+
+        A {"type":"start"} from the extension is always an explicit user
+        gesture now (it follows the getDisplayMedia permission click), so it
+        must always start the meeting when none is active — regardless of the
+        auto_record_meetings preference, which only governs fully-automatic
+        starts and is intentionally not consulted here.
+        """
         logger.info("Browser meeting started: %s (%s)", title, url)
-        if self._settings.auto_record_meetings and not self._meeting_active:
+        if not self._meeting_active:
             AppHelper.callAfter(self._start_meeting, True, title)
 
     def _on_browser_audio(self, data: bytes) -> None:
@@ -668,7 +700,7 @@ class MenuBarDelegate(NSObject):
             msg = build_settings_message(
                 self._settings, self._list_input_devices()
             )
-            self._browser_bridge.send_settings(msg)
+            self._browser_bridge.send_json_str(msg)
         except Exception:
             logger.exception("Failed to push settings snapshot")
 
@@ -682,17 +714,24 @@ class MenuBarDelegate(NSObject):
         threading.Thread(target=fn, daemon=True).start()
 
     def _handle_get_settings(self) -> None:
-        """Push the settings snapshot + idle status (runs on a worker thread)."""
+        """Push settings snapshot + current phase status (worker thread).
+
+        Reports the daemon's real phase (idle/recording/transcribing), not a
+        hardcoded "idle": a control surface that connects while the previous
+        meeting is still transcribing must see "transcribing" so its in-bar
+        button doesn't reset early. Plain attribute reads — thread-safe.
+        """
         self._push_settings_snapshot()
-        # When idle, tell the newly-connected control surface so its
-        # button/timer reflect the daemon's single source of truth.
-        if not self._meeting_active:
-            try:
-                self._browser_bridge.send_status_msg(
-                    build_status_message("idle", 0.0, 0)
-                )
-            except Exception:
-                logger.exception("Failed to push idle status")
+        phase = self._meeting_phase
+        elapsed = (
+            time.monotonic() - self._meeting_start if phase == "recording" else 0.0
+        )
+        try:
+            self._browser_bridge.send_json_str(
+                build_status_message(phase, elapsed, self._meeting_chunk_count)
+            )
+        except Exception:
+            logger.exception("Failed to push status")
 
     def _persist_and_push_settings(self) -> None:
         """Persist settings to disk and echo the snapshot (worker thread)."""
@@ -723,8 +762,11 @@ class MenuBarDelegate(NSObject):
                 return
             # Immutable in-memory update is fast; do it inline so ordering is
             # deterministic. Disk persistence + device enumeration are offloaded.
-            self._settings = apply_settings_patch(self._settings, patch)
-            self._daemon._settings = self._settings
+            # Locked so a concurrent native menu toggle (main thread) can't
+            # interleave its read-modify-write with this one (F14).
+            with self._settings_lock:
+                self._settings = apply_settings_patch(self._settings, patch)
+                self._daemon._settings = self._settings
             # COLD settings (mic/formats/dir/diarize/displays/capture_mic/tab)
             # take effect on the next recording — no live swap attempted. Hot
             # settings (live_captions is UI-only; capture_screenshots' local
@@ -777,6 +819,9 @@ class MenuBarDelegate(NSObject):
         self._meeting_active = True
         self._meeting_browser_triggered = browser_triggered
         self._meeting_start = time.monotonic()
+        self._meeting_phase = "recording"
+        self._meeting_chunk_count = 0
+        self._results_sent_count = 0
         self._meeting_menu_item.setTitle_("Stop Recording (0:00)")
         self._set_icon_by_name(MEETING_RECORDING_SYMBOL)
 
@@ -859,12 +904,13 @@ class MenuBarDelegate(NSObject):
         # spinning an empty meeting that never produces chunks.
         if mic_recorder is None and browser_recorder is None:
             logger.warning(
-                "Both capture_mic and capture_tab are disabled — aborting meeting"
+                "No audio source (capture_mic off and no browser recorder) — "
+                "aborting meeting"
             )
             _notify(
                 "whisper-daemon",
-                "Nothing to record",
-                "Enable microphone or tab capture to start a meeting.",
+                "No audio source",
+                "Enable microphone or participant capture — nothing to record.",
             )
             self._reset_meeting_ui()
             return
@@ -962,8 +1008,9 @@ class MenuBarDelegate(NSObject):
                     if now - last_status_push >= 1.0:
                         last_status_push = now
                         elapsed = now - self._meeting_start
+                        self._meeting_chunk_count = chunk_count
                         try:
-                            self._browser_bridge.send_status_msg(
+                            self._browser_bridge.send_json_str(
                                 build_status_message("recording", elapsed, chunk_count)
                             )
                         except Exception:
@@ -1062,10 +1109,13 @@ class MenuBarDelegate(NSObject):
                         _write_partial(partial_path, all_results)
                         self._send_results_to_browser(all_results, chunk_count)
 
-                # Recording finished — tell the extension we're now finishing
-                # transcription so its button reflects the transcribing state.
+                # Recording finished — enter the transcription phase so a
+                # get_settings arriving now reports "transcribing" (not idle),
+                # and tell the extension so its button reflects that state.
+                self._meeting_phase = "transcribing"
+                self._meeting_chunk_count = chunk_count
                 try:
-                    self._browser_bridge.send_status_msg(
+                    self._browser_bridge.send_json_str(
                         build_status_message("transcribing", 0.0, chunk_count)
                     )
                 except Exception:
@@ -1122,65 +1172,84 @@ class MenuBarDelegate(NSObject):
             self._reset_meeting_ui()
             return
 
-        from whisper_daemon.formats import merge_chunk_results
-        merged_result = merge_chunk_results(all_results)
+        # Finalization runs OUTSIDE the worker's try/except above, so any
+        # failure here (disk full, unwritable recording_dir, malformed
+        # segments) must NOT leave _meeting_phase stuck at "transcribing".
+        # The finally guarantees _reset_meeting_ui() runs and pushes the
+        # terminal "idle" status over the still-open socket (F3).
+        try:
+            from whisper_daemon.formats import merge_chunk_results
+            merged_result = merge_chunk_results(all_results)
 
-        if diarize and all_audio:
-            try:
-                from whisper_daemon.diarizer import diarize_batch
-                from whisper_daemon.diarize_merge import merge_speakers_with_transcript
+            if diarize and all_audio:
+                try:
+                    from whisper_daemon.diarizer import diarize_batch
+                    from whisper_daemon.diarize_merge import merge_speakers_with_transcript
 
+                    full_audio = np.concatenate(all_audio)
+                    logger.info("Diarizing %.1fs of audio...", len(full_audio) / 16000)
+                    speaker_segments = diarize_batch(full_audio)
+                    merged_result = merge_speakers_with_transcript(
+                        speaker_segments, merged_result
+                    )
+                    speaker_count = len(merged_result.get("speakers", []))
+                    logger.info("Diarization done — %d speakers", speaker_count)
+                except Exception:
+                    logger.exception("Diarization failed, saving without speaker labels")
+
+            from whisper_daemon.formats import FORMATTERS
+
+            written: list[str] = []
+            for fmt in recording_formats:
+                if fmt in FORMATTERS:
+                    out = rec_dir / f"transcript.{fmt}"
+                    out.write_text(FORMATTERS[fmt](merged_result), encoding="utf-8")
+                    written.append(str(out))
+
+            if save_audio and all_audio:
+                audio_path = rec_dir / "recording.wav"
                 full_audio = np.concatenate(all_audio)
-                logger.info("Diarizing %.1fs of audio...", len(full_audio) / 16000)
-                speaker_segments = diarize_batch(full_audio)
-                merged_result = merge_speakers_with_transcript(
-                    speaker_segments, merged_result
-                )
-                speaker_count = len(merged_result.get("speakers", []))
-                logger.info("Diarization done — %d speakers", speaker_count)
-            except Exception:
-                logger.exception("Diarization failed, saving without speaker labels")
+                _save_wav(audio_path, full_audio, 16000)
+                written.append(str(audio_path))
 
-        from whisper_daemon.formats import FORMATTERS
+            screenshots_msg = ""
+            if screen_capture is not None and screen_capture.saved_count > 0:
+                screenshots_msg = f", {screen_capture.saved_count} screenshots"
 
-        written: list[str] = []
-        for fmt in recording_formats:
-            if fmt in FORMATTERS:
-                out = rec_dir / f"transcript.{fmt}"
-                out.write_text(FORMATTERS[fmt](merged_result), encoding="utf-8")
-                written.append(str(out))
+            # Remove live partial now that final transcript exists
+            partial_path = rec_dir / "transcript_live.txt"
+            partial_path.unlink(missing_ok=True)
 
-        if save_audio and all_audio:
-            audio_path = rec_dir / "recording.wav"
-            full_audio = np.concatenate(all_audio)
-            _save_wav(audio_path, full_audio, 16000)
-            written.append(str(audio_path))
-
-        screenshots_msg = ""
-        if screen_capture is not None and screen_capture.saved_count > 0:
-            screenshots_msg = f", {screen_capture.saved_count} screenshots"
-
-        # Remove live partial now that final transcript exists
-        partial_path = rec_dir / "transcript_live.txt"
-        partial_path.unlink(missing_ok=True)
-
-        telemetry.meeting_stop(chunk_count, str(rec_dir))
-        logger.info("Meeting saved: %s", ", ".join(written))
-        _notify(
-            "whisper-daemon",
-            f"Meeting recorded ({chunk_count} chunks{screenshots_msg})",
-            str(rec_dir),
-        )
-        self._reset_meeting_ui()
+            telemetry.meeting_stop(chunk_count, str(rec_dir))
+            logger.info("Meeting saved: %s", ", ".join(written))
+            _notify(
+                "whisper-daemon",
+                f"Meeting recorded ({chunk_count} chunks{screenshots_msg})",
+                str(rec_dir),
+            )
+        except Exception:
+            logger.exception("Meeting finalization failed")
+            _notify("whisper-daemon", "Error", "Failed to save meeting transcript.")
+        finally:
+            self._reset_meeting_ui()
 
     def _send_results_to_browser(self, all_results: list, chunk_count: int) -> None:
-        """Forward transcription results to the Chrome extension if connected."""
+        """Forward NEW transcription results to the extension (send-once).
+
+        Each result is sent exactly once, tagged with its true index in
+        all_results as chunk_index — the old code resent all_results[-3:]
+        every cycle, duplicating and reordering captions (F5). ``chunk_count``
+        is unused for indexing now; kept for signature stability.
+        """
         if not self._browser_bridge.connected:
             return
-        for start_time, result in all_results[-3:]:  # send recent results
-            text = result.get("text", "").strip()
-            if text:
-                self._browser_bridge.send_chunk_result(text, start_time, chunk_count)
+        from whisper_daemon.bridge_protocol import select_unsent_results
+
+        for idx, start_time, text in select_unsent_results(
+            all_results, self._results_sent_count
+        ):
+            self._browser_bridge.send_chunk_result(text, start_time, idx)
+        self._results_sent_count = len(all_results)
 
     def graceful_stop(self, timeout: float = 300.0) -> None:
         """Stop any active meeting, wait for save/diarize, then quit.
@@ -1208,13 +1277,14 @@ class MenuBarDelegate(NSObject):
         AppKit mutations are dispatched to the main thread."""
         self._meeting_active = False
         self._meeting_browser_triggered = False
+        self._meeting_phase = "idle"
         self._browser_recorder = None
         self._browser_prebuffer = []
         self._browser_prebuffer_bytes = 0
 
         # Tell the extension the meeting is over so its in-bar button goes idle.
         try:
-            self._browser_bridge.send_status_msg(
+            self._browser_bridge.send_json_str(
                 build_status_message("idle", 0.0, 0)
             )
         except Exception:

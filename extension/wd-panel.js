@@ -66,6 +66,11 @@
   let recordingActive = false;
   let lastDevices = [];
   let outsideClick = null; // document click handler (for teardown removal)
+  // True when a render() was skipped because an input/select inside the panel
+  // held focus (F13). We repaint on blur and on next open so a state change that
+  // arrives mid-edit (e.g. WD_STATUS flips recording) is not stuck stale
+  // indefinitely (finding 6).
+  let renderPending = false;
 
   function buildHost() {
     if (hostEl) return;
@@ -82,6 +87,16 @@
     shadow.appendChild(popEl);
 
     document.body.appendChild(hostEl);
+
+    // When focus leaves an input/select that was blocking re-render, repaint if a
+    // render was deferred while it held focus (finding 6). Defer to a macrotask so
+    // shadow.activeElement reflects where focus landed (may be another field).
+    shadow.addEventListener("focusout", () => {
+      if (!renderPending) return;
+      setTimeout(() => {
+        if (renderPending && !isEditingInPanel()) render(currentSettings, lastDevices);
+      }, 0);
+    });
 
     outsideClick = (e) => {
       if (!popEl.classList.contains("wd-open")) return;
@@ -114,6 +129,7 @@
     hostEl = null;
     shadow = null;
     popEl = null;
+    renderPending = false;
   }
 
   function emitPatch(patch) {
@@ -122,10 +138,28 @@
     }
   }
 
-  function coldNote() {
-    return recordingActive
+  // Show the "applies next recording" note next to a COLD field while a
+  // recording is active. Driven by WD.logic.isColdSetting so the cold/hot
+  // classification lives in one place (wd-logic.js).
+  function coldNote(key) {
+    const logic = WD.logic;
+    const isCold = logic && typeof logic.isColdSetting === "function"
+      ? logic.isColdSetting(key)
+      : false;
+    return recordingActive && isCold
       ? '<div class="note wd-show">od następnego nagrania</div>'
       : "";
+  }
+
+  // True while a text input or select inside the (open) panel holds focus, so a
+  // WD_SETTINGS echo does not blow away the caret mid-typing (F13). Checkboxes/
+  // radios hold no caret, so they don't block re-render.
+  function isEditingInPanel() {
+    if (!popEl || !popEl.classList.contains("wd-open") || !shadow) return false;
+    const el = shadow.activeElement;
+    if (!el) return false;
+    const tag = el.tagName;
+    return tag === "SELECT" || (tag === "INPUT" && el.type === "text");
   }
 
   function devicesOptions(devices, selected) {
@@ -153,6 +187,15 @@
     buildHost();
     if (settings && typeof settings === "object") currentSettings = settings;
     if (Array.isArray(devices)) lastDevices = devices;
+    // Preserve the caret: skip the wholesale innerHTML rebuild while the user is
+    // typing in / focused on a text input or select. State is already stored
+    // above, so the next open (or a non-focused render) reflects it (F13). Flag
+    // the deferral so blur / next-open retries the paint (finding 6).
+    if (isEditingInPanel()) {
+      renderPending = true;
+      return;
+    }
+    renderPending = false;
     devices = lastDevices;
     const s = currentSettings || {};
     const formats = Array.isArray(s.recording_formats) ? s.recording_formats : ["txt"];
@@ -169,18 +212,18 @@
         <label>Mikrofon</label>
         <select data-key="recording_device">${devicesOptions(devices, s.recording_device || "")}</select>
       </div>
-      ${coldNote()}
+      ${coldNote("recording_device")}
 
       <div class="row">
         <label>Nagrywaj mnie (Ja)</label>
         <input type="checkbox" data-key="capture_mic" ${s.capture_mic ? "checked" : ""}>
       </div>
-      ${coldNote()}
+      ${coldNote("capture_mic")}
       <div class="row">
         <label>Nagrywaj uczestników</label>
         <input type="checkbox" data-key="capture_tab" ${s.capture_tab ? "checked" : ""}>
       </div>
-      ${coldNote()}
+      ${coldNote("capture_tab")}
 
       <hr>
 
@@ -194,7 +237,7 @@
       <div class="row sub">
         <label><input type="radio" name="wd-disp" data-disp="primary" ${s.screenshot_displays === "primary" ? "checked" : ""}> Tylko główny</label>
       </div>
-      ${coldNote()}
+      ${coldNote("screenshot_displays")}
 
       <hr>
 
@@ -207,6 +250,7 @@
         <label>Diaryzacja (kto mówi)</label>
         <input type="checkbox" data-key="diarize" ${s.diarize ? "checked" : ""}>
       </div>
+      ${coldNote("diarize")}
       <div class="row sub">
         <label>Tryb</label>
         <select data-key="diarize_mode">
@@ -215,7 +259,7 @@
           <option value="realtime" ${s.diarize_mode === "realtime" ? "selected" : ""}>realtime</option>
         </select>
       </div>
-      ${coldNote()}
+      ${coldNote("diarize_mode")}
 
       <hr>
 
@@ -223,11 +267,11 @@
         <label>Katalog zapisu</label>
         <input type="text" data-key="recording_dir" value="${escapeAttr(s.recording_dir || "~/Desktop")}">
       </div>
-      ${coldNote()}
+      ${coldNote("recording_dir")}
 
       <div class="row"><label>Formaty</label></div>
       <div class="formats">${formatBoxes}</div>
-      ${coldNote()}
+      ${coldNote("recording_formats")}
 
       <div class="actions">
         <button class="wd-action ${recordingActive ? "wd-recording" : ""}" data-role="action">
@@ -302,6 +346,9 @@
 
   function show() {
     buildHost();
+    // Repaint on open if a render was deferred while the panel was focused/closed
+    // (finding 6). Rendered before wd-open is set, so isEditingInPanel() is false.
+    if (renderPending) render(currentSettings, lastDevices);
     position();
     popEl.classList.add("wd-open");
   }

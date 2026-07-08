@@ -181,7 +181,7 @@ async function beginSession(gen) {
   // settings) instead of racing a second connection past the daemon's
   // single-connection slot.
   const alreadyOpen = ws && ws.readyState === WebSocket.OPEN;
-  const connected = alreadyOpen || (await connectWebSocket(CONNECT_ATTEMPTS, gen));
+  const connected = alreadyOpen || (await openSharedSocket(CONNECT_ATTEMPTS, gen));
   if (gen !== captureGen) return false; // stop/newer-start raced us
   if (!connected) {
     cleanup();
@@ -362,7 +362,7 @@ async function ensureControlConnection() {
   // instead (F7-js/F12-js).
   if (reconnecting) return await waitForReconnect();
   const gen = captureGen; // do NOT bump — this must not invalidate a capture
-  const connected = await connectWebSocket(1, gen);
+  const connected = await openSharedSocket(1, gen);
   return connected && ws && ws.readyState === WebSocket.OPEN;
 }
 
@@ -394,6 +394,21 @@ async function sendControl(obj) {
 }
 
 // --- WebSocket ---
+
+// Serialize socket bring-up: concurrent callers (two WD_GET_SETTINGS on boot,
+// or a settings fetch racing a record start) must share ONE connection attempt.
+// Without this each opens its own socket, the daemon keeps only the newest
+// ("New browser connection — closing previous one") and the losing socket fires
+// a spurious "WebSocket closed unexpectedly" on the client.
+let connectPromise = null;
+function openSharedSocket(attempts, gen) {
+  if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve(true);
+  if (connectPromise) return connectPromise;
+  connectPromise = connectWebSocket(attempts, gen).finally(() => {
+    connectPromise = null;
+  });
+  return connectPromise;
+}
 
 async function connectWebSocket(attempts, gen) {
   for (let attempt = 0; attempt < attempts; attempt++) {
@@ -452,10 +467,15 @@ function handleServerMessage(event) {
 }
 
 function handleUnexpectedClose() {
-  console.warn("WebSocket closed unexpectedly");
   ws = null;
   if (capturing && !reconnecting) {
+    console.warn("WebSocket closed during recording — reconnecting");
     reconnectLoop(captureGen);
+  } else {
+    // Benign: a daemon restart, or a superseded/idle control connection. The
+    // channel reopens on demand (next settings fetch or record start), so this
+    // is not an error worth surfacing.
+    console.debug("Control WebSocket closed — will reopen on demand");
   }
 }
 

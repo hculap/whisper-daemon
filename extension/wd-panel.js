@@ -1,6 +1,7 @@
 /**
- * wd-panel.js — settings popover rendered inside a Shadow DOM so none of its
- * styles leak into (or inherit from) Google Meet. Anchored above #wd-control.
+ * wd-panel.js — settings menu rendered in a Shadow DOM, styled to match Google
+ * Meet's native "more options" menu (dark surface, left-icon rows, dividers,
+ * Material switches, Google Sans). Anchored above the Whisper control.
  *
  * Classic content script sharing the isolated-world scope. Exposes WD.panel.
  */
@@ -13,63 +14,116 @@
   const HOST_ID = "wd-panel-host";
   const FORMATS = ["txt", "srt", "vtt", "json"];
 
+  // Outline icons (Google-Symbols-like) drawn with currentColor strokes; the
+  // record glyph is a filled dot. Kept inline so nothing loads over the network.
+  const ICONS = {
+    rec: '<circle cx="12" cy="12" r="6" fill="currentColor" stroke="none"/>',
+    mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M6 11a6 6 0 0 0 12 0"/><path d="M12 17v4"/>',
+    me: '<circle cx="12" cy="8" r="3.4"/><path d="M5 20a7 7 0 0 1 14 0"/>',
+    people: '<circle cx="9" cy="8.5" r="3"/><path d="M3.2 19a5.8 5.8 0 0 1 11.6 0"/><path d="M15.5 6.2a3 3 0 0 1 0 5.6"/><path d="M17 13.4a5.8 5.8 0 0 1 3.8 5.6"/>',
+    shot: '<rect x="3" y="6" width="18" height="13" rx="2.5"/><circle cx="12" cy="12.5" r="3.4"/>',
+    cc: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M7.5 13h3"/><path d="M13.5 13h3.5"/>',
+    diar: '<circle cx="9" cy="9" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 8a3.6 3.6 0 0 1 0 8"/><path d="M18.4 6a6.8 6.8 0 0 1 0 12"/>',
+    folder: '<path d="M3.5 7a2 2 0 0 1 2-2h3.2l2 2H18.5a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
+    doc: '<path d="M7 3.5h7l4 4V19a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M13.5 3.5V8H18"/><path d="M9 13h6"/><path d="M9 16h4"/>',
+    reset: '<path d="M12 6V3L7.5 7.5 12 12V9a4.5 4.5 0 1 1-4.5 4.5"/>',
+  };
+  function ic(name) {
+    return `<svg class="wd-ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ""}</svg>`;
+  }
+
   const CSS = `
     :host { all: initial; }
-    .wd-pop {
+    .wd-menu {
       position: fixed;
       z-index: 2147483646;
-      width: 320px;
-      max-height: 70vh;
+      width: 340px;
+      max-height: 78vh;
       overflow-y: auto;
-      background: #202124;
-      color: #e8eaed;
-      border: 1px solid #3c4043;
+      background: #282a2c;
+      color: #e3e3e3;
       border-radius: 12px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
-      padding: 16px;
-      font-family: "Google Sans", Roboto, Arial, sans-serif;
-      font-size: 13px;
+      box-shadow: 0 8px 28px rgba(0,0,0,.6), 0 1px 3px rgba(0,0,0,.4);
+      padding: 8px 0;
+      font-family: "Google Sans", "Roboto", Arial, sans-serif;
+      font-size: 14px;
       display: none;
+      user-select: none;
     }
-    .wd-pop.wd-open { display: block; }
-    h3 { margin: 0 0 12px; font-size: 15px; font-weight: 500; }
-    .row { display: flex; align-items: center; justify-content: space-between; margin: 10px 0; gap: 10px; }
-    .row label { flex: 1; }
-    .note { font-size: 11px; color: #9aa0a6; margin: 2px 0 8px; display: none; }
-    .note.wd-show { display: block; }
-    select, input[type="text"] {
-      background: #303134; color: #e8eaed; border: 1px solid #5f6368;
-      border-radius: 6px; padding: 5px 8px; font-size: 12px; max-width: 170px;
+    .wd-menu.wd-open { display: block; }
+    .wd-menu::-webkit-scrollbar { width: 8px; }
+    .wd-menu::-webkit-scrollbar-thumb { background: #5f6368; border-radius: 4px; }
+
+    .wd-row {
+      display: flex; align-items: center; gap: 16px;
+      min-height: 44px; padding: 4px 20px; box-sizing: border-box;
     }
-    input[type="text"] { width: 170px; }
-    .formats { display: flex; gap: 10px; flex-wrap: wrap; }
-    .formats label { display: flex; align-items: center; gap: 4px; flex: none; }
-    .sub { padding-left: 14px; }
-    hr { border: none; border-top: 1px solid #3c4043; margin: 12px 0; }
-    .actions { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
-    button {
-      cursor: pointer; border: none; border-radius: 8px; padding: 9px 12px;
-      font-size: 13px; font-weight: 500; font-family: inherit;
+    .wd-row.wd-click { cursor: pointer; }
+    .wd-row.wd-click:hover { background: rgba(255,255,255,.08); }
+    .wd-ic { width: 22px; height: 22px; flex: none; fill: none;
+      stroke: #c4c7c5; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+    .wd-label { flex: 1; min-width: 0; }
+    .wd-sub-label { flex: 1; padding-left: 38px; color: #c4c7c5; font-size: 13px; }
+
+    /* Primary record action — echoes Meet's top menu item. */
+    .wd-primary { width: 100%; text-align: left; background: none; border: none;
+      color: inherit; font: inherit; }
+    .wd-primary .wd-ic { fill: #e3e3e3; stroke: none; }
+    .wd-primary .wd-txt { display: flex; flex-direction: column; line-height: 1.25; }
+    .wd-primary .wd-title { font-size: 14px; }
+    .wd-primary .wd-desc { font-size: 12px; color: #9aa0a6; }
+    .wd-primary.wd-rec .wd-ic { fill: #f28b82; }
+    .wd-primary.wd-rec .wd-title { color: #f28b82; }
+
+    .wd-div { height: 1px; background: rgba(255,255,255,.12); margin: 8px 0; }
+
+    /* Material switch */
+    .wd-sw { appearance: none; -webkit-appearance: none; position: relative;
+      width: 34px; height: 20px; border-radius: 10px; background: #5f6368;
+      cursor: pointer; transition: background .15s; flex: none; margin: 0; }
+    .wd-sw::before { content: ""; position: absolute; top: 3px; left: 3px;
+      width: 14px; height: 14px; border-radius: 50%; background: #e3e3e3;
+      transition: transform .15s, background .15s; }
+    .wd-sw:checked { background: #8ab4f8; }
+    .wd-sw:checked::before { transform: translateX(14px); background: #202124; }
+
+    .wd-sel, .wd-txt-in {
+      background: #303134; color: #e3e3e3; border: 1px solid #5f6368;
+      border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 13px;
+      width: 100%; box-sizing: border-box;
     }
-    .wd-action { background: #8ab4f8; color: #202124; }
-    .wd-action.wd-recording { background: #ea4335; color: #fff; }
-    .wd-reset { background: transparent; color: #8ab4f8; border: 1px solid #5f6368; }
+    .wd-field { padding: 2px 20px 8px 58px; }
+    .wd-sel-inline { max-width: 130px; width: auto; }
+
+    .wd-radio { display: flex; align-items: center; gap: 10px; padding: 6px 20px 6px 58px;
+      cursor: pointer; }
+    .wd-radio:hover { background: rgba(255,255,255,.06); }
+    .wd-radio input { accent-color: #8ab4f8; width: 16px; height: 16px; }
+
+    .wd-chips { display: flex; gap: 8px; flex-wrap: wrap; padding: 4px 20px 8px 58px; }
+    .wd-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
+      border: 1px solid #5f6368; border-radius: 16px; cursor: pointer; font-size: 13px;
+      color: #c4c7c5; }
+    .wd-chip.wd-on { background: #004a77; border-color: #004a77; color: #d3e3fd; }
+    .wd-chip input { display: none; }
+
+    .wd-note { padding: 0 20px 6px 58px; font-size: 12px; color: #9aa0a6; display: none; }
+    .wd-note.wd-show { display: block; }
+
+    .wd-reset .wd-ic { stroke: #8ab4f8; }
+    .wd-reset .wd-label { color: #8ab4f8; }
   `;
 
   let hostEl = null;
   let shadow = null;
   let popEl = null;
-  let onPatch = null; // (patch) => void
-  let onAction = null; // () => void  (start/stop toggle)
-  let onReset = null; // () => void
+  let onPatch = null;
+  let onAction = null;
+  let onReset = null;
   let currentSettings = {};
   let recordingActive = false;
   let lastDevices = [];
-  let outsideClick = null; // document click handler (for teardown removal)
-  // True when a render() was skipped because an input/select inside the panel
-  // held focus (F13). We repaint on blur and on next open so a state change that
-  // arrives mid-edit (e.g. WD_STATUS flips recording) is not stuck stale
-  // indefinitely (finding 6).
+  let outsideClick = null;
   let renderPending = false;
 
   function buildHost() {
@@ -83,14 +137,11 @@
     shadow.appendChild(style);
 
     popEl = document.createElement("div");
-    popEl.className = "wd-pop";
+    popEl.className = "wd-menu";
     shadow.appendChild(popEl);
 
     document.body.appendChild(hostEl);
 
-    // When focus leaves an input/select that was blocking re-render, repaint if a
-    // render was deferred while it held focus (finding 6). Defer to a macrotask so
-    // shadow.activeElement reflects where focus landed (may be another field).
     shadow.addEventListener("focusout", () => {
       if (!renderPending) return;
       setTimeout(() => {
@@ -110,10 +161,6 @@
     document.addEventListener("click", outsideClick);
   }
 
-  /**
-   * Remove the panel host and its document-level click listener. Safe to call
-   * repeatedly; a later render()/show() rebuilds the host on demand.
-   */
   function teardown() {
     try {
       if (outsideClick) document.removeEventListener("click", outsideClick);
@@ -138,22 +185,16 @@
     }
   }
 
-  // Show the "applies next recording" note next to a COLD field while a
-  // recording is active. Driven by WD.logic.isColdSetting so the cold/hot
-  // classification lives in one place (wd-logic.js).
   function coldNote(key) {
     const logic = WD.logic;
     const isCold = logic && typeof logic.isColdSetting === "function"
       ? logic.isColdSetting(key)
       : false;
     return recordingActive && isCold
-      ? '<div class="note wd-show">od następnego nagrania</div>'
+      ? '<div class="wd-note wd-show">od następnego nagrania</div>'
       : "";
   }
 
-  // True while a text input or select inside the (open) panel holds focus, so a
-  // WD_SETTINGS echo does not blow away the caret mid-typing (F13). Checkboxes/
-  // radios hold no caret, so they don't block re-render.
   function isEditingInPanel() {
     if (!popEl || !popEl.classList.contains("wd-open") || !shadow) return false;
     const el = shadow.activeElement;
@@ -178,19 +219,19 @@
     return escapeHtml(s).replace(/"/g, "&quot;");
   }
 
-  /**
-   * Render the popover from a settings snapshot.
-   * @param {object} settings
-   * @param {string[]} devices
-   */
+  function toggleRow(icon, label, key, checked, cold) {
+    return `
+      <label class="wd-row wd-click">
+        ${ic(icon)}<span class="wd-label">${label}</span>
+        <input type="checkbox" class="wd-sw" data-key="${key}" ${checked ? "checked" : ""}>
+      </label>
+      ${cold ? coldNote(key) : ""}`;
+  }
+
   function render(settings, devices) {
     buildHost();
     if (settings && typeof settings === "object") currentSettings = settings;
     if (Array.isArray(devices)) lastDevices = devices;
-    // Preserve the caret: skip the wholesale innerHTML rebuild while the user is
-    // typing in / focused on a text input or select. State is already stored
-    // above, so the next open (or a non-focused render) reflects it (F13). Flag
-    // the deferral so blur / next-open retries the paint (finding 6).
     if (isEditingInPanel()) {
       renderPending = true;
       return;
@@ -200,60 +241,40 @@
     const s = currentSettings || {};
     const formats = Array.isArray(s.recording_formats) ? s.recording_formats : ["txt"];
 
-    const formatBoxes = FORMATS.map((f) => {
-      const checked = formats.includes(f) ? " checked" : "";
-      return `<label><input type="checkbox" data-fmt="${f}"${checked}>${f}</label>`;
+    const chips = FORMATS.map((f) => {
+      const on = formats.includes(f) ? " wd-on" : "";
+      return `<label class="wd-chip${on}"><input type="checkbox" data-fmt="${f}" ${formats.includes(f) ? "checked" : ""}>${f}</label>`;
     }).join("");
 
+    const status = recordingActive ? "Nagrywanie w toku" : "Gotowy do nagrywania";
+
     popEl.innerHTML = `
-      <h3>Whisper — ustawienia</h3>
+      <button class="wd-row wd-click wd-primary ${recordingActive ? "wd-rec" : ""}" data-role="action">
+        ${ic("rec")}
+        <span class="wd-txt">
+          <span class="wd-title">${recordingActive ? "Zatrzymaj nagrywanie" : "Rozpocznij nagrywanie"}</span>
+          <span class="wd-desc">${status}</span>
+        </span>
+      </button>
 
-      <div class="row">
-        <label>Mikrofon</label>
-        <select data-key="recording_device">${devicesOptions(devices, s.recording_device || "")}</select>
-      </div>
+      <div class="wd-div"></div>
+
+      <div class="wd-row"><span class="wd-ic-slot">${ic("mic")}</span><span class="wd-label">Mikrofon</span></div>
+      <div class="wd-field"><select class="wd-sel" data-key="recording_device">${devicesOptions(devices, s.recording_device || "")}</select></div>
       ${coldNote("recording_device")}
+      ${toggleRow("me", "Nagrywaj mnie (Ja)", "capture_mic", s.capture_mic, true)}
+      ${toggleRow("people", "Nagrywaj uczestników", "capture_tab", s.capture_tab, true)}
 
-      <div class="row">
-        <label>Nagrywaj mnie (Ja)</label>
-        <input type="checkbox" data-key="capture_mic" ${s.capture_mic ? "checked" : ""}>
-      </div>
-      ${coldNote("capture_mic")}
-      <div class="row">
-        <label>Nagrywaj uczestników</label>
-        <input type="checkbox" data-key="capture_tab" ${s.capture_tab ? "checked" : ""}>
-      </div>
-      ${coldNote("capture_tab")}
+      <div class="wd-div"></div>
 
-      <hr>
-
-      <div class="row">
-        <label>Zrzuty ekranu</label>
-        <input type="checkbox" data-key="capture_screenshots" ${s.capture_screenshots ? "checked" : ""}>
-      </div>
-      <div class="row sub">
-        <label><input type="radio" name="wd-disp" data-disp="all" ${s.screenshot_displays !== "primary" ? "checked" : ""}> Wszystkie ekrany</label>
-      </div>
-      <div class="row sub">
-        <label><input type="radio" name="wd-disp" data-disp="primary" ${s.screenshot_displays === "primary" ? "checked" : ""}> Tylko główny</label>
-      </div>
+      ${toggleRow("shot", "Zrzuty ekranu", "capture_screenshots", s.capture_screenshots, false)}
+      <label class="wd-radio"><input type="radio" name="wd-disp" data-disp="all" ${s.screenshot_displays !== "primary" ? "checked" : ""}>Wszystkie ekrany</label>
+      <label class="wd-radio"><input type="radio" name="wd-disp" data-disp="primary" ${s.screenshot_displays === "primary" ? "checked" : ""}>Tylko główny</label>
       ${coldNote("screenshot_displays")}
-
-      <hr>
-
-      <div class="row">
-        <label>Napisy na żywo</label>
-        <input type="checkbox" data-key="live_captions" ${s.live_captions ? "checked" : ""}>
-      </div>
-
-      <div class="row">
-        <label>Diaryzacja (kto mówi)</label>
-        <input type="checkbox" data-key="diarize" ${s.diarize ? "checked" : ""}>
-      </div>
-      ${coldNote("diarize")}
-      <div class="row sub">
-        <label>Tryb</label>
-        <select data-key="diarize_mode">
+      ${toggleRow("cc", "Napisy na żywo", "live_captions", s.live_captions, false)}
+      ${toggleRow("diar", "Diaryzacja (kto mówi)", "diarize", s.diarize, true)}
+      <div class="wd-row"><span class="wd-sub-label">Tryb</span>
+        <select class="wd-sel wd-sel-inline" data-key="diarize_mode">
           <option value="hybrid" ${s.diarize_mode === "hybrid" ? "selected" : ""}>hybrid</option>
           <option value="batch" ${s.diarize_mode === "batch" ? "selected" : ""}>batch</option>
           <option value="realtime" ${s.diarize_mode === "realtime" ? "selected" : ""}>realtime</option>
@@ -261,31 +282,26 @@
       </div>
       ${coldNote("diarize_mode")}
 
-      <hr>
+      <div class="wd-div"></div>
 
-      <div class="row">
-        <label>Katalog zapisu</label>
-        <input type="text" data-key="recording_dir" value="${escapeAttr(s.recording_dir || "~/Desktop")}">
-      </div>
+      <div class="wd-row"><span class="wd-ic-slot">${ic("folder")}</span><span class="wd-label">Katalog zapisu</span></div>
+      <div class="wd-field"><input type="text" class="wd-txt-in" data-key="recording_dir" value="${escapeAttr(s.recording_dir || "~/Desktop")}"></div>
       ${coldNote("recording_dir")}
-
-      <div class="row"><label>Formaty</label></div>
-      <div class="formats">${formatBoxes}</div>
+      <div class="wd-row"><span class="wd-ic-slot">${ic("doc")}</span><span class="wd-label">Formaty</span></div>
+      <div class="wd-chips">${chips}</div>
       ${coldNote("recording_formats")}
 
-      <div class="actions">
-        <button class="wd-action ${recordingActive ? "wd-recording" : ""}" data-role="action">
-          ${recordingActive ? "ZATRZYMAJ NAGRYWANIE" : "ROZPOCZNIJ NAGRYWANIE"}
-        </button>
-        <button class="wd-reset" data-role="reset">Przywróć domyślne</button>
-      </div>
+      <div class="wd-div"></div>
+
+      <div class="wd-row wd-click wd-reset" data-role="reset">${ic("reset")}<span class="wd-label">Przywróć domyślne</span></div>
     `;
 
+    // The icon in label-only rows uses a slot wrapper; normalise its class.
+    popEl.querySelectorAll(".wd-ic-slot > .wd-ic").forEach((el) => el.classList.add("wd-ic"));
     wireInputs();
   }
 
   function wireInputs() {
-    // Boolean + string keys
     popEl.querySelectorAll("[data-key]").forEach((el) => {
       el.addEventListener("change", () => {
         const key = el.getAttribute("data-key");
@@ -293,15 +309,11 @@
         else emitPatch({ [key]: el.value });
       });
     });
-
-    // Screenshot displays radios
     popEl.querySelectorAll("[data-disp]").forEach((el) => {
       el.addEventListener("change", () => {
         if (el.checked) emitPatch({ screenshot_displays: el.getAttribute("data-disp") });
       });
     });
-
-    // Recording formats — collect all checked boxes into an array
     popEl.querySelectorAll("[data-fmt]").forEach((el) => {
       el.addEventListener("change", () => {
         const chosen = Array.from(popEl.querySelectorAll("[data-fmt]"))
@@ -310,25 +322,17 @@
         emitPatch({ recording_formats: chosen });
       });
     });
-
     const actionBtn = popEl.querySelector('[data-role="action"]');
-    if (actionBtn) {
-      actionBtn.addEventListener("click", () => {
-        if (typeof onAction === "function") onAction();
-      });
-    }
+    if (actionBtn) actionBtn.addEventListener("click", () => { if (typeof onAction === "function") onAction(); });
     const resetBtn = popEl.querySelector('[data-role="reset"]');
-    if (resetBtn) {
-      resetBtn.addEventListener("click", () => {
-        if (typeof onReset === "function") onReset();
-      });
-    }
+    if (resetBtn) resetBtn.addEventListener("click", () => { if (typeof onReset === "function") onReset(); });
   }
 
   function position() {
     const control = document.getElementById(
       WD.injector ? WD.injector.CONTROL_ID : "wd-control"
     );
+    const width = 340;
     if (!control) {
       popEl.style.left = "50%";
       popEl.style.bottom = "90px";
@@ -336,7 +340,6 @@
       return;
     }
     const rect = control.getBoundingClientRect();
-    const width = 320;
     let left = rect.left + rect.width / 2 - width / 2;
     left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
     popEl.style.left = `${left}px`;
@@ -346,8 +349,6 @@
 
   function show() {
     buildHost();
-    // Repaint on open if a render was deferred while the panel was focused/closed
-    // (finding 6). Rendered before wd-open is set, so isEditingInPanel() is false.
     if (renderPending) render(currentSettings, lastDevices);
     position();
     popEl.classList.add("wd-open");
@@ -365,7 +366,6 @@
     const next = !!active;
     if (next === recordingActive) return;
     recordingActive = next;
-    // Reflect start/stop label + cold-field notes without losing settings.
     if (popEl && currentSettings) render(currentSettings);
   }
 

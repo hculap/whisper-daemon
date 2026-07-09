@@ -240,6 +240,19 @@
     }
 
     try {
+      // The picker blocks on the OS UI for seconds; during that await the
+      // session can be torn down (user stop, menu-bar/remote idle, WD_ERROR,
+      // WD_MEET_LEFT). Those teardowns run while localCapture is null, so they
+      // only flip sessionOwned=false and never see this not-yet-wired capture.
+      // If the session ended while the picker was open, drop the freshly
+      // acquired stream instead of wiring WD_PCM (and possibly WD_START) into a
+      // dead/next session — which would leave an orphaned tab share with no UI
+      // to stop it and block the next start (localCapture stuck non-null).
+      if (resumeSession && !sessionOwned) {
+        try { stream.getTracks().forEach((t) => t.stop()); } catch {}
+        return;
+      }
+
       // We only need audio — drop the video track immediately.
       stream.getVideoTracks().forEach((t) => t.stop());
 

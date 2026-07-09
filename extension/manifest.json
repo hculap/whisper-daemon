@@ -11,6 +11,12 @@
   "content_scripts": [
     {
       "matches": ["https://meet.google.com/*"],
+      "js": ["rtc-tap.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
+    {
+      "matches": ["https://meet.google.com/*"],
       "js": [
         "content.js",
         "wd-logic.js",

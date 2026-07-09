@@ -67,10 +67,21 @@
   // surface or didn't tick "Share tab audio" — otherwise participants are
   // dropped and the transcript fills with hallucinated gibberish. Watch the
   // captured PCM's RMS and warn, clearly and persistently, when it stays silent.
-  const TAB_SILENCE_MS = 8000;
-  const TAB_SILENCE_RMS = 0.004;
+  // A quiet opening is normal — a meeting routinely joins with everyone muted
+  // for far longer than a few seconds. Only a *long* dead window is evidence of
+  // a wrong/silent surface, so the alarm window is generous. Dead captures with
+  // zero audio tracks are already caught synchronously at start.
+  const TAB_SILENCE_MS = 25000;
+  // Match the daemon's keep criterion (RMS_SILENCE_FLOOR): energy below this is
+  // dropped as silence anyway, so it must not count as "audio heard".
+  const TAB_SILENCE_RMS = 0.005;
+  // Require ~1s of contiguous energy (4 × 256ms frames) before trusting the tab
+  // carries real audio — a lone join/notification chime or ambient blip must not
+  // permanently disarm the watch while the daemon still drops every chunk.
+  const TAB_AUDIO_MIN_FRAMES = 4;
   let tabSilenceSince = 0;
-  let tabAudioEverHeard = false; // once true, quiet spells are just quiet
+  let tabAudioFrames = 0; // consecutive frames at/above the floor
+  let tabAudioEverHeard = false; // set only after sustained energy — then quiet is just quiet
   let bannerEl = null;
 
   function showBanner(text) {
@@ -79,7 +90,10 @@
       Object.assign(bannerEl.style, {
         position: "fixed", bottom: "96px", left: "50%",
         transform: "translateX(-50%)", zIndex: "2147483647",
-        background: "rgba(217,48,37,0.96)", color: "#fff",
+        // Amber advisory, not an alarming red stop-now banner: capture may well
+        // be healthy (pre-speech silence is indistinguishable from a dead tab by
+        // RMS alone), so this nudges the user to verify rather than to react.
+        background: "rgba(249,171,0,0.96)", color: "#202124",
         padding: "10px 16px", borderRadius: "8px", maxWidth: "90vw",
         textAlign: "center", fontFamily: "Roboto, Arial, sans-serif",
         fontSize: "13px", boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
@@ -95,28 +109,37 @@
 
   function resetSilenceWatch() {
     tabAudioEverHeard = false;
+    tabAudioFrames = 0;
     clearBanner();
   }
 
   function checkTabSilence(f32) {
-    // Only diagnose a dead capture: once real audio has been heard, the tab is
-    // proven to carry sound and later quiet spells are just nobody talking — do
-    // not flip the warning on during natural pauses.
+    // Only diagnose a dead capture: once *sustained* real audio has been heard
+    // the tab is proven to carry participant sound and later quiet spells are
+    // just nobody talking — do not flip the warning on during natural pauses.
     if (tabAudioEverHeard) return;
     let sum = 0;
     for (let i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
     const rms = Math.sqrt(sum / f32.length);
-    if (rms > TAB_SILENCE_RMS) {
-      tabAudioEverHeard = true;
-      clearBanner();
+    if (rms >= TAB_SILENCE_RMS) {
+      // Above the daemon's floor — but require a contiguous run so a single
+      // chime/blip can't latch the watch off while chunks are still dropped.
+      if (++tabAudioFrames >= TAB_AUDIO_MIN_FRAMES) {
+        tabAudioEverHeard = true;
+        clearBanner();
+      }
       return;
     }
+    // A sub-floor frame breaks the run — sustained energy must be contiguous.
+    tabAudioFrames = 0;
     const now = Date.now();
     if (!tabSilenceSince) tabSilenceSince = now;
     else if (now - tabSilenceSince > TAB_SILENCE_MS) {
       showBanner(
-        "🔇 Nie słychać uczestników. Zatrzymaj, kliknij nagrywanie ponownie i " +
-        "udostępnij kartę Meet z zaznaczonym „Udostępnij dźwięk karty”."
+        "🔇 Nie słychać uczestników. Najczęstsza przyczyna: w Meet głośnik jest " +
+        "ustawiony na słuchawki/urządzenie inne niż „Domyślny” — Chrome nie nagrywa " +
+        "wtedy dźwięku karty. Ustaw głośnik Meet na „Domyślny”. Sprawdź też " +
+        "„Udostępnij dźwięk karty”. Jeśli dźwięk działa, zignoruj."
       );
     }
   }
@@ -156,11 +179,13 @@
       let stream;
       try {
         // preferCurrentTab / selfBrowserSurface / systemAudio are TOP-LEVEL
-        // DisplayMediaStreamOptions — putting preferCurrentTab under `video`
-        // (as before) is ignored, so the user got the full screen/window/tab
-        // picker and could share a surface with no audio (macOS window/screen
-        // capture carries no audio), leaving participants silent. Pinning the
-        // current tab keeps its audio in the capture.
+        // DisplayMediaStreamOptions (nesting preferCurrentTab under `video` made
+        // it a no-op). Scoping the prompt to the current tab removes the whole
+        // class of wrong-surface picks. NOTE: this does NOT guarantee non-silent
+        // audio — a live-but-silent tab-audio track is the usual failure (see the
+        // silence watch + banner below), most often because Meet's speaker output
+        // is routed to a non-default device (Chromium's tab capture omits audio
+        // rendered to a device set via setSinkId).
         stream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: true,
@@ -185,6 +210,23 @@
           injector.setButtonState("idle");
           return;
         }
+
+        // Instrument the captured track so a future silent-capture is diagnosable
+        // from the console (distinguishes a muted/zeroed sink-routing track from
+        // attenuated audio, which the daemon's RMS log cannot tell apart).
+        const audioTrack = stream.getAudioTracks()[0];
+        try {
+          console.info("wd: tab audio track", {
+            muted: audioTrack.muted,
+            readyState: audioTrack.readyState,
+            settings: audioTrack.getSettings ? audioTrack.getSettings() : null,
+          });
+        } catch (err) {
+          console.warn("wd: getSettings failed", err);
+        }
+        audioTrack.onmute = () =>
+          console.warn("wd: tab audio MUTED — Meet speaker likely on a non-default device");
+        audioTrack.onunmute = () => console.info("wd: tab audio unmuted");
 
         const audioContext = new AudioContext({ sampleRate: 16000 });
         const source = audioContext.createMediaStreamSource(stream);

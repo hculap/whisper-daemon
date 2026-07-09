@@ -12,11 +12,23 @@ CONFIG_FILE = CONFIG_DIR / "config.toml"
 
 VALID_FORMATS = {"txt", "srt", "vtt", "json"}
 VALID_SCREENSHOT_DISPLAYS = {"all", "primary"}
+# "auto" = let Whisper detect per chunk (unreliable on short/quiet audio, which
+# is why forcing a language exists). The codes are a curated subset of Whisper's
+# supported languages, enough for the common meeting cases.
+VALID_LANGUAGES = {
+    "auto", "en", "pl", "de", "es", "fr", "it", "pt", "nl",
+    "uk", "ru", "cs", "sk", "sv", "no", "da", "fi",
+}
 
 
 def _validate_screenshot_displays(value: str) -> str:
     """Coerce screenshot_displays to a valid value, defaulting to 'all'."""
     return value if value in VALID_SCREENSHOT_DISPLAYS else "all"
+
+
+def _validate_language(value: str) -> str:
+    """Coerce a transcription language to a valid code, defaulting to 'auto'."""
+    return value if value in VALID_LANGUAGES else "auto"
 
 
 _TOML_SIMPLE_ESCAPES = {
@@ -64,6 +76,7 @@ class Settings:
     capture_mic: bool = True  # capture local microphone during meetings
     capture_tab: bool = True  # capture browser tab audio during meetings
     live_captions: bool = False  # show live captions in the extension UI
+    recording_language: str = "auto"  # forced transcription language; "auto" = detect
     screenshot_displays: str = "all"  # "all" or "primary"
     save_audio: bool = False  # save raw audio alongside transcripts
     capture_screenshots: bool = False  # capture screenshots during recording
@@ -111,6 +124,7 @@ def load_settings() -> Settings:
             capture_mic=rec.get("capture_mic", True),
             capture_tab=rec.get("capture_tab", True),
             live_captions=rec.get("live_captions", False),
+            recording_language=_validate_language(rec.get("language", "auto")),
             screenshot_displays=_validate_screenshot_displays(
                 rec.get("screenshot_displays", "all")
             ),
@@ -149,6 +163,7 @@ def save_settings(settings: Settings) -> None:
         f'capture_mic = {"true" if settings.capture_mic else "false"}',
         f'capture_tab = {"true" if settings.capture_tab else "false"}',
         f'live_captions = {"true" if settings.live_captions else "false"}',
+        f"language = {_toml_str(settings.recording_language)}",
         f"screenshot_displays = {_toml_str(settings.screenshot_displays)}",
         f'save_audio = {"true" if settings.save_audio else "false"}',
         f'capture_screenshots = {"true" if settings.capture_screenshots else "false"}',

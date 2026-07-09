@@ -118,12 +118,19 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL) -> str:
         return ""
 
 
-def transcribe_full(audio: np.ndarray, model: str = DEFAULT_MODEL) -> dict:
+def transcribe_full(
+    audio: np.ndarray,
+    model: str = DEFAULT_MODEL,
+    language: str | None = None,
+) -> dict:
     """Transcribe audio array and return the full result dict with segments.
 
     Args:
         audio: 1D float32 numpy array, 16kHz mono.
         model: HuggingFace model repo ID.
+        language: Force a language code, or None to auto-detect. Forcing avoids
+            per-chunk language misdetection (short/quiet meeting chunks otherwise
+            come back as Icelandic/Russian/etc.).
 
     Returns:
         Dict with keys: text, segments, language.
@@ -136,18 +143,21 @@ def transcribe_full(audio: np.ndarray, model: str = DEFAULT_MODEL) -> dict:
     if len(audio) < min_samples:
         audio = np.pad(audio, (0, min_samples - len(audio)))
 
+    kwargs: dict = {
+        "path_or_hf_repo": model,
+        "temperature": 0,
+        "condition_on_previous_text": False,
+        "word_timestamps": False,
+    }
+    if language:
+        kwargs["language"] = language
+
     try:
         logger.info("Transcribing %.1fs of audio...", len(audio) / 16000)
         with MLX_LOCK:
             watchdog = _hang_watchdog(len(audio) / 16000)
             try:
-                result = mlx_whisper.transcribe(
-                    audio,
-                    path_or_hf_repo=model,
-                    temperature=0,
-                    condition_on_previous_text=False,
-                    word_timestamps=False,
-                )
+                result = mlx_whisper.transcribe(audio, **kwargs)
             finally:
                 watchdog.cancel()
         # Strip leading whitespace from segment texts

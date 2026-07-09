@@ -14,7 +14,12 @@ from __future__ import annotations
 import dataclasses
 import json
 
-from .config import VALID_FORMATS, VALID_SCREENSHOT_DISPLAYS, Settings
+from .config import (
+    VALID_FORMATS,
+    VALID_LANGUAGES,
+    VALID_SCREENSHOT_DISPLAYS,
+    Settings,
+)
 
 ALLOWED_ORIGIN_PREFIX = "chrome-extension://"
 
@@ -78,6 +83,7 @@ def settings_to_dict(s: Settings) -> dict:
         "capture_screenshots": s.capture_screenshots,
         "screenshot_displays": s.screenshot_displays,
         "live_captions": s.live_captions,
+        "recording_language": s.recording_language,
         "diarize": s.diarize,
         "diarize_mode": s.diarize_mode,
         "recording_dir": s.recording_dir,
@@ -150,6 +156,9 @@ def apply_settings_patch(s: Settings, patch: dict) -> Settings:
                 updates[key] = value
         elif key == "diarize_mode":
             if isinstance(value, str) and value in _VALID_DIARIZE_MODES:
+                updates[key] = value
+        elif key == "recording_language":
+            if isinstance(value, str) and value in VALID_LANGUAGES:
                 updates[key] = value
         elif key == "recording_formats":
             updates[key] = _clean_formats(value, s.recording_formats)

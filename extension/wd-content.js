@@ -62,6 +62,65 @@
     }
   }
 
+  // --- "No participant audio" banner (persistent, unlike toast) ---
+  // The shared-tab audio can be dead silence if the user shared the wrong
+  // surface or didn't tick "Share tab audio" — otherwise participants are
+  // dropped and the transcript fills with hallucinated gibberish. Watch the
+  // captured PCM's RMS and warn, clearly and persistently, when it stays silent.
+  const TAB_SILENCE_MS = 8000;
+  const TAB_SILENCE_RMS = 0.004;
+  let tabSilenceSince = 0;
+  let tabAudioEverHeard = false; // once true, quiet spells are just quiet
+  let bannerEl = null;
+
+  function showBanner(text) {
+    if (!bannerEl) {
+      bannerEl = document.createElement("div");
+      Object.assign(bannerEl.style, {
+        position: "fixed", bottom: "96px", left: "50%",
+        transform: "translateX(-50%)", zIndex: "2147483647",
+        background: "rgba(217,48,37,0.96)", color: "#fff",
+        padding: "10px 16px", borderRadius: "8px", maxWidth: "90vw",
+        textAlign: "center", fontFamily: "Roboto, Arial, sans-serif",
+        fontSize: "13px", boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
+      });
+      document.body.appendChild(bannerEl);
+    }
+    bannerEl.textContent = text;
+  }
+  function clearBanner() {
+    tabSilenceSince = 0;
+    if (bannerEl) { bannerEl.remove(); bannerEl = null; }
+  }
+
+  function resetSilenceWatch() {
+    tabAudioEverHeard = false;
+    clearBanner();
+  }
+
+  function checkTabSilence(f32) {
+    // Only diagnose a dead capture: once real audio has been heard, the tab is
+    // proven to carry sound and later quiet spells are just nobody talking — do
+    // not flip the warning on during natural pauses.
+    if (tabAudioEverHeard) return;
+    let sum = 0;
+    for (let i = 0; i < f32.length; i++) sum += f32[i] * f32[i];
+    const rms = Math.sqrt(sum / f32.length);
+    if (rms > TAB_SILENCE_RMS) {
+      tabAudioEverHeard = true;
+      clearBanner();
+      return;
+    }
+    const now = Date.now();
+    if (!tabSilenceSince) tabSilenceSince = now;
+    else if (now - tabSilenceSince > TAB_SILENCE_MS) {
+      showBanner(
+        "🔇 Nie słychać uczestników. Zatrzymaj, kliknij nagrywanie ponownie i " +
+        "udostępnij kartę Meet z zaznaczonym „Udostępnij dźwięk karty”."
+      );
+    }
+  }
+
   // --- Capture (page gesture required, runs in content script) ---
   async function startCapture() {
     // Re-entrancy guard (F4): a double click or a WD_COMMAND_TOGGLE while the
@@ -96,9 +155,18 @@
 
       let stream;
       try {
+        // preferCurrentTab / selfBrowserSurface / systemAudio are TOP-LEVEL
+        // DisplayMediaStreamOptions — putting preferCurrentTab under `video`
+        // (as before) is ignored, so the user got the full screen/window/tab
+        // picker and could share a surface with no audio (macOS window/screen
+        // capture carries no audio), leaving participants silent. Pinning the
+        // current tab keeps its audio in the capture.
         stream = await navigator.mediaDevices.getDisplayMedia({
-          video: { preferCurrentTab: true },
+          video: true,
           audio: true,
+          preferCurrentTab: true,
+          selfBrowserSurface: "include",
+          systemAudio: "include",
         });
       } catch (err) {
         console.warn("wd: getDisplayMedia denied", err);
@@ -127,8 +195,10 @@
         source.connect(worklet);
         // Do NOT connect to destination — avoid echoing meeting audio locally.
 
+        resetSilenceWatch(); // fresh session — re-arm the dead-capture watch
         worklet.port.onmessage = (event) => {
           const f32 = event.data;
+          checkTabSilence(f32); // warn if the shared tab has no participant audio
           // runtime messaging serializes via JSON, so ship a plain number array.
           chrome.runtime.sendMessage({ type: "WD_PCM", samples: Array.from(f32) });
         };
@@ -155,6 +225,7 @@
   }
 
   function teardownLocalCapture() {
+    clearBanner();
     if (!localCapture) return;
     const { audioContext, stream, worklet } = localCapture;
     localCapture = null;
@@ -199,6 +270,7 @@
     capture_screenshots: false,
     screenshot_displays: "all",
     live_captions: false,
+    recording_language: "auto",
     diarize: false,
     diarize_mode: "hybrid",
     recording_dir: "~/Desktop",

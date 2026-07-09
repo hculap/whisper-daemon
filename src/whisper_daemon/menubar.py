@@ -878,6 +878,13 @@ class MenuBarDelegate(NSObject):
         capture_screenshots = self._settings.capture_screenshots
         screenshot_displays = self._settings.screenshot_displays
         screenshot_interval = self._settings.screenshot_interval
+        # "auto" -> None so Whisper auto-detects; otherwise force the language so
+        # short/quiet chunks stop coming back as the wrong language (Icelandic,
+        # Russian, …) in the live captions and saved transcript.
+        language = (
+            None if self._settings.recording_language == "auto"
+            else self._settings.recording_language
+        )
 
         # Mic recorder (local device) — only when capture_mic is enabled.
         mic_recorder: MeetingRecorder | None = None
@@ -1098,7 +1105,7 @@ class MenuBarDelegate(NSObject):
                         all_audio.append(chunk.audio.copy())
                     cn = chunk_count  # capture for closure
                     def _transcribe_and_track(audio, m, n):
-                        result = transcribe_full(audio, m)
+                        result = transcribe_full(audio, m, language)
                         segs = len(result.get("segments", []))
                         chars = len(result.get("text", ""))
                         telemetry.meeting_chunk_transcribed(n, chars, segs)
@@ -1144,7 +1151,7 @@ class MenuBarDelegate(NSObject):
                     chunk_count += 1
                     if save_audio or diarize:
                         all_audio.append(chunk.audio.copy())
-                    result = transcribe_full(chunk.audio, model)
+                    result = transcribe_full(chunk.audio, model, language)
                     if result.get("text", "").strip():
                         all_results.append((chunk.start_time, result))
 

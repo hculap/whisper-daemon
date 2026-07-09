@@ -13,6 +13,15 @@
 
   const HOST_ID = "wd-panel-host";
   const FORMATS = ["txt", "srt", "vtt", "json"];
+  // Curated subset of Whisper languages; "auto" detects per chunk (unreliable on
+  // short audio — forcing a language stops the wrong-language captions).
+  const LANGUAGES = [
+    ["auto", "Wykryj automatycznie"], ["pl", "Polski"], ["en", "English"],
+    ["de", "Deutsch"], ["es", "Español"], ["fr", "Français"], ["it", "Italiano"],
+    ["nl", "Nederlands"], ["uk", "Українська"], ["ru", "Русский"],
+    ["cs", "Čeština"], ["sk", "Slovenčina"], ["sv", "Svenska"],
+    ["no", "Norsk"], ["da", "Dansk"], ["fi", "Suomi"],
+  ];
 
   // Outline icons (Google-Symbols-like) drawn with currentColor strokes; the
   // record glyph is a filled dot. Kept inline so nothing loads over the network.
@@ -24,6 +33,7 @@
     shot: '<rect x="3" y="6" width="18" height="13" rx="2.5"/><circle cx="12" cy="12.5" r="3.4"/>',
     cc: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M7.5 13h3"/><path d="M13.5 13h3.5"/>',
     diar: '<circle cx="9" cy="9" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 8a3.6 3.6 0 0 1 0 8"/><path d="M18.4 6a6.8 6.8 0 0 1 0 12"/>',
+    lang: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.5 2.4 3.8 5.6 3.8 9s-1.3 6.6-3.8 9c-2.5-2.4-3.8-5.6-3.8-9S9.5 5.4 12 3z"/>',
     folder: '<path d="M3.5 7a2 2 0 0 1 2-2h3.2l2 2H18.5a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
     doc: '<path d="M7 3.5h7l4 4V19a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M13.5 3.5V8H18"/><path d="M9 13h6"/><path d="M9 16h4"/>',
     reset: '<path d="M12 6V3L7.5 7.5 12 12V9a4.5 4.5 0 1 1-4.5 4.5"/>',
@@ -212,6 +222,13 @@
     return opts.join("");
   }
 
+  function languageOptions(selected) {
+    const sel = selected || "auto";
+    return LANGUAGES.map(
+      ([code, name]) => `<option value="${code}"${code === sel ? " selected" : ""}>${name}</option>`
+    ).join("");
+  }
+
   function escapeHtml(s) {
     return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
   }
@@ -262,6 +279,10 @@
       <div class="wd-row"><span class="wd-ic-slot">${ic("mic")}</span><span class="wd-label">Mikrofon</span></div>
       <div class="wd-field"><select class="wd-sel" data-key="recording_device">${devicesOptions(devices, s.recording_device || "")}</select></div>
       ${coldNote("recording_device")}
+
+      <div class="wd-row"><span class="wd-ic-slot">${ic("lang")}</span><span class="wd-label">Język transkrypcji</span></div>
+      <div class="wd-field"><select class="wd-sel" data-key="recording_language">${languageOptions(s.recording_language)}</select></div>
+      ${coldNote("recording_language")}
       ${toggleRow("me", "Nagrywaj mnie (Ja)", "capture_mic", s.capture_mic, true)}
       ${toggleRow("people", "Nagrywaj uczestników", "capture_tab", s.capture_tab, true)}
 

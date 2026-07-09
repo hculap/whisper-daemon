@@ -139,3 +139,21 @@ def test_screenshot_displays_validator_valid(tmp_path, monkeypatch):
     )
     loaded = config_mod.load_settings()
     assert loaded.screenshot_displays == "primary"
+
+
+def test_recording_language_default_is_auto():
+    assert Settings().recording_language == "auto"
+
+
+def test_recording_language_round_trip(tmp_path, monkeypatch):
+    _reload_config_with_dir(tmp_path, monkeypatch)
+    config_mod.save_settings(Settings(recording_language="pl"))
+    assert config_mod.load_settings().recording_language == "pl"
+
+
+def test_recording_language_invalid_coerced_to_auto(tmp_path, monkeypatch):
+    _reload_config_with_dir(tmp_path, monkeypatch)
+    (tmp_path / "config.toml").write_text(
+        '[recording]\nlanguage = "klingon"\n', encoding="utf-8"
+    )
+    assert config_mod.load_settings().recording_language == "auto"

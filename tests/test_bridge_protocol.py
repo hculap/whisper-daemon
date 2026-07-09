@@ -39,6 +39,7 @@ def test_settings_to_dict_exact_keys():
         "capture_screenshots",
         "screenshot_displays",
         "live_captions",
+        "recording_language",
         "diarize",
         "diarize_mode",
         "recording_dir",
@@ -306,3 +307,19 @@ def test_apply_patch_never_mutates_via_replace():
         if getattr(s, f.name) != getattr(result, f.name)
     }
     assert changed == {"diarize"}
+
+
+def test_settings_to_dict_includes_language():
+    assert bp.settings_to_dict(Settings())["recording_language"] == "auto"
+
+
+def test_apply_patch_accepts_valid_language():
+    s = Settings()
+    assert bp.apply_settings_patch(s, {"recording_language": "pl"}).recording_language == "pl"
+
+
+def test_apply_patch_rejects_invalid_language():
+    s = Settings(recording_language="pl")
+    # unknown code is skipped — the old value is kept
+    assert bp.apply_settings_patch(s, {"recording_language": "xx"}).recording_language == "pl"
+    assert bp.apply_settings_patch(s, {"recording_language": 5}).recording_language == "pl"

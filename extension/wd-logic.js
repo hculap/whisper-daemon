@@ -11,6 +11,7 @@
 // Cold settings only take effect on the NEXT recording; hot settings apply live.
 const COLD_SETTINGS = Object.freeze([
   "recording_device",
+  "recording_language",
   "recording_formats",
   "recording_dir",
   "diarize",

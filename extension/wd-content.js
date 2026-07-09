@@ -199,6 +199,7 @@
     capture_screenshots: false,
     screenshot_displays: "all",
     live_captions: false,
+    recording_language: "auto",
     diarize: false,
     diarize_mode: "hybrid",
     recording_dir: "~/Desktop",

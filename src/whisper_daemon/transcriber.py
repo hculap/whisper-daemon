@@ -8,6 +8,7 @@ import mlx_whisper
 import numpy as np
 
 from whisper_daemon.ffmpeg_path import ensure_ffmpeg_on_path
+from whisper_daemon.text_cleanup import collapse_repetitions
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +110,7 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL) -> str:
                 )
             finally:
                 watchdog.cancel()
-        text = result.get("text", "").strip()
+        text = collapse_repetitions(result.get("text", "").strip())
         language = result.get("language", "unknown")
         logger.info("Transcription done — lang=%s, len=%d chars", language, len(text))
         return text
@@ -162,8 +163,8 @@ def transcribe_full(
                 watchdog.cancel()
         # Strip leading whitespace from segment texts
         for seg in result.get("segments", []):
-            seg["text"] = seg["text"].strip()
-        result["text"] = result.get("text", "").strip()
+            seg["text"] = collapse_repetitions(seg["text"].strip())
+        result["text"] = collapse_repetitions(result.get("text", "").strip())
 
         logger.info(
             "Transcription done — lang=%s, %d chars, %d segments",
@@ -223,6 +224,9 @@ def transcribe_file(
             result = mlx_whisper.transcribe(audio, **kwargs)
         finally:
             watchdog.cancel()
+    for seg in result.get("segments", []):
+        seg["text"] = collapse_repetitions(seg.get("text", "").strip())
+    result["text"] = collapse_repetitions(result.get("text", "").strip())
     language_detected = result.get("language", "unknown")
     text_len = len(result.get("text", ""))
     segments_count = len(result.get("segments", []))

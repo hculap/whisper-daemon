@@ -91,7 +91,8 @@
       bandEl.appendChild(div);
     }
     requestAnimationFrame(() => {
-      bandEl.querySelectorAll(".wd-line").forEach((el) => el.classList.add("wd-in"));
+      // teardown() (on MEET_LEFT) can null bandEl before this frame runs.
+      if (bandEl) bandEl.querySelectorAll(".wd-line").forEach((el) => el.classList.add("wd-in"));
     });
     apply();
   }

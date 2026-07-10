@@ -21,6 +21,15 @@
     return;
   }
 
+  // Orphaned content scripts (after an extension reload) throw "Extension context
+  // invalidated" on any chrome.* call — the 4x/sec WD_PCM relay would spam it.
+  // Route every send through a guard that no-ops once the context is gone.
+  const _rawSend = chrome.runtime.sendMessage.bind(chrome.runtime);
+  function wdSend(message) {
+    if (!(chrome.runtime && chrome.runtime.id)) return;
+    try { _rawSend(message); } catch (err) { /* orphaned after reload */ }
+  }
+
   // --- Local state (UI mirrors daemon; capture ownership is local) ---
   let daemonState = "idle"; // idle | recording | transcribing
   let lastElapsed = 0; // last elapsed seconds from a status push (for reinject)
@@ -174,7 +183,7 @@
     // Defer: (re)request settings and bail so the click can be retried once they
     // land.
     if (currentSettings === null) {
-      chrome.runtime.sendMessage({ type: "WD_GET_SETTINGS" });
+      wdSend({ type: "WD_GET_SETTINGS" });
       toast("Ładowanie ustawień — spróbuj ponownie za chwilę");
       return;
     }
@@ -186,7 +195,7 @@
       if (!captureTab) {
         const { title, url } = meetingMeta();
         sessionOwned = true;
-        chrome.runtime.sendMessage({ type: "WD_START", title, url });
+        wdSend({ type: "WD_START", title, url });
         return;
       }
 
@@ -205,7 +214,7 @@
       // Button-gesture-initiated: the START reaches rtc-tap.js inside the click,
       // so AudioContext.resume() is allowed to un-suspend.
       window.postMessage({ source: "wd", type: "WD_RTC_START" }, location.origin);
-      chrome.runtime.sendMessage({ type: "WD_START", title, url });
+      wdSend({ type: "WD_START", title, url });
     } finally {
       starting = false;
     }
@@ -292,7 +301,7 @@
         const f32 = event.data;
         checkTabSilence(f32); // warn if the shared tab has no participant audio
         // runtime messaging serializes via JSON, so ship a plain number array.
-        chrome.runtime.sendMessage({ type: "WD_PCM", samples: Array.from(f32) });
+        wdSend({ type: "WD_PCM", samples: Array.from(f32) });
       };
 
       // The user (or another audio track) ending the share stops recording.
@@ -305,7 +314,7 @@
       if (!resumeSession) {
         const { title, url } = meetingMeta();
         sessionOwned = true;
-        chrome.runtime.sendMessage({ type: "WD_START", title, url });
+        wdSend({ type: "WD_START", title, url });
       }
     } catch (err) {
       console.error("wd: startDisplayMediaCapture failed", err);
@@ -386,10 +395,10 @@
     teardownLocalCapture(); // no-op for a mic-only or menu-bar meeting
     if (owned) {
       // We started this meeting (tab OR mic-only) — end it via WD_STOP.
-      chrome.runtime.sendMessage({ type: "WD_STOP" });
+      wdSend({ type: "WD_STOP" });
     } else {
       // Meeting was started elsewhere (menu bar) — stop it at the daemon.
-      chrome.runtime.sendMessage({ type: "WD_STOP_MEETING" });
+      wdSend({ type: "WD_STOP_MEETING" });
     }
     // Optimistic instant feedback: the socket stays open, so the daemon's real
     // transcribing→idle status will correct this shortly.
@@ -406,7 +415,7 @@
   // --- Settings patch flow ---
   function sendPatch(patch) {
     if (!patch || !Object.keys(patch).length) return;
-    chrome.runtime.sendMessage({ type: "WD_SET_SETTINGS", patch });
+    wdSend({ type: "WD_SET_SETTINGS", patch });
   }
 
   const DEFAULT_SETTINGS = {
@@ -509,7 +518,7 @@
       if (!Array.isArray(data.samples) || data.samples.length === 0) return;
       checkTabSilence(Float32Array.from(data.samples)); // dead-capture watch
       // Same relay the worklet path uses; the array is already JSON-safe.
-      chrome.runtime.sendMessage({ type: "WD_PCM", samples: data.samples });
+      wdSend({ type: "WD_PCM", samples: data.samples });
     } else if (data.type === "WD_RTC_STATE") {
       remoteTrackCount = typeof data.tracks === "number" ? data.tracks : remoteTrackCount;
       handleRtcState();
@@ -545,7 +554,7 @@
     panel.init({ onPatch: sendPatch, onAction: onToggle, onReset });
     reinject();
     injector.startObserver(reinject);
-    chrome.runtime.sendMessage({ type: "WD_GET_SETTINGS" });
+    wdSend({ type: "WD_GET_SETTINGS" });
   }
 
   // Re-join in the same tab: rebuild everything.

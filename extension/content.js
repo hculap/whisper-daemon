@@ -7,8 +7,42 @@
 
 let meetingActive = false;
 let debounceTimer = null;
+let pollTimer = null;
+
+// After the extension is reloaded/updated, content scripts already running on
+// open Meet tabs are ORPHANED: chrome.runtime is gone, so any sendMessage throws
+// "Extension context invalidated". Detect that, stop all timers/observers, and
+// bail quietly instead of spamming the console every 3s.
+function contextValid() {
+  return !!(chrome.runtime && chrome.runtime.id);
+}
+
+function stopAll() {
+  try { observer.disconnect(); } catch {}
+  if (pollTimer) clearInterval(pollTimer);
+  if (debounceTimer) clearTimeout(debounceTimer);
+  pollTimer = null;
+}
+
+function send(message) {
+  if (!contextValid()) {
+    stopAll();
+    return;
+  }
+  try {
+    chrome.runtime.sendMessage(message);
+  } catch (err) {
+    // Orphaned after a reload — stop cleanly.
+    stopAll();
+  }
+}
 
 function checkMeetingState() {
+  if (!contextValid()) {
+    stopAll();
+    return;
+  }
+
   const leaveBtn = document.querySelector(
     '[aria-label*="Leave call"], [aria-label*="Leave the call"], [aria-label*="Opuść"]'
   );
@@ -21,15 +55,10 @@ function checkMeetingState() {
       document.querySelector("[data-meeting-title]")?.getAttribute("data-meeting-title") ||
       document.title.replace(" - Google Meet", "").trim();
 
-    chrome.runtime.sendMessage({
-      type: "MEET_JOINED",
-      title,
-      url: location.href,
-    });
-
+    send({ type: "MEET_JOINED", title, url: location.href });
   } else if (!isActive && meetingActive) {
     meetingActive = false;
-    chrome.runtime.sendMessage({ type: "MEET_LEFT" });
+    send({ type: "MEET_LEFT" });
   }
 }
 
@@ -39,8 +68,10 @@ function debouncedCheck() {
 }
 
 const observer = new MutationObserver(debouncedCheck);
-observer.observe(document.body, { childList: true, subtree: true });
+if (document.body) {
+  observer.observe(document.body, { childList: true, subtree: true });
+}
 
 // Initial check + fallback polling (Meet is a SPA)
 checkMeetingState();
-setInterval(checkMeetingState, 3000);
+pollTimer = setInterval(checkMeetingState, 3000);

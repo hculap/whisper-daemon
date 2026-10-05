@@ -1,8 +1,11 @@
-"""Global hotkey listener using NSEvent (replaces pynput GlobalHotKeys).
+"""Global hotkey listener: Carbon hot key for record, NSEvent monitor for the rest.
 
-NSEvent global monitors are compatible with the AppKit main-thread run loop
-and avoid the pynput/Python 3.14 signature mismatch that silently kills
-the listener thread.
+Record (Cmd+Shift+Space) is a Carbon RegisterEventHotKey because it is the
+only mechanism that survives Secure Keyboard Entry (password fields, iTerm2
+auto secure input) — the NSEvent global monitor goes silently deaf then.
+Paste-last and copy-and-speak stay on the passive NSEvent monitor: Carbon
+consumes its combos, which would break Cmd+Shift+V / Cmd+Shift+C in other
+apps. If Carbon registration fails, record falls back to the monitor too.
 """
 
 import logging
@@ -20,7 +23,10 @@ from AppKit import (
     NSWorkspace,
 )
 
+from whisper_daemon import secure_input
+from whisper_daemon.carbon_hotkey import CMD_KEY, SHIFT_KEY, CarbonHotkeys
 from whisper_daemon.events import Event, EventType
+from whisper_daemon.notify import notify
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +42,7 @@ HOTKEY_DESCRIPTIONS = {
 
 HEARTBEAT_INTERVAL_S = 600.0  # 10 minutes
 REINSTALL_EVERY_BEATS = 36  # reinstall the monitor every 36 beats = 6h
+SECURE_INPUT_POLL_S = 15.0  # how fast a Secure-Input block gets reported
 
 
 class _WakeObserver(NSObject):
@@ -77,6 +84,10 @@ class HotkeyListener:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._last_event_at: float = 0.0
+        self._secure_watch = secure_input.SecureInputWatch()
+        self._secure_holder_pid: int | None = None
+        self._carbon = CarbonHotkeys()
+        self._record_via_carbon = False
 
     def _handle_key(self, ns_event: object) -> None:
         flags = ns_event.modifierFlags()
@@ -89,14 +100,32 @@ class HotkeyListener:
         self._last_event_at = time.monotonic()
 
         if keycode == RECORD_COMBO[1]:
-            logger.info("Hotkey: record toggle")
-            self._queue.put(Event(EventType.RECORD_TOGGLE))
+            if not self._record_via_carbon:
+                self._on_record()
         elif keycode == PASTE_LAST_COMBO[1]:
             logger.info("Hotkey: paste last transcription")
             self._queue.put(Event(EventType.PASTE_LAST))
         elif keycode == SPEAK_COMBO[1]:
             logger.info("Hotkey: copy & speak")
             self._queue.put(Event(EventType.SPEAK_CLIPBOARD))
+
+    def _on_record(self) -> None:
+        self._last_event_at = time.monotonic()
+        logger.info("Hotkey: record toggle")
+        self._queue.put(Event(EventType.RECORD_TOGGLE))
+
+    def _register_carbon_record(self) -> None:
+        try:
+            self._carbon.register(
+                RECORD_COMBO[1], CMD_KEY | SHIFT_KEY, self._on_record,
+            )
+            self._record_via_carbon = True
+        except OSError:
+            logger.exception(
+                "Carbon record hotkey unavailable — falling back to NSEvent "
+                "monitor (record will not work under Secure Keyboard Entry)"
+            )
+            self._record_via_carbon = False
 
     def _install_monitor(self) -> None:
         if self._monitor is not None:
@@ -114,14 +143,61 @@ class HotkeyListener:
         logger.info("Hotkey: system wake — reinstalling global monitor")
         self._install_monitor()
 
+    def _check_secure_input(self) -> None:
+        """Log Secure Input changes; notify only if it blocks the record hotkey."""
+        change = self._secure_watch.poll()
+        if change == "cleared":
+            self._secure_holder_pid = None
+            logger.info("Secure Keyboard Entry released — all hotkeys active")
+            return
+        if not self._secure_watch.blocked:
+            return
+        # Re-resolve while blocked: the holder can hand over (e.g. Chrome
+        # quits, iTerm2 takes it) without the flag ever dropping.
+        holder = secure_input.find_holder()
+        holder_pid = holder.pid if holder else None
+        if change != "blocked" and holder_pid == self._secure_holder_pid:
+            return
+        self._secure_holder_pid = holder_pid
+
+        if holder is None:
+            who = "another app"
+        elif holder.alive:
+            who = f"{holder.app} (pid {holder.pid})"
+        else:
+            who = f"exited pid {holder.pid} — stuck flag, lock/unlock screen to reset"
+
+        if self._record_via_carbon:
+            logger.info(
+                "Secure Keyboard Entry held by %s — Cmd+Shift+V/C paused, "
+                "record hotkey unaffected", who,
+            )
+            return
+
+        logger.warning("Hotkeys BLOCKED — Secure Keyboard Entry held by %s", who)
+        from PyObjCTools import AppHelper
+
+        AppHelper.callAfter(
+            notify, "whisper-daemon", "Hotkeys blocked",
+            f"Secure Keyboard Entry held by {who}.",
+        )
+
     def _heartbeat_loop(self) -> None:
         beats = 0
-        while not self._heartbeat_stop.wait(HEARTBEAT_INTERVAL_S):
+        ticks_per_beat = max(1, round(HEARTBEAT_INTERVAL_S / SECURE_INPUT_POLL_S))
+        ticks = 0
+        self._check_secure_input()
+        while not self._heartbeat_stop.wait(SECURE_INPUT_POLL_S):
+            self._check_secure_input()
+            ticks += 1
+            if ticks % ticks_per_beat:
+                continue
             beats += 1
             since = time.monotonic() - self._last_event_at if self._last_event_at else -1
             logger.info(
-                "Hotkey heartbeat — monitor=%s, last_event=%s",
+                "Hotkey heartbeat — monitor=%s, secure_input=%s, last_event=%s",
                 "alive" if self._monitor is not None else "none",
+                "BLOCKING" if self._secure_watch.blocked else "off",
                 f"{since:.0f}s ago" if since >= 0 else "never",
             )
             # Periodic reinstall: the monitor can die without any wake
@@ -135,6 +211,7 @@ class HotkeyListener:
                 AppHelper.callAfter(self._install_monitor)
 
     def start(self) -> None:
+        self._register_carbon_record()
         self._install_monitor()
 
         self._wake_observer = _WakeObserver.alloc().initWithCallback_(self._on_wake)
@@ -163,6 +240,8 @@ class HotkeyListener:
             logger.info("Hotkey registered: %s", desc)
 
     def stop(self) -> None:
+        self._carbon.unregister_all()
+        self._record_via_carbon = False
         if self._monitor is not None:
             NSEvent.removeMonitor_(self._monitor)
             self._monitor = None

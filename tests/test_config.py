@@ -34,6 +34,7 @@ def test_save_load_roundtrip_preserves_new_fields(tmp_path, monkeypatch):
         recording_formats=["txt", "srt"],
         diarize=True,
         diarize_mode="batch",
+        transcription_diarize=True,
     )
     config_mod.save_settings(original)
     loaded = config_mod.load_settings()
@@ -45,6 +46,7 @@ def test_save_load_roundtrip_preserves_new_fields(tmp_path, monkeypatch):
     assert loaded.recording_formats == ["txt", "srt"]
     assert loaded.diarize is True
     assert loaded.diarize_mode == "batch"
+    assert loaded.transcription_diarize is True
 
 
 def test_load_defaults_when_no_file(tmp_path, monkeypatch):
@@ -54,6 +56,7 @@ def test_load_defaults_when_no_file(tmp_path, monkeypatch):
     assert loaded.capture_tab is True
     assert loaded.live_captions is False
     assert loaded.screenshot_displays == "all"
+    assert loaded.transcription_diarize is False
 
 
 def test_screenshot_displays_validator_invalid(tmp_path, monkeypatch):

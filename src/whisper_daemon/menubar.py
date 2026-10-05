@@ -292,6 +292,16 @@ class MenuBarDelegate(NSObject):
         trans_fmt_item.setSubmenu_(self._trans_fmt_menu)
         settings_menu.addItem_(trans_fmt_item)
 
+        # Speaker diarization for "Transcribe Files/Folder" — separate from the
+        # meeting-recording toggle above so a slow pyannote pass can be enabled
+        # for imported files only (or vice versa).
+        self._trans_diarize_item = _make_item(
+            "Transcription Diarization", "onToggleTransDiarize:", self
+        )
+        if self._settings.transcription_diarize:
+            self._trans_diarize_item.setState_(1)
+        settings_menu.addItem_(self._trans_diarize_item)
+
         settings_item.setSubmenu_(settings_menu)
         menu.addItem_(settings_item)
 
@@ -590,6 +600,18 @@ class MenuBarDelegate(NSObject):
                 self._settings.transcription_formats.append(fmt)
                 sender.setState_(1)
         save_settings(self._settings)
+
+    @objc.typedSelector(b"v@:@")
+    def onToggleTransDiarize_(self, sender):
+        with self._settings_lock:
+            self._settings.transcription_diarize = (
+                not self._settings.transcription_diarize
+            )
+        sender.setState_(1 if self._settings.transcription_diarize else 0)
+        save_settings(self._settings)
+        logger.info(
+            "Transcription diarization: %s", self._settings.transcription_diarize
+        )
 
     def _build_device_menu(self):
         """Populate the recording device submenu with available input devices."""
@@ -1311,6 +1333,7 @@ class MenuBarDelegate(NSObject):
         from whisper_daemon.transcriber import transcribe_file
 
         model = self._daemon._model
+        diarize = self._settings.transcription_diarize
 
         self._set_icon_safe(State.TRANSCRIBING)
         self._set_status_safe("Transcribing files...")
@@ -1337,10 +1360,22 @@ class MenuBarDelegate(NSObject):
 
         done = 0
         last_error: str | None = None
+        diarize_error: str | None = None
         for file_path in files:
             try:
                 self._set_status_safe(f"Transcribing {file_path.name}...")
                 result = transcribe_file(str(file_path), model=model)
+
+                if diarize:
+                    # A diarization failure (missing HF token, model download,
+                    # unsupported audio) must not cost the user the transcript —
+                    # fall through and write it without speaker labels.
+                    self._set_status_safe(f"Diarizing {file_path.name}...")
+                    try:
+                        result = _diarize_transcript(str(file_path), result)
+                    except Exception as exc:
+                        diarize_error = str(exc) or exc.__class__.__name__
+                        logger.exception("Diarization failed for %s", file_path)
 
                 dest = out_dir or file_path.parent
                 stem = file_path.stem
@@ -1359,6 +1394,12 @@ class MenuBarDelegate(NSObject):
         # instead of a bare "0/N" that reads like the format is unsupported.
         if done == 0 and last_error is not None:
             _notify("whisper-daemon", "Transcription failed", last_error[:200])
+        elif diarize_error is not None:
+            _notify(
+                "whisper-daemon",
+                "Transcription complete — diarization failed",
+                f"{done}/{len(files)} files transcribed. {diarize_error[:150]}",
+            )
         else:
             _notify(
                 "whisper-daemon",
@@ -1366,6 +1407,27 @@ class MenuBarDelegate(NSObject):
                 f"{done}/{len(files)} files transcribed.",
             )
         self._reset_meeting_ui()
+
+
+def _diarize_transcript(path: str, result: dict) -> dict:
+    """Label a transcript's segments with speakers (pyannote; needs an HF token).
+
+    Imported at call time — pyannote/torch load is seconds-slow and must not be
+    paid by users who never turn diarization on.
+    """
+    from whisper_daemon.diarize_merge import merge_speakers_with_transcript
+    from whisper_daemon.diarizer import diarize_file
+
+    speaker_segments = diarize_file(path)
+    if not speaker_segments:
+        logger.warning("No speaker segments for %s — writing plain transcript", path)
+        return result
+
+    merged = merge_speakers_with_transcript(speaker_segments, result)
+    logger.info(
+        "Diarized %s — %d speaker(s)", path, len(merged.get("speakers", []))
+    )
+    return merged
 
 
 def _make_item(title: str, action: str | None, target: object) -> NSMenuItem:

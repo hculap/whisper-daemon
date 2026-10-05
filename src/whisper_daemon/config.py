@@ -90,6 +90,7 @@ class Settings:
     tts_language: str = "auto"  # auto, pl, or en
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
+    transcription_diarize: bool = False  # diarize files transcribed from disk
     server_host: str = "127.0.0.1"
     server_port: int = 9876
 
@@ -140,6 +141,7 @@ def load_settings() -> Settings:
             tts_language=data.get("tts", {}).get("language", "auto"),
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
+            transcription_diarize=trans.get("diarize", False),
             server_host=srv.get("host", "127.0.0.1"),
             server_port=srv.get("port", 9876),
         )
@@ -178,6 +180,7 @@ def save_settings(settings: Settings) -> None:
         "[transcription]",
         f"formats = [{trans_formats}]",
         f"output_dir = {_toml_str(settings.transcription_output_dir)}",
+        f'diarize = {"true" if settings.transcription_diarize else "false"}',
         "",
         "[tts]",
         f"language = {_toml_str(settings.tts_language)}",

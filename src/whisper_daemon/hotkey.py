@@ -20,7 +20,9 @@ from AppKit import (
     NSWorkspace,
 )
 
+from whisper_daemon import secure_input
 from whisper_daemon.events import Event, EventType
+from whisper_daemon.notify import notify
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +38,7 @@ HOTKEY_DESCRIPTIONS = {
 
 HEARTBEAT_INTERVAL_S = 600.0  # 10 minutes
 REINSTALL_EVERY_BEATS = 36  # reinstall the monitor every 36 beats = 6h
+SECURE_INPUT_POLL_S = 15.0  # how fast a Secure-Input block gets reported
 
 
 class _WakeObserver(NSObject):
@@ -77,6 +80,7 @@ class HotkeyListener:
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self._last_event_at: float = 0.0
+        self._secure_watch = secure_input.SecureInputWatch()
 
     def _handle_key(self, ns_event: object) -> None:
         flags = ns_event.modifierFlags()
@@ -114,14 +118,54 @@ class HotkeyListener:
         logger.info("Hotkey: system wake — reinstalling global monitor")
         self._install_monitor()
 
+    def _check_secure_input(self) -> None:
+        """Warn (log + one notification) when Secure Input starts/stops blocking hotkeys."""
+        change = self._secure_watch.poll()
+        if change == "blocked":
+            holder = secure_input.find_holder()
+            if holder is not None and not holder.alive:
+                logger.warning(
+                    "Hotkeys BLOCKED — Secure Keyboard Entry is stuck: holder "
+                    "pid %s already exited (macOS leak). Lock and unlock the "
+                    "screen (Ctrl+Cmd+Q) to reset it", holder.pid,
+                )
+                message = (
+                    "Secure Keyboard Entry is stuck after its app quit. "
+                    "Lock and unlock the screen (Ctrl+Cmd+Q) to reset it."
+                )
+            else:
+                who = holder.app if holder else "another app"
+                logger.warning(
+                    "Hotkeys BLOCKED — Secure Keyboard Entry held by %s (pid %s); "
+                    "global key events are not delivered until it is released",
+                    who, holder.pid if holder else "?",
+                )
+                message = (
+                    f"{who} holds Secure Keyboard Entry (focused password field?). "
+                    "Leave that field or quit the app."
+                )
+            from PyObjCTools import AppHelper
+
+            AppHelper.callAfter(notify, "whisper-daemon", "Hotkeys blocked", message)
+        elif change == "cleared":
+            logger.info("Secure Keyboard Entry released — hotkeys active again")
+
     def _heartbeat_loop(self) -> None:
         beats = 0
-        while not self._heartbeat_stop.wait(HEARTBEAT_INTERVAL_S):
+        ticks_per_beat = max(1, round(HEARTBEAT_INTERVAL_S / SECURE_INPUT_POLL_S))
+        ticks = 0
+        self._check_secure_input()
+        while not self._heartbeat_stop.wait(SECURE_INPUT_POLL_S):
+            self._check_secure_input()
+            ticks += 1
+            if ticks % ticks_per_beat:
+                continue
             beats += 1
             since = time.monotonic() - self._last_event_at if self._last_event_at else -1
             logger.info(
-                "Hotkey heartbeat — monitor=%s, last_event=%s",
+                "Hotkey heartbeat — monitor=%s, secure_input=%s, last_event=%s",
                 "alive" if self._monitor is not None else "none",
+                "BLOCKING" if self._secure_watch.blocked else "off",
                 f"{since:.0f}s ago" if since >= 0 else "never",
             )
             # Periodic reinstall: the monitor can die without any wake

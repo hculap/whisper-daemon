@@ -40,6 +40,7 @@ from whisper_daemon.bridge_protocol import (
 )
 from whisper_daemon.config import VALID_FORMATS, Settings, load_settings, save_settings
 from whisper_daemon.daemon import State
+from whisper_daemon.notify import notify as _notify
 
 logger = logging.getLogger(__name__)
 
@@ -1438,25 +1439,6 @@ def _make_item(title: str, action: str | None, target: object) -> NSMenuItem:
     if target is not None:
         item.setTarget_(target)
     return item
-
-
-def _notify(title: str, subtitle: str, message: str) -> None:
-    """Post a macOS notification via NSUserNotificationCenter (best-effort)."""
-    try:
-        from Foundation import (
-            NSUserNotification,
-            NSUserNotificationCenter,
-        )
-
-        notification = NSUserNotification.alloc().init()
-        notification.setTitle_(title)
-        notification.setSubtitle_(subtitle)
-        notification.setInformativeText_(message)
-        NSUserNotificationCenter.defaultUserNotificationCenter().deliverNotification_(
-            notification
-        )
-    except Exception:
-        logger.warning("Notification failed: %s — %s — %s", title, subtitle, message)
 
 
 def _save_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:

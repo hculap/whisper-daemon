@@ -1,6 +1,7 @@
 """User-facing shortcut names mapped to macOS physical key codes."""
-KEYS = dict(zip('asdfhgzxcvbqwerty', (0,1,2,3,4,5,6,7,8,9,11,12,13,14,15,16)))
-KEYS.update(dict(zip('ouiplnjkm', (31,32,34,35,37,45,38,40,46))))
+KEYS = {'a':0,'s':1,'d':2,'f':3,'h':4,'g':5,'z':6,'x':7,'c':8,'v':9,
+        'b':11,'q':12,'w':13,'e':14,'r':15,'y':16,'t':17,'o':31,'u':32,
+        'i':34,'p':35,'l':37,'j':38,'k':40,'n':45,'m':46}
 KEYS.update(space=49, enter=36, escape=53)
 MODIFIERS = {'cmd': (1 << 20, 0x100), 'shift': (1 << 17, 0x200),
              'alt': (1 << 19, 0x800), 'ctrl': (1 << 18, 0x1000)}

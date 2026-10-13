@@ -29,3 +29,6 @@ whisper-daemon = "whisper_daemon.__main__:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+whisper_daemon = ["review_assets/*"]

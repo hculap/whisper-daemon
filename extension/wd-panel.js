@@ -294,14 +294,8 @@
       ${coldNote("screenshot_displays")}
       ${toggleRow("cc", "Napisy na żywo", "live_captions", s.live_captions, false)}
       ${toggleRow("diar", "Diaryzacja (kto mówi)", "diarize", s.diarize, true)}
-      <div class="wd-row"><span class="wd-sub-label">Tryb</span>
-        <select class="wd-sel wd-sel-inline" data-key="diarize_mode">
-          <option value="hybrid" ${s.diarize_mode === "hybrid" ? "selected" : ""}>hybrid</option>
-          <option value="batch" ${s.diarize_mode === "batch" ? "selected" : ""}>batch</option>
-          <option value="realtime" ${s.diarize_mode === "realtime" ? "selected" : ""}>realtime</option>
-        </select>
-      </div>
-      ${coldNote("diarize_mode")}
+      <div class="wd-row"><span class="wd-sub-label">Rozpoznawanie po zakończeniu nagrania</span></div>
+
 
       <div class="wd-div"></div>
 

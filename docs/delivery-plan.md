@@ -14,7 +14,7 @@ the running daemon are preserved until an explicit integration check.
 | M2 | B03 continuous source audio; B04 crash recovery; B05 session ownership; bounded queues, pause/resume, 110-minute capture | implemented; 111 Python tests pass |
 | M3 | Paired/authenticated bridge, validated sequenced audio; offline models and diarization preflight | implemented; 122 Python + 25 JS tests pass |
 | M4 | Dictation preview/cancel, configurable shortcuts and silence, languages, vocabulary, persistent history, focus protection | implemented; 133 Python tests pass |
-| M5 | Source health indicators, searchable playback, speaker editing, local summaries and action items | pending |
+| M5 | Source health indicators, searchable playback, speaker editing, local summaries and action items | implemented; 136 Python + 27 JS tests pass; UI verification follows |
 | M6 | PR, independent subagent review, corrections, final end-to-end verification | pending |
 
 ## Acceptance evidence
@@ -55,3 +55,7 @@ Real loopback WebSocket test rejects an unpaired origin, wrong secret and malfor
 ### M4 evidence
 
 Cancellation generation test rejects a late result after another dictation starts. Focus rejection preserves text in persistent history without touching the clipboard. Review mode needs an explicit accept and supports edited text. Settings roundtrip covers PL, vocabulary, pause and custom shortcut; native AX probe can identify the current input. History is local, limited to 100 entries and mode 0600. Native menu exposes all controls.
+
+### M5 evidence
+
+Local HTTP integration verifies byte-range playback, private routes, cross-origin write rejection, speaker reassignment, new speaker creation and persisted exports. Extractive task suggestions keep source timestamps and require confirmation; no model-invented owners/dates. RTC graph start/stop tests cover positioned PCM and stop during module loading. Screenshot capture observes meeting pause.

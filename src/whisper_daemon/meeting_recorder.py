@@ -383,7 +383,6 @@ class MeetingRecorder:
                 )
                 self._needs_recovery = True
                 self._zero_block_count = 0
-                return
         else:
             self._zero_block_count = 0
 

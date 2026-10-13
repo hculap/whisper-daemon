@@ -1,92 +1,152 @@
 # whisper-daemon
 
-Local push-to-talk transcription daemon for macOS (Apple Silicon) — record with a hotkey, transcribe offline via `mlx-whisper`, paste text into the active field.
+Local dictation and meeting recording for macOS on Apple Silicon. Whisper runs
+on the Mac; microphone and browser audio are saved continuously before voice
+filtering or transcription. The Chrome extension supports Google Meet participant
+audio. Other applications can use an audio loopback device such as BlackHole.
 
-## Features
+## Install and prepare
 
-- **Fully offline** — everything runs locally, no data leaves your machine
-- **Fast** — 4-bit quantized `whisper-large-v3-turbo` via MLX, ~1s transcription latency
-- **Push-to-talk** — global hotkey `Cmd+Shift+Space` with automatic silence detection (Silero VAD)
-- **Paste-to-focus** — transcription lands in the active text field, any app
-- **Meeting recording** — record from mic or system audio (BlackHole), chunked parallel transcription
-- **File transcription** — batch transcribe audio/video files to txt, srt, vtt, json
-- **Menu bar** — status icon showing idle/recording/transcribing
-- **Lightweight** — ~65MB install (no torch dependency)
+Requires Apple Silicon, Python 3.11+, macOS 13+, and `ffmpeg` on PATH. Model files
+and the optional speaker pipeline take substantially more space than the Python
+source; pyannote also installs PyTorch.
 
-## Install
-
-```bash
-git clone <repo-url> && cd whisper-daemon
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e .
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e '.[dev]'
+brew install ffmpeg
+whisper-daemon models prepare
+whisper-daemon models check
+whisper-daemon start
 ```
 
-Grant permissions: **System Settings > Privacy & Security > Accessibility + Microphone** (for Terminal or your IDE).
+Grant Microphone and Accessibility permissions to the app running the daemon.
+Screen Recording permission is needed only when screenshots are enabled.
 
-## Usage
+Inference is offline by default: Hugging Face downloads and telemetry are disabled,
+as is pyannote usage telemetry. `models prepare` is the explicit online provisioning
+step. Missing models cause an actionable error instead of an implicit download.
+For speaker recognition, obtain access to
+[pyannote community-1](https://huggingface.co/pyannote/speaker-diarization-community-1),
+sign in using `hf auth login`, then run:
 
-### Push-to-talk daemon
-
-```bash
-whisper-daemon start              # background with menu bar
-whisper-daemon start -v           # verbose logging
-whisper-daemon stop               # stop daemon
-whisper-daemon status             # check if running
-whisper-daemon run                # foreground (debug)
-whisper-daemon logs -f            # follow logs
+```sh
+whisper-daemon models prepare --diarization
+whisper-daemon models check
 ```
 
-Press `Cmd+Shift+Space` to record → speak → wait for silence → text appears.
+The app checks that the speaker pipeline and dependencies actually load before
+capture. If unavailable, it shows a warning and saves audio/transcripts without
+automatic speaker labels. No token is included in recordings or the repository.
 
-### Transcribe files
+## Dictation
 
-```bash
-whisper-daemon transcribe meeting.mp3
-whisper-daemon transcribe meeting.mp3 --format srt
+| Action | Default shortcut |
+| --- | --- |
+| Start / stop | Cmd+Shift+Space |
+| Cancel recording, inference or draft | Cmd+Shift+Escape |
+| Accept a reviewed draft | Cmd+Shift+Enter |
+| Paste last result | Cmd+Shift+V |
+| Speak selected text | Cmd+Shift+C |
+
+The menu shows a live preview. **Dictation Settings** controls PL/EN/automatic
+language, silence duration (0 means manual stop), vocabulary hints, confirmation
+before pasting, and all five shortcuts. **Review / Edit Dictation** edits a completed
+draft when confirmation is enabled. Shortcuts are reserved globally; choose
+combinations that do not conflict with your applications.
+
+The final transcription includes the entire captured audio, including speech after
+the last preview. Automatic paste checks the original app, window and focused
+input. If that target changed or cannot be verified, the result stays in **Recent**.
+Recent entries can be pasted again and survive restart (up to 100 entries in
+`~/.config/whisper-daemon/dictation-history.json`, file mode 0600). Paste preserves
+all clipboard formats and does not overwrite a new copy made during the paste.
+
+## Chrome pairing and recording
+
+1. Load `extension/` as an unpacked extension in `chrome://extensions`.
+2. Open its popup. Run the displayed `whisper-daemon pair EXTENSION_ID` command.
+3. Paste the returned private key into the popup and save it.
+4. Start recording from the Meet button or extension popup.
+
+Pairing permits only that exact extension ID and a secret held in trusted extension
+storage. The daemon binds only to loopback. Reload the extension and restart the
+daemon when upgrading: the authenticated, sequenced protocol is incompatible with
+older versions. Pairing another extension rotates the key.
+
+Microphone and participant indicators are separate. The native menu and extension
+popup/panel provide **Pause / Resume**; paused intervals retain their position in
+the timeline as silence. Screenshots pause too. Stop finishes the pending disk
+queue. Another meeting cannot start until finalization has ended.
+
+Packet sequence and source sample positions detect duplicates and missing audio.
+Reconnects resume the same meeting. A transport loss leaves microphone capture
+running and the participant indicator reports loss; use the native Stop control
+if the browser is unreachable. The extension reports buffer exhaustion explicitly.
+
+## Files, recovery and meeting review
+
+Each meeting folder contains:
+
+- `mic.f32` / `browser.f32`: continuous 16 kHz mono float32-LE sources, including silence.
+- `mic.wav` / `browser.wav`: aligned source exports; `recording.wav`: combined playback.
+- `session.json`: duration, missing-source intervals, pauses and errors.
+- `chunks/`: durable pending jobs and completed results.
+- `transcript.json` plus selected text/subtitle formats.
+- `notes.json`: editable summary and task suggestions with source timestamps.
+
+Audio is always retained for recovery. The old optional `save_audio` setting no
+longer disables source capture. Allow about 810 MB/hour for two raw sources plus
+source and mixed WAVs (pending jobs and screenshots need additional space).
+Files are written before inference; disk errors are surfaced and stop capture.
+Raw writes are unbuffered and fsynced once per second. Process-crash recovery uses
+file lengths rather than a WAV header; a power failure may lose the last unsynced
+second. There is no automatic deletion or alteration of older recordings.
+
+```sh
+whisper-daemon recover /path/to/interrupted/recording
+whisper-daemon recover /path/to/interrupted/recording --transcribe --language pl
+whisper-daemon review /path/to/recording
+```
+
+The native menu also has **Review Last Meeting** and **Open Meeting**. The local
+review page supports search, timestamp playback, source selection, speaker names,
+per-utterance speaker corrections, and adding speakers. Saving persists edits and
+regenerates TXT/SRT/VTT while preserving `transcript_original.json`.
+
+Initial notes are extractive suggestions, not an AI-generated account of facts:
+selected utterances and action-like phrases retain their recording timestamps.
+Verify tasks, fill in owners/dates, and mark completion. The review server is bound
+to `127.0.0.1` and uses an unpredictable per-run URL; it loads no external assets.
+Keep that URL private. Closing the daemon/CLI closes the review server.
+
+## CLI
+
+```sh
+whisper-daemon run                         # foreground
+whisper-daemon stop
+whisper-daemon status
+whisper-daemon logs -f
+whisper-daemon devices
+whisper-daemon record meeting.txt --format txt,srt,json --language pl
+whisper-daemon record meeting.txt --device 'BlackHole 2ch'
 whisper-daemon transcribe meeting.mp3 --format txt,srt,json
-whisper-daemon transcribe ./recordings/
-whisper-daemon transcribe video.mp4 --output-dir ./out
 ```
 
-### Record meetings
+CLI recording ends with Ctrl+C and saves continuous audio in an adjacent unique
+`*_audio_*` folder. Native/browser speaker recognition runs after capture; the CLI
+also retains experimental realtime/hybrid speaker tracking options.
 
-```bash
-whisper-daemon record meeting.txt                                # from default mic
-whisper-daemon record meeting.txt --device "BlackHole 2ch"       # system audio
-whisper-daemon record meeting.txt --format txt,srt --language en
-whisper-daemon devices                                           # list audio devices
+## Verification
+
+```sh
+python -m pytest -q
+node --test extension/test/*.test.js
+python scripts/verify_110_minutes.py
 ```
 
-Records until `Ctrl+C`. Splits audio at natural pauses and transcribes in parallel.
-
-### System audio capture (Google Meet, Zoom)
-
-To capture audio from other apps, install [BlackHole](https://github.com/ExistentialAudio/BlackHole):
-
-```bash
-brew install blackhole-2ch
-```
-
-Then in **Audio MIDI Setup** (built-in macOS app):
-
-1. Create a **Multi-Output Device**: combine "Built-in Output" + "BlackHole 2ch"
-2. Set the Multi-Output Device as your macOS sound output
-3. Record: `whisper-daemon record meeting.txt --device "BlackHole 2ch"`
-
-You'll hear audio through speakers AND it gets captured by the daemon.
-
-## Requirements
-
-- macOS 13+ (Ventura)
-- Apple Silicon (M1/M2/M3/M4)
-- Python 3.11+
-- ffmpeg (for file transcription): `brew install ffmpeg`
-
-## Documentation
-
-- [Product Requirements](docs/prd.md)
-- [Architecture](docs/architecture.md)
-
-## License
-
-MIT
+The 110-minute test feeds both real recorder/storage pipelines at accelerated speed
+and checks exact sample counts, silent intervals, WAV lengths and bounded memory.
+It is separate from a 110-minute wall-clock microphone/Meet soak test.
+See [delivery evidence](docs/delivery-plan.md) for executed checks and limitations.

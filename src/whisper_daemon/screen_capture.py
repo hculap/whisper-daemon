@@ -52,12 +52,14 @@ class ScreenCapture:
         interval: float = DEFAULT_INTERVAL,
         threshold: float = CHANGE_THRESHOLD,
         displays: str = "all",
+        paused=None,
     ) -> None:
         self._output_dir = output_dir / "screenshots"
         self._interval = interval
         self._threshold = threshold
         # "all" captures every active display; "primary" only the first one.
         self._displays = displays
+        self._paused = paused or (lambda: False)
         self._running = False
         self._thread: threading.Thread | None = None
         self._start_time: float = 0.0
@@ -94,7 +96,7 @@ class ScreenCapture:
 
     def capture_now(self) -> None:
         """Capture all displays immediately (called by activity monitor)."""
-        if not self._running:
+        if not self._running or self._paused():
             return
         with self._capture_lock:
             try:

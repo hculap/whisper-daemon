@@ -140,9 +140,13 @@ registerProcessor("wd-pcm", WdPcmProcessor);
 
   // --- Session lifecycle ---
 
+  let generation = 0;
+  let starting = false;
   async function start() {
+    if (starting || capturing) return;
+    starting = true;
+    const gen = ++generation;
     try {
-      if (capturing) return;
       ctx = new AudioContext({ sampleRate: 16000 });
       workletUrl = URL.createObjectURL(
         new Blob([WORKLET_CODE], { type: "application/javascript" })

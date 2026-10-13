@@ -6,6 +6,7 @@ output is unchanged (backward compatible).
 """
 
 import json
+import html
 import re
 
 COMPACT_STRIP_KEYS = {"tokens", "seek", "compression_ratio", "temperature", "avg_logprob", "no_speech_prob"}
@@ -76,7 +77,7 @@ def to_vtt(result: dict) -> str:
         text = seg["text"].strip()
         if has_speakers:
             label = speakers.get(seg.get("speaker", 0), f"Speaker {seg.get('speaker', 0) + 1}")
-            text = f"<v {label}>{text}</v>"
+            text = f"<v {html.escape(label)}>{html.escape(text)}</v>"
         lines.append(f"{start} --> {end}\n{text}\n")
 
     return "\n".join(lines)
@@ -112,6 +113,8 @@ def _strip_segments(result: dict) -> dict:
         "segments": compact_segments,
         "language": result.get("language", ""),
     }
+    for key in ("duration", "gaps", "diarization"):
+        if key in result: cleaned[key] = result[key]
     if "speakers" in result:
         cleaned["speakers"] = result["speakers"]
     return cleaned

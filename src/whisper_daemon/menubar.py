@@ -85,6 +85,8 @@ class MenuBarDelegate(NSObject):
         self._meeting_start = 0.0
         self._meeting_thread = None
         self._meeting_store = None
+        self._review_server = None
+        self._last_meeting_dir = None
         self._meeting_paused = False
         self._diarization_status = {"available": False, "message": "Speaker recognition not checked"}
         self._browser_audio_lock = threading.RLock()
@@ -188,6 +190,8 @@ class MenuBarDelegate(NSObject):
         )
         menu.addItem_(self._meeting_menu_item)
         menu.addItem_(_make_item("Pause / Resume Meeting", "onPauseMeeting:", self))
+        menu.addItem_(_make_item("Review Last Meeting…", "onReviewMeeting:", self))
+        menu.addItem_(_make_item("Open Meeting…", "onOpenMeeting:", self))
 
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -214,10 +218,10 @@ class MenuBarDelegate(NSObject):
 
         # Save Audio toggle
         self._save_audio_item = _make_item(
-            "Save Audio Recording", "onToggleSaveAudio:", self
+            "Continuous Audio Saved (required for recovery)", None, None
         )
-        if self._settings.save_audio:
-            self._save_audio_item.setState_(1)
+        self._save_audio_item.setState_(1)
+        self._save_audio_item.setEnabled_(False)
         settings_menu.addItem_(self._save_audio_item)
 
         # Capture Screenshots toggle
@@ -238,10 +242,9 @@ class MenuBarDelegate(NSObject):
 
         # Auto-Record Meetings toggle
         self._auto_record_item = _make_item(
-            "Auto-Record Meetings", "onToggleAutoRecord:", self
+            "Start meetings explicitly in Chrome", None, None
         )
-        if self._settings.auto_record_meetings:
-            self._auto_record_item.setState_(1)
+        self._auto_record_item.setEnabled_(False)
         settings_menu.addItem_(self._auto_record_item)
 
         # TTS Language (submenu with radio-style selection)
@@ -819,14 +822,14 @@ class MenuBarDelegate(NSObject):
         except Exception:
             logger.exception("Failed to push settings snapshot")
 
-    def _run_off_bridge(self, fn: Callable[[], None]) -> None:
+    def _run_off_bridge(self, fn, *args) -> None:
         """Run blocking work off the bridge event-loop thread.
 
         Device enumeration (sounddevice) and disk I/O must never run inline on
         the WebSocket coroutine thread — while they block, the async-for loop
         can't read the next audio frame, silently starving a live meeting.
         """
-        threading.Thread(target=fn, daemon=True).start()
+        threading.Thread(target=fn, args=args, daemon=True).start()
 
     def _handle_get_settings(self) -> None:
         """Push settings snapshot + current phase status (worker thread).
@@ -910,7 +913,7 @@ class MenuBarDelegate(NSObject):
         """
         s = self._settings
         try:
-            self._save_audio_item.setState_(1 if s.save_audio else 0)
+            self._save_audio_item.setState_(1)
             self._capture_screenshots_item.setState_(
                 1 if s.capture_screenshots else 0
             )
@@ -1039,7 +1042,7 @@ class MenuBarDelegate(NSObject):
                 raise RuntimeError("No audio source is available")
             if settings.capture_screenshots:
                 screens = ScreenCapture(rec_dir, interval=settings.screenshot_interval,
-                                        displays=settings.screenshot_displays)
+                                        displays=settings.screenshot_displays, paused=lambda: self._meeting_paused)
                 screens.start()
             last_status = 0.0
             last_recovery = 0.0
@@ -1102,6 +1105,9 @@ class MenuBarDelegate(NSObject):
                     temp = target.with_suffix(target.suffix + ".tmp")
                     temp.write_text(FORMATTERS[fmt](merged), encoding="utf-8")
                     temp.replace(target)
+            from whisper_daemon.meeting_review import prepare_review
+            prepare_review(rec_dir)
+            self._last_meeting_dir = rec_dir
             store.meta['state'] = 'complete'
             store._save()
             (rec_dir / "transcript_live.txt").unlink(missing_ok=True)
@@ -1197,6 +1203,34 @@ class MenuBarDelegate(NSObject):
         if self._meeting_phase == "idle":
             self._set_icon_safe(self._daemon._state)
             self._set_status_safe("Ready")
+
+    def _open_review(self, directory):
+        import webbrowser
+        from whisper_daemon.meeting_review import ReviewServer
+        if self._review_server:
+            self._review_server.shutdown()
+            self._review_server.server_close()
+        self._review_server = ReviewServer(directory)
+        webbrowser.open(self._review_server.start())
+
+    def onReviewMeeting_(self, sender):
+        directory = self._last_meeting_dir
+        if directory is None:
+            candidates = list(self._settings.recording_dir_path.glob("recording_*/transcript.json"))
+            if candidates: directory = max(candidates, key=lambda p: p.stat().st_mtime).parent
+        if directory: self._run_off_bridge(self._open_review, directory)
+        else: _notify("whisper-daemon", "No completed meetings", "Use Open Meeting to select a recording folder.")
+
+    def onOpenMeeting_(self, sender):
+        from AppKit import NSOpenPanel
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(False)
+        panel.setCanChooseDirectories_(True)
+        panel.setAllowsMultipleSelection_(False)
+        if panel.runModal() == 1:
+            directory = Path(str(panel.URLs()[0].path()))
+            if (directory / "transcript.json").exists(): self._run_off_bridge(self._open_review, directory)
+            else: _notify("whisper-daemon", "No transcript", "Select a meeting folder containing transcript.json.")
 
     def onPauseMeeting_(self, sender) -> None:
         if not self._meeting_active: return

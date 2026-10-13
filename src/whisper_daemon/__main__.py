@@ -677,6 +677,22 @@ def recover(directory, redo_transcript, language):
 
 
 @cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option('--port', type=click.IntRange(0, 65535), default=0)
+@click.option('--no-open', is_flag=True)
+def review(directory, port, no_open):
+    """Open a local meeting: search, play, name speakers and save notes/tasks."""
+    import webbrowser
+    from whisper_daemon.meeting_review import ReviewServer
+    server = ReviewServer(directory, port)
+    click.echo(server.url)
+    if not no_open: webbrowser.open(server.url)
+    try: server.serve_forever()
+    except KeyboardInterrupt: pass
+    finally: server.server_close()
+
+
+@cli.command()
 @click.argument("extension_id")
 def pair(extension_id):
     """Authorize one extension ID; paste the printed key into its popup."""

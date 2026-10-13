@@ -24,7 +24,7 @@ whisper-daemon start
 Grant Microphone and Accessibility permissions to the app running the daemon.
 Screen Recording permission is needed only when screenshots are enabled.
 
-Inference is offline by default: Hugging Face downloads and telemetry are disabled,
+Inference is offline by default: missing Whisper/VAD models require explicit preparation. Hugging Face downloads and telemetry are disabled,
 as is pyannote usage telemetry. `models prepare` is the explicit online provisioning
 step. Missing models cause an actionable error instead of an implicit download.
 For speaker recognition, obtain access to
@@ -53,7 +53,8 @@ automatic speaker labels. No token is included in recordings or the repository.
 The menu shows a live preview. **Dictation Settings** controls PL/EN/automatic
 language, silence duration (0 means manual stop), vocabulary hints, confirmation
 before pasting, and all five shortcuts. **Review / Edit Dictation** edits a completed
-draft when confirmation is enabled. Shortcuts are reserved globally; choose
+draft when confirmation is enabled. Saving an edit keeps the draft: return to
+the original input field and press the accept shortcut to paste. Shortcuts are reserved globally; choose
 combinations that do not conflict with your applications.
 
 The final transcription includes the entire captured audio, including speech after
@@ -84,6 +85,12 @@ Packet sequence and source sample positions detect duplicates and missing audio.
 Reconnects resume the same meeting. A transport loss leaves microphone capture
 running and the participant indicator reports loss; use the native Stop control
 if the browser is unreachable. The extension reports buffer exhaustion explicitly.
+Stop during reconnect first drains retained audio. If the session was already
+closed from the native menu, the extension popup offers a local WAV export of its
+undelivered tail, including timing gaps and the starting offset in the filename.
+Download it before closing Chrome; this exceptional tail is retained in extension
+memory, not in the daemon's already finalized recording. Starting another session
+does not discard it. Remove the buffer copy only after checking the downloaded file.
 
 ## Files, recovery and meeting review
 
@@ -144,6 +151,7 @@ also retains experimental realtime/hybrid speaker tracking options.
 python -m pytest -q
 node --test extension/test/*.test.js
 python scripts/verify_110_minutes.py
+python scripts/verify_speech_e2e.py  # macOS voices + cached Whisper/Silero, offline
 ```
 
 The 110-minute test feeds both real recorder/storage pipelines at accelerated speed

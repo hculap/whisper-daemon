@@ -250,7 +250,7 @@ class SpeakerTracker:
             embedding = model(waveform)
         except Exception:
             logger.exception("Embedding extraction failed")
-            return []
+            raise
 
         if isinstance(embedding, torch.Tensor):
             embedding = embedding.cpu().numpy()

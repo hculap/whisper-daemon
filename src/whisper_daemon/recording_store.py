@@ -35,14 +35,15 @@ def atomic_json(path: Path, value: object) -> None:
 
 
 class RecordingStore:
-    def __init__(self, path: Path, *, clock=time.monotonic, started_at=None):
+    def __init__(self, path: Path, *, clock=time.monotonic, started_at=None, sources=()):
         self.path = Path(path)
-        self.path.mkdir(parents=True, exist_ok=True)
+        self.path.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.clock = clock
         self.started_at = clock() if started_at is None else started_at
         self.lock = threading.RLock()
         self.files = {}
         self.frames = {}
+        self.enabled_sources = set(sources)
         self.levels = {}
         self.last_audio = {}
         self.last_sync = clock()
@@ -76,8 +77,7 @@ class RecordingStore:
                 self.files[source] = (self.path / f'{source}.f32').open('xb', buffering=0)
             file = self.files[source]
             if at > cursor:
-                self.meta['gaps'].append({'source': source, 'start': cursor / RATE,
-                                         'end': at / RATE, 'reason': 'missing audio'})
+                self._record_gap(source, cursor, at)
             file.seek(at * 4)
             payload = samples.tobytes()
             if file.write(payload) != len(payload):
@@ -102,10 +102,37 @@ class RecordingStore:
             self.last_sync = self.clock()
             self._save()
 
-    def pause(self, paused):
+    def pause(self, paused, *, at=None):
         with self.lock:
-            self.meta['pauses'].append({'time': self.clock() - self.started_at, 'paused': paused})
+            self.meta['pauses'].append({'time': self.clock() - self.started_at if at is None else at, 'paused': paused})
             self.flush()
+
+    def _intervals(self, start, end):
+        """Split a capture-time interval into paused/unpaused sample ranges."""
+        paused = False
+        cursor = start
+        for event in self.meta['pauses']:
+            position = round(event['time'] * RATE)
+            if position <= start:
+                paused = event['paused']
+                continue
+            if position >= end: break
+            yield cursor, position, paused
+            cursor, paused = position, event['paused']
+        if cursor < end: yield cursor, end, paused
+
+    def unpaused_audio(self, samples, position):
+        # Take the interval snapshot under the same lock used by Pause. No
+        # receipt-time flag: replay may arrive on either side of a later pause.
+        with self.lock:
+            intervals = list(self._intervals(position, position + len(samples)))
+        return [(start, samples[start-position:end-position])
+                for start, end, paused in intervals if not paused]
+
+    def _record_gap(self, source, start, end):
+        for first, last, paused in self._intervals(start, end):
+            self.meta['gaps'].append({'source': source, 'start': first / RATE,
+                'end': last / RATE, 'reason': 'paused' if paused else 'missing audio'})
 
     def finish(self, duration=None, state='complete'):
         with self.lock:
@@ -114,6 +141,9 @@ class RecordingStore:
                 file.close()
             self.files.clear()
             frames = max(max(self.frames.values(), default=0), round((duration or 0) * RATE))
+            for source in self.enabled_sources | self.frames.keys():
+                if self.frames.get(source, 0) < frames:
+                    self._record_gap(source, self.frames.get(source, 0), frames)
             self.meta.update(state=state, duration=frames / RATE)
             self._save()
             self.export(self.path, frames)

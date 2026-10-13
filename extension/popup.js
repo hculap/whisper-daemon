@@ -24,6 +24,8 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (msg.type === "CHUNK_TRANSCRIBED") {
     addTranscriptChunk(msg.text);
   }
+  if(msg.type==='STATUS')updateUI(msg.state==='recording'?'capturing':msg.state);
+  if(msg.type==='CAPTURE_ERROR' || msg.type==='RECOVERY_AVAILABLE')refreshRecovery();
 });
 
 // --- Button ---
@@ -39,7 +41,7 @@ actionBtn.addEventListener("click", async () => {
     return;
   }
 
-  if (response.state === "starting") return;
+  if (response.state === "starting" || response.state === 'transcribing') return;
 
   // Get tab to capture
   const tabId = response.meetTabId || (await getActiveTabId());
@@ -86,8 +88,8 @@ function updateUI(state, title) {
     actionBtn.disabled = false;
     startTimer();
     transcript.classList.add("visible");
-  } else if (state === "starting") {
-    actionBtn.textContent = "Starting...";
+  } else if (state === "starting" || state === 'transcribing') {
+    actionBtn.textContent = state==='starting'?'Starting...':'Saving recording...';
     actionBtn.className = "btn btn-record";
     actionBtn.disabled = true;
   } else {
@@ -151,5 +153,22 @@ chrome.runtime.onMessage.addListener(msg => {
   if (msg.type === "HEALTH") document.getElementById("sourceHealth").textContent =
     Object.entries(msg.sources).map(([name, value]) => `${name === "mic" ? "Microphone" : "Participants"}: ${value.age > 3 ? "no signal" : value.rms > .005 ? "speaking" : "quiet"}`).join(" · ") + (msg.paused ? " · PAUSED" : "");
   if (msg.type === "CAPABILITIES") document.getElementById("capabilityStatus").textContent = msg.diarization.message;
-  if (msg.type === "CAPTURE_ERROR") document.getElementById("capabilityStatus").textContent = msg.message;
+  if (msg.type === "CAPTURE_ERROR" || msg.type === 'RECOVERY_AVAILABLE') document.getElementById("capabilityStatus").textContent = msg.message;
 });
+
+async function refreshRecovery(){
+  try{const state=await chrome.runtime.sendMessage({target:'offscreen',type:'GET_RECOVERY'});
+    document.getElementById('recovery').hidden=!(state?.count || state?.pending);
+  }catch{}
+}
+document.getElementById('exportRecovery').onclick=async()=>{
+  const result=await chrome.runtime.sendMessage({target:'offscreen',type:'EXPORT_RECOVERY'});
+  if(!result?.url)return;
+  const link=document.createElement('a');link.href=result.url;link.download=result.filename;link.click();
+  document.getElementById('clearRecovery').disabled=false;
+};
+document.getElementById('clearRecovery').onclick=async()=>{
+  await chrome.runtime.sendMessage({target:'offscreen',type:'CLEAR_EXPORTED_RECOVERY'});
+  document.getElementById('clearRecovery').disabled=true;refreshRecovery();
+};
+refreshRecovery();

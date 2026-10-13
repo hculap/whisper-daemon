@@ -62,6 +62,7 @@ class MeetingRecorder:
         source_label: str = "mic",
         raw_sink=None,
         paused=None,
+        sample_filter=None,
     ) -> None:
         self._chunk_queue = chunk_queue
         self._device = device
@@ -69,6 +70,8 @@ class MeetingRecorder:
         self._source_label = source_label
         self._raw_sink = raw_sink
         self._paused = paused or (lambda: False)
+        self._sample_filter = sample_filter
+        self._vad_position = None
         self.error = None
         self._capture_lock = __import__("threading").RLock()
 
@@ -102,6 +105,7 @@ class MeetingRecorder:
         self._voice_detected_in_chunk = False
         self._silence_start = None
         self._vad_buffer = np.array([], dtype=np.float32)
+        self._vad_position = None
         self._device_error_count = 0
         self._needs_recovery = False
         self._recovery_attempts = 0
@@ -142,6 +146,13 @@ class MeetingRecorder:
         """
         self._needs_recovery = True
 
+    def check_liveness(self, now, timeout=10):
+        """Detect missing device callbacks even while paused or transcribing."""
+        if self._source_label == 'mic' and not self._needs_recovery and now - self._last_audio_at > timeout:
+            self.request_recovery()
+            return True
+        return False
+
     def recover_device(self) -> bool:
         """Attempt to reopen audio stream after device failure.
 
@@ -177,6 +188,7 @@ class MeetingRecorder:
                 self._stream.start()
                 audio_system.register_stream(self._stream)
             self._needs_recovery = False
+            self._last_audio_at = time.monotonic()
             logger.info(
                 "Device recovered on attempt %d (device: %s, channels: %d)",
                 self._recovery_attempts,
@@ -308,7 +320,7 @@ class MeetingRecorder:
     def _finalize(self) -> None:
         """Emit remaining audio, send sentinel, reset VAD."""
         if len(self._vad_buffer):
-            self._process_block(self._vad_buffer)
+            self._process_block(self._vad_buffer, self._vad_position)
             self._vad_buffer = np.array([], dtype=np.float32)
         self._emit_chunk(is_final=True)
         self._chunk_queue.put(None)
@@ -317,22 +329,30 @@ class MeetingRecorder:
         elapsed = time.monotonic() - self._recording_start
         logger.info("Meeting recording stopped — total %.1fs", elapsed)
 
-    def feed_audio(self, samples: np.ndarray) -> None:
+    def feed_audio(self, samples: np.ndarray, position: int | None = None) -> None:
         """Feed externally-sourced audio into the recording pipeline.
 
         Accepts a 1D float32 mono array of arbitrary length. Buffers
         internally and processes in BLOCK_SIZE (512-sample) chunks
         through VAD and chunk-splitting logic.
         """
-        if not self._recording:
-            return
-
-        self._vad_buffer = np.concatenate([self._vad_buffer, samples])
-
-        while len(self._vad_buffer) >= BLOCK_SIZE:
-            block = self._vad_buffer[:BLOCK_SIZE]
-            self._vad_buffer = self._vad_buffer[BLOCK_SIZE:]
-            self._process_block(block)
+        with self._capture_lock:
+            if not self._recording: return
+            self._last_audio_at = time.monotonic()
+            parts = (self._sample_filter(samples, position)
+                     if self._sample_filter and position is not None else [(position, samples)])
+            for start, part in parts:
+                if start is not None and self._vad_position is not None and start != self._vad_position + len(self._vad_buffer):
+                    if len(self._vad_buffer): self._process_block(self._vad_buffer, self._vad_position)
+                    self._vad_buffer = np.array([], dtype=np.float32)
+                    self._emit_chunk(is_final=True)
+                if not len(self._vad_buffer): self._vad_position = start
+                self._vad_buffer = np.concatenate([self._vad_buffer, part])
+                while len(self._vad_buffer) >= BLOCK_SIZE:
+                    block = self._vad_buffer[:BLOCK_SIZE]
+                    self._vad_buffer = self._vad_buffer[BLOCK_SIZE:]
+                    self._process_block(block, self._vad_position)
+                    if self._vad_position is not None: self._vad_position += BLOCK_SIZE
 
     def _callback(
         self,
@@ -388,14 +408,14 @@ class MeetingRecorder:
 
         self._process_block(samples)
 
-    def _process_block(self, samples: np.ndarray) -> None:
+    def _process_block(self, samples: np.ndarray, position=None) -> None:
         """Process a single block of mono audio through VAD and chunk splitting."""
-        if self._paused():
+        if position is None and self._paused():
             if self._frames: self._emit_chunk(is_final=True)
             return
         if self._raw_sink is not None:
             try:
-                start = self._raw_sink(samples)
+                start = self._raw_sink(samples, position) if position is not None else self._raw_sink(samples)
                 expected = self._chunk_start + self._current_chunk_duration()
                 if start > expected + .01:
                     self._emit_chunk(is_final=True)
@@ -438,7 +458,7 @@ class MeetingRecorder:
         if not self._frames:
             return
 
-        audio = np.concatenate(self._frames, axis=0).squeeze()
+        audio = np.concatenate(self._frames, axis=0).reshape(-1)
         duration = len(audio) / SAMPLE_RATE
 
         if duration < 0.3 and not is_final:

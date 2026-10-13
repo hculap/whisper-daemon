@@ -10,7 +10,7 @@ chrome.storage.local.setAccessLevel({accessLevel: "TRUSTED_CONTEXTS"});
  * recording, transcription, diarization, and output automatically.
  */
 
-const State = { IDLE: "idle", DETECTED: "detected", STARTING: "starting", CAPTURING: "capturing" };
+const State = { IDLE: "idle", DETECTED: "detected", STARTING: "starting", CAPTURING: "capturing", TRANSCRIBING: "transcribing" };
 
 let state = State.IDLE;
 let meetTabId = null;
@@ -30,6 +30,7 @@ function updateBadge() {
     [State.DETECTED]: { text: "!", color: "#FF9800" },
     [State.STARTING]: { text: "...", color: "#FF9800" },
     [State.CAPTURING]: { text: "REC", color: "#F44336" },
+    [State.TRANSCRIBING]: { text: "…", color: "#FF9800" },
   };
   const badge = badges[state];
   chrome.action.setBadgeText({ text: badge.text });
@@ -112,6 +113,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     meetTabId = null;
     sendResponse({ ok: true });
 
+  } else if (msg.type === 'RECOVERY_AVAILABLE') {
+    chrome.notifications.create('audio-recovery', {type:'basic',iconUrl:'icons/icon128.png',
+      title:'Audio recovery',message:msg.message});
+    sendResponse({ok:true});
   } else if (msg.type === "CAPTURE_ERROR") {
     chrome.notifications.create("capture-error", {
       type: "basic",
@@ -143,6 +148,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // CAPTURING, so without this the badge would stay red "REC" for the rest of
     // the session after an owned stop. Map the daemon phase directly.
     updateBadgeForPhase(msg.state);
+    if (msg.state === 'idle') { state = State.IDLE; meetTabId = null; }
+    else if (msg.state === 'transcribing') state = State.TRANSCRIBING;
+    else if (msg.state === 'recording') {
+      state = State.CAPTURING;
+      if (!msg.sessionId) meetTabId = null; // native session, no exclusive tab
+    }
     sendResponse({ ok: true });
 
   } else if (msg.type === "HEALTH") {
@@ -152,12 +163,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     relayWD("WD_CAPABILITIES", {diarization: msg.diarization});
     sendResponse({ok: true});
   } else if (msg.type === "SETTINGS") {
-    relayWD("WD_SETTINGS", { settings: msg.settings, devices: msg.devices });
+    // Global read-only snapshot: initialize every content surface without
+    // granting any of them ownership of a recording.
+    chrome.tabs.query({url:'https://meet.google.com/*'}).then(tabs => {
+      for (const tab of tabs) chrome.tabs.sendMessage(tab.id, {
+        type:'WD_SETTINGS', settings:msg.settings, devices:msg.devices,
+      }).catch(() => {});
+    }).catch(() => {});
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_START") {
     // From content script (page gesture). Forward to offscreen.
     if (sender.tab?.id) {
+      if (state === State.TRANSCRIBING) { sendResponse({ok:false,error:'Previous recording is still being saved'}); return; }
       if (meetTabId !== null && meetTabId !== sender.tab.id && (state === State.CAPTURING || state === State.STARTING)) {
         sendResponse({ok: false, error: "Another tab is recording"}); return;
       }
@@ -178,14 +196,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     forwardToOffscreen(msg);
     sendResponse({ ok: true });
 
+  } else if (msg.type === 'WD_GET_SETTINGS') {
+    forwardToOffscreen(msg);
+    sendResponse({ok:true});
   } else if (
     msg.type === "WD_PAUSE_MEETING" ||
     msg.type === "WD_STOP_MEETING" ||
-    msg.type === "WD_GET_SETTINGS" ||
     msg.type === "WD_SET_SETTINGS"
   ) {
-    if (!sender.tab || meetTabId === null || sender.tab.id === meetTabId) {
-      if (meetTabId === null && sender.tab) meetTabId = sender.tab.id;
+    if (!sender.tab || meetTabId === null || state === State.IDLE || state === State.DETECTED || sender.tab.id === meetTabId) {
       forwardToOffscreen(msg);
     }
     sendResponse({ ok: true });
@@ -332,8 +351,7 @@ async function resolveMeetTab() {
     const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
     if (tabs && tabs.length) {
       const t = tabs.find((x) => x.active) || tabs[0];
-      meetTabId = t.id ?? null;
-      return meetTabId;
+      return t.id ?? null;
     }
   } catch (err) {
     console.warn("wd: resolveMeetTab failed", err);

@@ -10,6 +10,7 @@ class EventType(Enum):
     RECORD_STOP = auto()
     RECORD_CANCEL = auto()
     DICTATION_ACCEPT = auto()
+    DICTATION_EDIT = auto()
     PASTE_HISTORY = auto()
     RECORD_DEVICE_DEAD = auto()
     TRANSCRIBE_PREVIEW = auto()

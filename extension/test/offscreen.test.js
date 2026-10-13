@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 
-function fixture() {
+function fixture({autoStart = true} = {}) {
   const sockets = [], messages = [];
   let receive;
   class Socket {
@@ -17,7 +17,7 @@ function fixture() {
       if (typeof value === 'string') {
         const data = JSON.parse(value);
         if (data.type === 'auth') queueMicrotask(() => this.onmessage({data: JSON.stringify({type:'authenticated'})}));
-        if (data.type === 'start') queueMicrotask(() => this.onmessage({data: JSON.stringify({type:'started', session_id:data.session_id})}));
+        if (data.type === 'start' && autoStart) queueMicrotask(() => this.onmessage({data: JSON.stringify({type:'started', session_id:data.session_id})}));
       }
     }
   }
@@ -37,7 +37,7 @@ function fixture() {
 
 test('a broadcast PCM frame is ignored until addressed to offscreen', () => {
   const f = fixture();
-  f.run('capturing = true; ws = { readyState: 1, send() { globalThis.sends = (globalThis.sends || 0) + 1; } }; globalThis.sends = 0');
+  f.run('capturing = true; streamReady = true; ws = { readyState: 1, send() { globalThis.sends = (globalThis.sends || 0) + 1; } }; globalThis.sends = 0');
   f.receive({ type: 'WD_PCM', samples: [0.1, 0.2] });
   f.receive({ type: 'WD_PCM', target: 'offscreen', samples: [0.1, 0.2] });
   assert.equal(f.run('sends'), 1);
@@ -59,10 +59,69 @@ test('daemon-side stop permits a subsequent browser start', async () => {
   await f.open();
   await pending;
   f.run('handleServerMessage({data: JSON.stringify({type: "status", state: "recording"})})');
-  f.run('handleServerMessage({data: JSON.stringify({type: "status", state: "transcribing"})})');
-  f.run('handleServerMessage({data: JSON.stringify({type: "status", state: "idle"})})');
+  f.run('handleServerMessage({data: JSON.stringify({type: "status", state: "transcribing", session_id:sessionId})})');
+  f.run('handleServerMessage({data: JSON.stringify({type: "status", state: "idle", session_id:sessionId})})');
   await f.run('startExternal()');
   assert.equal(f.sockets[0].sent.map(JSON.parse).filter(m => m.type === 'start').length, 2);
+});
+
+test('reconnect never sends live PCM ahead of unacknowledged backlog', async () => {
+  const f = fixture({autoStart:false});
+  const start = f.run('startExternal()'); await f.open(); await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})'); await start;
+  f.receive({type:'WD_PCM',target:'offscreen',samples:[.1,.2],position:0});
+  f.run('handleServerMessage({data:JSON.stringify({type:"audio_ack",session_id:sessionId,sequence:0})})');
+  f.sockets[0].readyState=3; f.sockets[0].onclose();
+  f.receive({type:'WD_PCM',target:'offscreen',samples:[.3,.4],position:2});
+  await new Promise(setImmediate); f.sockets[1].open(); await new Promise(setImmediate);
+  f.receive({type:'WD_PCM',target:'offscreen',samples:[.5,.6],position:4});
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');
+  await new Promise(setImmediate);
+  const packets=f.sockets[1].sent.filter(x=>typeof x!=='string');
+  assert.deepEqual(packets.map(x=>new DataView(x).getUint32(4,true)),[1,2]);
+});
+
+test('stop after start was sent but before ACK explicitly terminates session', async () => {
+  const f=fixture({autoStart:false});
+  const start=f.run('startExternal()'); await f.open(); await new Promise(setImmediate);
+  f.run('stopCapture()');
+  await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');
+  await new Promise(setImmediate);
+  assert.equal(f.sockets[0].sent.map(JSON.parse).filter(m=>m.type==='stop').length,1);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');
+  await start;
+  assert.equal(f.run('capturing'),false);
+});
+
+test('stop during reconnect drains pending PCM before stopping and shares the socket',async()=>{
+  const f=fixture({autoStart:false});const start=f.run('startExternal()');
+  await f.open();await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');await start;
+  f.receive({type:'WD_PCM',target:'offscreen',samples:[.1,.2],position:0});
+  f.run('handleServerMessage({data:JSON.stringify({type:"audio_ack",session_id:sessionId,sequence:0})})');
+  f.sockets[0].readyState=3;f.sockets[0].onclose();
+  f.receive({type:'WD_PCM',target:'offscreen',samples:[.3,.4],position:2});
+  const stop=f.run('stopCapture()');
+  await new Promise(setImmediate);
+  assert.equal(f.sockets.length,2);
+  f.sockets[1].open();await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');
+  await stop;
+  const sent=f.sockets[1].sent;
+  const packets=sent.filter(x=>typeof x!=='string');
+  assert.deepEqual(packets.map(x=>new DataView(x).getUint32(4,true)),[1]);
+  assert.equal(JSON.parse(sent.at(-1)).type,'stop');
+});
+
+test('an idle snapshot cannot terminate a new session awaiting its ACK', async () => {
+  const f=fixture({autoStart:false});
+  const start=f.run('startExternal()'); await f.open(); await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"status",state:"idle",snapshot:true})})');
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');
+  await start;
+  assert.equal(f.run('capturing'),true);
+  assert.equal(f.messages.filter(m=>m.type==='STATUS').length,0);
 });
 
 test('settings connection racing a start is shared without cancelling capture', async () => {
@@ -74,4 +133,23 @@ test('settings connection racing a start is shared without cancelling capture', 
   await Promise.all([control, start]);
   assert.equal(f.run('capturing'), true);
   assert.equal(f.sockets[0].sent.map(JSON.parse).filter(m => m.type === 'start').length, 1);
+});
+
+test('native-ended session keeps its tail for export and allows a new capture',async()=>{
+  const f=fixture({autoStart:false});
+  const start=f.run('startExternal()');await f.open();await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');await start;
+  const oldId=f.run('sessionId');
+  f.run('stoppedSession={id:sessionId,position:2,packets:[new ArrayBuffer(24)]};capturing=false;streamReady=false;');
+  const next=f.run('startExternal()');await new Promise(setImmediate);
+  f.receive({type:'WD_PCM',target:'offscreen',samples:[.7,.8],position:0});
+  f.run('handleServerMessage({data:JSON.stringify({type:"error",code:"session_ended",session_id:stoppedSession.id,message:"ended"})})');
+  await new Promise(setImmediate);
+  f.sockets[1].open();await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');await next;
+  assert.notEqual(f.run('sessionId'),oldId);
+  assert.equal(f.run('capturing'),true);
+  assert.equal(f.run('recoveryTails[0].packets.length'),1);
+  assert.equal(f.messages.some(m=>m.type==='CAPTURE_ERROR'),false);
+  assert.equal(f.sockets[1].sent.filter(m=>typeof m!=='string').length,1);
 });

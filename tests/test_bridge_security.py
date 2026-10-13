@@ -48,7 +48,7 @@ def test_real_websocket_auth_reconnect_gap_and_stop(tmp_path):
     paired = pair(ID, tmp_path / 'pair.json')
     received, starts, stops, gaps = [], [], [], []
     bridge = BrowserAudioBridge('127.0.0.1', 0,
-        lambda *args: starts.append(args), received.append, lambda: stops.append(True), gaps.append,
+        lambda *args: starts.append(args), lambda audio, position: received.append((position, audio)), lambda session: stops.append(session), gaps.append,
         pairing_path=tmp_path / 'pair.json')
     async def run():
         async with serve(bridge._handler, '127.0.0.1', 0, process_request=bridge._process_request) as server:
@@ -75,7 +75,8 @@ def test_real_websocket_auth_reconnect_gap_and_stop(tmp_path):
                 await ws.send(json.dumps({'type': 'stop', 'session_id': 'test-session-12345678'}))
                 await ws.send(json.dumps({'type': 'ping'})); await ws.recv()
             assert len(starts) == 1 and len(stops) == 1
-            assert len(b''.join(received)) == 6 * 4
+            assert [position for position, _ in received] == [0, 5]
+            assert len(b''.join(audio for _, audio in received)) == 3 * 4
             assert gaps[0]['samples'] == 3
             async with connect(url, origin='chrome-extension://' + ID) as ws:
                 await ws.send(json.dumps({'type': 'auth', 'secret': paired['secret']})); await ws.recv()

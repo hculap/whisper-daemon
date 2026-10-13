@@ -125,7 +125,8 @@ class MenuBarDelegate(NSObject):
         # Staging buffer for browser PCM that arrives after a reconnect's
         # 'start' but before the meeting worker has created the browser
         # recorder — otherwise the extension's flushed buffer is dropped.
-        self._browser_prebuffer: list[bytes] = []
+        self._browser_prebuffer: list[tuple[bytes, int]] = []
+        self._meeting_session_id = None
         self._browser_prebuffer_bytes = 0
 
         return self
@@ -511,8 +512,13 @@ class MenuBarDelegate(NSObject):
         if self._daemon._state != State.REVIEW:
             _notify("whisper-daemon", "Dictation review", "Enable Review before pasting in Dictation Settings for editable drafts.")
             return
-        text = self._ask_text("Review dictation", self._daemon._review_text, "Edit the text. Save accepts it; Cancel leaves the draft available.")
-        if text is not None: self._daemon._queue.put(Event(EventType.DICTATION_ACCEPT, text))
+        generation = self._daemon._recording_gen
+        shortcut = self._settings.accept_hotkey
+        text = self._ask_text("Review dictation", self._daemon._review_text,
+            f"Save updates the draft. Return to the original text field and press {shortcut} to paste it.")
+        if text is not None:
+            self._daemon._queue.put(Event(EventType.DICTATION_EDIT, {'generation':generation, 'text':text}))
+            _notify("whisper-daemon", "Draft updated", f"Return to the original field and press {shortcut} to paste.")
 
     def _ask_text(self, title, value, description):
         from AppKit import NSAlert, NSTextField
@@ -764,7 +770,7 @@ class MenuBarDelegate(NSObject):
 
     # -- Browser bridge callbacks (called from asyncio thread) --
 
-    def _on_browser_connect(self, title: str, url: str) -> None:
+    def _on_browser_connect(self, title: str, url: str, session_id: str, started_at: float) -> None:
         """Extension started a capture session.
 
         A {"type":"start"} from the extension is always an explicit user
@@ -773,30 +779,46 @@ class MenuBarDelegate(NSObject):
         auto_record_meetings preference, which only governs fully-automatic
         starts and is intentionally not consulted here.
         """
-        if self._meeting_phase == "transcribing" or (self._meeting_active and not self._meeting_browser_triggered): return False
+        if self._meeting_phase != "idle" or (self._meeting_thread and self._meeting_thread.is_alive()): return False
+        with self._browser_audio_lock:
+            self._browser_prebuffer = []
+            self._browser_prebuffer_bytes = 0
         logger.info("Browser capture requested")
-        if not self._meeting_active:
-            AppHelper.callAfter(self._start_meeting, True, title)
+        def start_if_current():
+            # Stop may arrive before Cocoa runs this callback. A cancelled
+            # session must never open the microphone later.
+            if self._browser_bridge.session_id == session_id:
+                self._start_meeting(True, title, started_at, session_id)
+        AppHelper.callAfter(start_if_current)
 
-    def _on_browser_audio(self, data: bytes) -> None:
+    def _on_browser_audio(self, data: bytes, position: int) -> None:
         """Stage the startup tail, then hand off atomically to its source."""
         with self._browser_audio_lock:
             if self._browser_recorder is not None:
-                self._browser_recorder.feed_audio(np.frombuffer(data, dtype="<f4"))
+                self._browser_recorder.feed_audio(np.frombuffer(data, dtype="<f4"), position=position)
                 return
             if self._meeting_phase == "transcribing": return
             if self._browser_prebuffer_bytes + len(data) > BROWSER_PREBUFFER_MAX_BYTES:
                 self._browser_bridge.send_json_str('{"type":"error","message":"Audio startup buffer full; stop and retry"}')
                 AppHelper.callAfter(self._stop_meeting)
                 return
-            self._browser_prebuffer.append(data)
+            self._browser_prebuffer.append((data, position))
             self._browser_prebuffer_bytes += len(data)
 
-    def _on_browser_disconnect(self) -> None:
+    def _on_browser_disconnect(self, session_id: str) -> None:
         """Extension disconnected or stopped capture."""
         logger.info("Browser meeting ended")
-        if self._meeting_active and self._meeting_browser_triggered:
-            AppHelper.callAfter(self._stop_meeting)
+        def stop_if_browser():
+            if self._meeting_session_id == session_id and self._meeting_phase != 'idle':
+                if self._meeting_active and self._meeting_browser_triggered:
+                    self._stop_meeting()
+                # Its worker owns ACKed staging, including during preflight.
+                return
+            if self._browser_bridge.session_id is None:
+                with self._browser_audio_lock:
+                    self._browser_prebuffer = []
+                    self._browser_prebuffer_bytes = 0
+        AppHelper.callAfter(stop_if_browser)
 
     def _list_input_devices(self) -> list[str]:
         """Return the names of available input devices (best-effort)."""
@@ -846,7 +868,7 @@ class MenuBarDelegate(NSObject):
         )
         try:
             self._browser_bridge.send_json_str(
-                build_status_message(phase, elapsed, self._meeting_chunk_count)
+                build_status_message(phase, elapsed, self._meeting_chunk_count, snapshot=True)
             )
         except Exception:
             logger.exception("Failed to push status")
@@ -869,8 +891,6 @@ class MenuBarDelegate(NSObject):
         msg_type = data.get("type")
 
         if msg_type == "audio_gap":
-            if self._meeting_store:
-                self._meeting_store.meta["gaps"].append({"source": "browser", "start": data["end"] - data["samples"] / 16000, "end": data["end"], "reason": "missing packets"})
             _notify("whisper-daemon", "Participant audio gap", f'{data["samples"] / 16000:.2f} seconds missing; silence inserted and marked.')
 
         elif msg_type == "get_settings":
@@ -933,7 +953,7 @@ class MenuBarDelegate(NSObject):
 
     # -- Meeting recording --
 
-    def _start_meeting(self, browser_triggered: bool = False, browser_title: str = "") -> None:
+    def _start_meeting(self, browser_triggered: bool = False, browser_title: str = "", started_at=None, session_id=None) -> None:
         # Guard against duplicate starts: two rapid browser 'start' messages
         # each schedule _start_meeting via callAfter, and _on_browser_connect
         # checks _meeting_active before the first one has run — so the check
@@ -944,7 +964,11 @@ class MenuBarDelegate(NSObject):
             return
         self._meeting_active = True
         self._meeting_browser_triggered = browser_triggered
-        self._meeting_start = time.monotonic()
+        self._meeting_start = time.monotonic() if started_at is None else started_at
+        self._meeting_stopped_at = None
+        self._meeting_session_id = session_id
+        self._meeting_paused = False
+        self._meeting_pause_events = []
         self._meeting_phase = "recording"
         self._meeting_chunk_count = 0
         self._results_sent_count = 0
@@ -967,6 +991,7 @@ class MenuBarDelegate(NSObject):
             # plus the connection-closed callback) — nothing to do.
             return
         self._meeting_active = False
+        self._meeting_stopped_at = time.monotonic()
         self._browser_bridge.end_session()
         self._meeting_phase = "transcribing"
         logger.info("Meeting recording stop requested")
@@ -1009,11 +1034,11 @@ class MenuBarDelegate(NSObject):
                 if not diarize_ready:
                     _notify("whisper-daemon", "Speaker recognition unavailable", self._diarization_status['message'])
                 self._browser_bridge.send_json_str(__import__('json').dumps({"type": "capabilities", "diarization": self._diarization_status}))
-            store = RecordingStore(rec_dir, started_at=self._meeting_start)
-            self._meeting_store = store
+            sources = (['mic'] if settings.capture_mic else []) + (['browser'] if settings.capture_tab and browser_triggered else [])
+            store = RecordingStore(rec_dir, started_at=self._meeting_start, sources=sources)
+            self._attach_recording_store(store)
             jobs = DiskChunkQueue(rec_dir)
-            self._meeting_paused = False
-            if settings.capture_mic:
+            if settings.capture_mic and self._meeting_active:
                 mic = MeetingRecorder(jobs, device=settings.recording_device or None,
                     raw_sink=lambda audio: store.append("mic", audio),
                     paused=lambda: self._meeting_paused)
@@ -1026,21 +1051,21 @@ class MenuBarDelegate(NSObject):
                     _notify("whisper-daemon", "Microphone unavailable", str(exc)[:180])
             if settings.capture_tab and browser_triggered:
                 browser = MeetingRecorder(jobs, source_label="browser",
-                    raw_sink=lambda audio: store.append("browser", audio),
-                    paused=lambda: self._meeting_paused)
+                    raw_sink=lambda audio, position: store.append("browser", audio, at=position),
+                    sample_filter=store.unpaused_audio)
                 browser.start_without_device()
                 recorders.append(browser)
                 # The same lock protects staging and handoff: no PCM can land
                 # between draining the prebuffer and publishing the recorder.
                 with self._browser_audio_lock:
-                    for data in self._browser_prebuffer:
-                        browser.feed_audio(np.frombuffer(data, dtype="<f4"))
+                    for data, position in self._browser_prebuffer:
+                        browser.feed_audio(np.frombuffer(data, dtype="<f4"), position=position)
                     self._browser_prebuffer = []
                     self._browser_prebuffer_bytes = 0
                     self._browser_recorder = browser
             if not recorders:
                 raise RuntimeError("No audio source is available")
-            if settings.capture_screenshots:
+            if settings.capture_screenshots and self._meeting_active:
                 screens = ScreenCapture(rec_dir, interval=settings.screenshot_interval,
                                         displays=settings.screenshot_displays, paused=lambda: self._meeting_paused)
                 screens.start()
@@ -1056,11 +1081,14 @@ class MenuBarDelegate(NSObject):
                             if recorder._source_label == "mic": recorder.stop()
                             else: recorder.stop_without_device()
                     if screens: screens.stop()
-                    store.finish(duration=now - self._meeting_start, state="transcribing")
+                    store.finish(duration=(self._meeting_stopped_at or now) - self._meeting_start, state="transcribing")
                     stopped = True
                 for recorder in recorders:
                     if recorder.error:
                         raise RuntimeError(f"Audio storage failed: {recorder.error}")
+                    if not stopped and recorder.check_liveness(now):
+                        store.meta['errors'].append('Microphone stopped delivering audio; recovery requested')
+                        _notify("whisper-daemon", "Microphone interrupted", "Trying to reconnect. Any missing audio will be marked in the recording.")
                     if (not stopped and recorder._source_label == "mic"
                             and recorder.needs_recovery and now - last_recovery > 10):
                         last_recovery = now
@@ -1084,7 +1112,8 @@ class MenuBarDelegate(NSObject):
                 if now - last_status >= 1:
                     last_status = now
                     self._browser_bridge.send_json_str(build_status_message(
-                        self._meeting_phase, now - self._meeting_start, self._meeting_chunk_count))
+                        self._meeting_phase, now - self._meeting_start, self._meeting_chunk_count,
+                        session_id=self._meeting_session_id))
                     self._browser_bridge.send_json_str(__import__("json").dumps({
                         "type": "health", "sources": store.health(), "paused": self._meeting_paused}))
                 time.sleep(.05)
@@ -1185,7 +1214,7 @@ class MenuBarDelegate(NSObject):
         # Tell the extension the meeting is over so its in-bar button goes idle.
         try:
             self._browser_bridge.send_json_str(
-                build_status_message("idle", 0.0, 0)
+                build_status_message("idle", 0.0, 0, session_id=self._meeting_session_id)
             )
         except Exception:
             logger.debug("Failed to push idle status", exc_info=True)
@@ -1234,9 +1263,18 @@ class MenuBarDelegate(NSObject):
 
     def onPauseMeeting_(self, sender) -> None:
         if not self._meeting_active: return
-        self._meeting_paused = not self._meeting_paused
-        if self._meeting_store: self._meeting_store.pause(self._meeting_paused)
+        with self._browser_audio_lock:
+            self._meeting_paused = not self._meeting_paused
+            elapsed = time.monotonic() - self._meeting_start
+            self._meeting_pause_events.append((elapsed, self._meeting_paused))
+            if self._meeting_store: self._meeting_store.pause(self._meeting_paused, at=elapsed)
         self._set_status_safe("Meeting paused" if self._meeting_paused else "Recording meeting")
+
+    def _attach_recording_store(self, store):
+        with self._browser_audio_lock:
+            for elapsed, paused in self._meeting_pause_events:
+                store.pause(paused, at=elapsed)
+            self._meeting_store = store
 
     def _transcribe_paths_worker(self, paths: list[str]) -> None:
         from whisper_daemon.formats import FORMATTERS

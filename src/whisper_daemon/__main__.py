@@ -50,7 +50,7 @@ def cli(ctx: click.Context) -> None:
 
 @cli.command()
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
-@click.option("--silence-timeout", default=0.7, type=float, help="Seconds of silence before auto-stop.")
+@click.option("--silence-timeout", default=None, type=click.FloatRange(0, 30), help="Override configured silence timeout (0 = manual stop).")
 @click.option("--no-menubar", is_flag=True, help="Run without menu bar icon.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def start(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> None:
@@ -74,8 +74,9 @@ def start(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -
     cmd = [
         sys.executable, "-m", "whisper_daemon", "run",
         "--model", model,
-        "--silence-timeout", str(silence_timeout),
     ]
+    if silence_timeout is not None:
+        cmd.extend(['--silence-timeout', str(silence_timeout)])
     if no_menubar:
         cmd.append("--no-menubar")
     if verbose:
@@ -209,7 +210,7 @@ def status() -> None:
 
 @cli.command()
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
-@click.option("--silence-timeout", default=0.7, type=float, help="Seconds of silence before auto-stop.")
+@click.option("--silence-timeout", default=None, type=click.FloatRange(0, 30), help="Override configured silence timeout (0 = manual stop).")
 @click.option("--no-menubar", is_flag=True, help="Run without menu bar icon.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> None:
@@ -240,9 +241,10 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     event_queue: queue.Queue[Event] = queue.Queue()
 
     logger.info("Initializing components...")
-    recorder = AudioRecorder(event_queue, silence_timeout=settings.dictation_silence if silence_timeout == .7 else silence_timeout, device=device)
+    effective_silence = settings.dictation_silence if silence_timeout is None else silence_timeout
+    recorder = AudioRecorder(event_queue, silence_timeout=effective_silence, device=device)
     hotkey = HotkeyListener(event_queue)
-    daemon = Daemon(event_queue, recorder, model=model, settings=settings)
+    daemon = Daemon(event_queue, recorder, model=model, settings=settings, silence_timeout=silence_timeout)
 
     audio_system.install_topology_listener()
     supervisor.start()
@@ -280,7 +282,7 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
 
     click.echo(f"whisper-daemon running — press Cmd+Shift+Space to record")
     click.echo(f"Model: {model}")
-    click.echo(f"Silence timeout: {silence_timeout}s")
+    click.echo(f"Silence timeout: {effective_silence}s")
     click.echo("Press Ctrl+C to quit")
 
     if no_menubar:
@@ -413,6 +415,7 @@ def transcribe(
     click.echo(f"Model: {model}")
     click.echo(f"Files: {len(files)}")
     click.echo(f"Formats: {', '.join(format_list)}")
+    diarize = _speaker_model_ready(diarize)
     if diarize:
         click.echo("Diarization: enabled")
     click.echo()
@@ -428,12 +431,8 @@ def transcribe(
             continue
 
         if diarize:
-            from whisper_daemon.diarizer import diarize_file as run_diarization
-            from whisper_daemon.diarize_merge import merge_speakers_with_transcript
-
             click.echo("  Diarizing speakers...")
-            speaker_segments = run_diarization(str(file_path), num_speakers=num_speakers)
-            result = merge_speakers_with_transcript(speaker_segments, result)
+            result = _with_optional_speakers(result, str(file_path), num_speakers)
             speaker_count = len(result.get("speakers", []))
             click.echo(f"  Found {speaker_count} speaker(s)")
 
@@ -457,7 +456,7 @@ def transcribe(
 @click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
 @click.option("--chunk-silence", default=1.0, type=float, help="Seconds of silence to split chunks.")
 @click.option("--diarize", is_flag=True, help="Enable speaker diarization (requires HF_TOKEN).")
-@click.option("--diarize-mode", type=click.Choice(["batch", "realtime", "hybrid"]), default="hybrid", help="Diarization approach.")
+@click.option("--diarize-mode", type=click.Choice(["batch", "realtime", "hybrid"]), default="batch", help="Diarization approach.")
 @click.option("--num-speakers", type=int, default=None, help="Expected number of speakers (improves diarization).")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def record(
@@ -481,7 +480,7 @@ def record(
     Examples:
       whisper-daemon record                                   # → recording.txt
       whisper-daemon record meeting.txt --format txt,srt
-      whisper-daemon record meeting.txt --diarize             # hybrid (default)
+      whisper-daemon record meeting.txt --diarize             # batch (default)
       whisper-daemon record meeting.txt --diarize --diarize-mode realtime
       whisper-daemon record meeting.txt --device "BlackHole 2ch"
       whisper-daemon record meeting.txt --device 3            # by device index
@@ -522,6 +521,7 @@ def record(
         click.echo(f"Diarization: {diarize_mode}")
     click.echo()
 
+    diarize = _speaker_model_ready(diarize)
     preload_model(model)
 
     # Set up realtime speaker tracker if needed
@@ -573,9 +573,13 @@ def record(
 
 
             if speaker_tracker is not None:
-                rt_segments = speaker_tracker.identify(chunk.audio, chunk.start_time)
-                if rt_segments:
-                    click.echo(f"    → Speaker {rt_segments[0].speaker + 1}")
+                try:
+                    rt_segments = speaker_tracker.identify(chunk.audio, chunk.start_time)
+                    if rt_segments: click.echo(f"    → Speaker {rt_segments[0].speaker + 1}")
+                except Exception as exc:
+                    click.echo(f"Live speaker recognition unavailable: {exc}. Using final batch labels.")
+                    speaker_tracker = None
+                    diarize_mode = 'batch'
 
             future = pool.submit(transcribe_job, chunk)
             futures[future] = chunk.start_time
@@ -601,7 +605,10 @@ def record(
             chunk_count += 1
             click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
             if speaker_tracker is not None:
-                speaker_tracker.identify(chunk.audio, chunk.start_time)
+                try: speaker_tracker.identify(chunk.audio, chunk.start_time)
+                except Exception:
+                    speaker_tracker = None
+                    diarize_mode = 'batch'
             result = transcribe_job(chunk)
             if result.get("text"):
                 all_results.append((chunk.start_time, result))
@@ -621,11 +628,8 @@ def record(
         from whisper_daemon.diarize_merge import merge_speakers_with_transcript
 
         if diarize_mode in ("batch", "hybrid"):
-            from whisper_daemon.diarizer import diarize_file
-
             click.echo("\nDiarizing continuous audio...")
-            batch_segments = diarize_file(str(capture_dir / "recording.wav"), num_speakers=num_speakers)
-            final_result = merge_speakers_with_transcript(batch_segments, merged)
+            final_result = _with_optional_speakers(merged, str(capture_dir / "recording.wav"), num_speakers)
             speaker_count = len(final_result.get("speakers", []))
             click.echo(f"Found {speaker_count} speaker(s)")
 
@@ -714,6 +718,12 @@ def models():
 def check_models():
     from whisper_daemon.model_policy import local_model, diarization_status
     from whisper_daemon.transcriber import DEFAULT_MODEL
+    from whisper_daemon.vad import SileroVAD
+    try:
+        SileroVAD()
+        click.echo('Silero VAD: cached locally and loadable')
+    except Exception as exc:
+        click.echo(str(exc))
     try:
         local_model(DEFAULT_MODEL)
         click.echo('Whisper: cached locally')
@@ -730,11 +740,29 @@ def prepare_models(diarization):
     """Download models. Diarization needs authorized Hugging Face access."""
     env = dict(os.environ, WHISPER_PREPARE_MODELS='1', HF_HUB_OFFLINE='0', TRANSFORMERS_OFFLINE='0')
     code = ('from whisper_daemon.diarizer import _get_pipeline; _get_pipeline()' if diarization else
-            'from whisper_daemon.transcriber import preload_model; preload_model()')
+            'from whisper_daemon.vad import SileroVAD; SileroVAD(); from whisper_daemon.transcriber import preload_model; preload_model()')
     result = subprocess.run([sys.executable, '-c', code], env=env)
     if result.returncode:
         raise click.ClickException('Model preparation failed. For gated models, grant access on Hugging Face and sign in with hf auth login, then retry.')
     click.echo('Model prepared. Normal recording remains offline.')
+
+
+def _speaker_model_ready(requested):
+    if not requested: return False
+    from whisper_daemon.model_policy import diarization_status
+    status = diarization_status()
+    click.echo(status['message'])
+    return status['available']
+
+
+def _with_optional_speakers(result, audio_path, num_speakers):
+    try:
+        from whisper_daemon.diarizer import diarize_file
+        from whisper_daemon.diarize_merge import merge_speakers_with_transcript
+        return merge_speakers_with_transcript(diarize_file(audio_path, num_speakers=num_speakers), result)
+    except Exception as exc:
+        click.echo(f'Speaker recognition unavailable: {exc}. Full transcript preserved without automatic labels.')
+        return result
 
 
 def _collect_results(

@@ -39,11 +39,13 @@ class Daemon:
         model: str = "mlx-community/whisper-large-v3-turbo-q4",
         settings: object | None = None,
         history_store=None,
+        silence_timeout=None,
     ) -> None:
         self._queue = event_queue
         self._recorder = recorder
         self._model = model
         self._settings = settings
+        self._silence_timeout_override = silence_timeout
         self._state = State.IDLE
         self._running = False
         self._recording_started_at: float = 0.0
@@ -119,6 +121,9 @@ class Daemon:
         elif event.type == EventType.DICTATION_ACCEPT:
             if self._state == State.REVIEW:
                 self._deliver_text(event.payload if isinstance(event.payload, str) else self._review_text)
+        elif event.type == EventType.DICTATION_EDIT:
+            if self._state == State.REVIEW and event.payload['generation'] == self._recording_gen:
+                self._review_text = event.payload['text']
         elif event.type == EventType.PASTE_HISTORY:
             text, target = event.payload
             if target is None or not paste_text(text, target=target):
@@ -142,7 +147,8 @@ class Daemon:
         if self._state == State.IDLE:
             self._paste_target = capture_target()
             if self._settings is not None:
-                self._recorder._silence_timeout = getattr(self._settings, 'dictation_silence', .7)
+                self._recorder._silence_timeout = (self._silence_timeout_override if self._silence_timeout_override is not None
+                    else getattr(self._settings, 'dictation_silence', .7))
             try:
                 self._recorder.start_recording()
             except Exception as exc:
@@ -221,6 +227,7 @@ class Daemon:
             logger.warning("Preview skipped — MLX lock busy")
             return
         try:
+            if gen != self._recording_gen: return
             text = transcribe(audio, model=self._model, **self._transcription_options())
             if gen != self._recording_gen:
                 logger.info("Discarding preview from previous recording")

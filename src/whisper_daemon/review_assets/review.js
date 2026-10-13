@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-let data, assignments = {};
+let data, assignments = {}, revision = 0;
 const time = value => `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2,'0')}`;
 function element(tag, text, cls) { const node=document.createElement(tag); if(text!==undefined) node.textContent=text; if(cls) node.className=cls; return node; }
 function play(start) { $('audio').currentTime=start; $('audio').play().catch(() => {$('status').textContent='Wybierz dostępne źródło audio.';}); }
@@ -22,7 +22,7 @@ function renderTranscript() {
   }
   $('count').textContent=`${shown} / ${data.transcript.segments.length}`;
 }
-function dirty() {$('status').textContent='Niezapisane zmiany';}
+function dirty() {revision++;$('status').textContent='Niezapisane zmiany';}
 function renderTasks() {
   $('tasks').replaceChildren();
   data.notes.tasks.forEach((task,index)=>{
@@ -60,11 +60,20 @@ $('audio').ontimeupdate=()=>{for(const row of document.querySelectorAll('.segmen
 $('addTask').onclick=()=>{data.notes.tasks.push({text:'',owner:'',due:'',start:$('audio').currentTime||0,done:false,confirmed:false});renderTasks();dirty();};
 $('save').onclick=async()=>{
   $('save').disabled=true;
+  const savingRevision=revision;
   try {
     const names=Object.fromEntries(data.transcript.speakers.map(s=>[s.id,s.label]));
     const response=await fetch('save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names,assignments,summary:$('summary').value,tasks:data.notes.tasks})});
     const saved=await response.json();if(!response.ok)throw new Error(saved.error||'Nie udało się zapisać');
-    data=saved;assignments={};$('status').textContent='Zapisano nazwy, notatki i zadania. Eksporty transkrypcji zaktualizowane.';
+    if(revision===savingRevision) {
+      data=saved;assignments={};
+      // Bind inputs to the newly returned objects, without resetting playback.
+      renderSpeakers();renderTasks();renderTranscript();
+      $('summary').value=data.notes.summary;
+      $('status').textContent='Zapisano nazwy, notatki i zadania. Eksporty transkrypcji zaktualizowane.';
+    } else {
+      $('status').textContent='Niezapisane zmiany wprowadzone podczas zapisywania — zapisz ponownie.';
+    }
   } catch(error) {$('status').textContent=error.message;} finally {$('save').disabled=false;}
 };
 fetch('data').then(r=>{if(!r.ok)throw new Error('Brak dostępu do spotkania');return r.json();}).then(value=>{data=value;render();}).catch(error=>{$('status').textContent=error.message;});

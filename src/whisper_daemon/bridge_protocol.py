@@ -80,6 +80,9 @@ def validate_client_message(data):
         if not isinstance(data.get("session_id"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", data["session_id"]):
             raise ValueError("Invalid session ID")
     if kind == "start":
+        elapsed = data.get('audio_elapsed', 0)
+        if type(elapsed) not in (int, float) or not 0 <= elapsed <= 300:
+            raise ValueError('Invalid capture startup time')
         for field in ("meeting_title", "meeting_url"):
             value = data.get(field, "")
             if not isinstance(value, str) or len(value) > 2048 or any(ord(c) < 32 for c in value):
@@ -142,13 +145,15 @@ def build_settings_message(s: Settings, devices: list[str]) -> str:
     })
 
 
-def build_status_message(state: str, elapsed: float, chunks: int) -> str:
+def build_status_message(state: str, elapsed: float, chunks: int, *, session_id=None, snapshot=False) -> str:
     """Build the JSON 'status' message pushed to the extension."""
     return json.dumps({
         "type": "status",
         "state": state,
         "elapsed": elapsed,
         "chunks": chunks,
+        "session_id": session_id,
+        "snapshot": snapshot,
     })
 
 

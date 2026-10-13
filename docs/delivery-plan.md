@@ -15,7 +15,7 @@ the running daemon are preserved until an explicit integration check.
 | M3 | Paired/authenticated bridge, validated sequenced audio; offline models and diarization preflight | implemented; 122 Python + 25 JS tests pass |
 | M4 | Dictation preview/cancel, configurable shortcuts and silence, languages, vocabulary, persistent history, focus protection | implemented; 133 Python tests pass |
 | M5 | Source health indicators, searchable playback, speaker editing, local summaries and action items | implemented; 136 Python + 27 JS tests pass; UI verification follows |
-| M6 | PR, independent subagent review, corrections, final end-to-end verification | pending |
+| M6 | PR, independent subagent review, corrections, final end-to-end verification | implemented; 153 Python + 38 JS tests pass; evidence below |
 
 ## Acceptance evidence
 
@@ -36,9 +36,10 @@ the running daemon are preserved until an explicit integration check.
 
 ## Audit findings
 
-All B01–B09 and the three additional findings are open until their changes and
-regression checks land. External model-account permissions cannot be fabricated;
-their actual verification state must remain explicit.
+All B01–B09 and the three additional findings are implemented in M1–M5 and refined
+by independent review. External model-account permissions cannot be fabricated:
+actual speaker-model inference remains unverified because its authorized model is
+not available locally. Readiness detection and fallback have been verified.
 
 ### M1 evidence
 
@@ -59,3 +60,46 @@ Cancellation generation test rejects a late result after another dictation start
 ### M5 evidence
 
 Local HTTP integration verifies byte-range playback, private routes, cross-origin write rejection, speaker reassignment, new speaker creation and persisted exports. Extractive task suggestions keep source timestamps and require confirmation; no model-invented owners/dates. RTC graph start/stop tests cover positioned PCM and stop during module loading. Screenshot capture observes meeting pause.
+
+### M6 independent review and corrections
+
+Three independent reviewers examined audio persistence/lifecycle, extension/bridge,
+and dictation/review UI. Their reproducible findings were corrected with regression
+tests and re-reviewed. No findings were waived as accepted risk.
+
+| Findings | Severity | Resolution / evidence |
+| --- | --- | --- |
+| A01 replay arrival-time drift; A02 paused replay retained | BLOCKER | Capture positions reach raw storage; capture-time pause mask excludes buffered private samples; exact replay and odd packet boundary tests |
+| A03 silently dead microphone | BLOCKER | Callback liveness requests recovery, warns and marks gaps; worker reproduction verified |
+| A04 one-sample tail; A05 trailing missing source | DEBT | Tail remains 1D; enabled sources receive explicit trailing gap intervals |
+| A06 pause during preflight; A07 stop during initialization | BLOCKER | Timestamped pending pauses are handed off under lock; stopped worker drains acknowledged PCM without opening new devices; final duration uses stop time |
+| B-EXT-1 reconnect ordering; B-EXT-2 stop during start; B-EXT-3 stale idle | BLOCKER | ACK/replay readiness, session-scoped termination, explicit stop during pending start; VM and real WebSocket reproductions verified |
+| D-EXT-1 settings in second tab; D-EXT-2 stale ownership | DEBT | Read-only settings broadcast; terminal idle releases ownership; native controls work without browser ownership |
+| Stop during reconnect and after native session close | BLOCKER | Retained backlog drains before stop over shared connection; ended-session tail can be exported locally without blocking new capture |
+| R-D1 second save loses UI edits; R-D3 implicit VAD download | BLOCKER | Revision-aware save/rebind; VAD prepared explicitly and missing cache fails offline |
+| R-D2 CLI silence overridden; R-D4 cancelled preview inference | DEBT | Explicit runtime override; generation check after model lock acquisition |
+| Native editor focus lead | Preventive correction | Editing keeps REVIEW state; return to original field to accept; generation-scoped edit regression |
+| CLI speaker model readiness / later failure | Preventive correction | Same visible preflight as native capture; failure preserves plain transcript; simulated 401 regression |
+| CLI realtime embedding exception swallowed | DEBT | Propagated error selects final batch labels; full CLI regression verifies one batch call, visible fallback and retained TXT/JSON |
+
+Final accelerated capture now traverses the actual loopback WebSocket and native
+ingress method, not just direct store calls: 6,600 seconds and 105,600,000 samples
+per source, ten-second delayed replay plus duplicate packet, no missing intervals,
+14,254,080-byte RSS growth, 60.88-second runtime. Synthetic PCM and VAD replacement
+are explicit; this is not a 110-minute physical meeting.
+
+`verify_speech_e2e.py` generates PL/EN speech using macOS voices and runs actual
+Silero VAD, the authenticated bridge, disk spool, cached MLX Whisper, source merge
+and review exports with external socket connections forbidden. Both final “42”
+sentences survive. Four segments / 17.2981875-second timeline; runtime 8.47 seconds.
+
+Chrome UI verification: search and timestamp playback, speaker/task editing, two
+successive saves and reload preserve the second edits. Screenshot evidence retained
+locally with synthetic content. Physical default-microphone smoke test received
+and saved about five seconds, with initial/trailing device latency marked as gaps;
+its audio was deleted with the isolated temporary test directory.
+
+Packaging: offline wheel build includes all three local review assets. The
+production daemon and installed Chrome extension were not restarted or upgraded.
+No actual 110-minute call, installed-extension tabCapture, permission-dialog flow,
+or authorized diarization inference was claimed by these checks.

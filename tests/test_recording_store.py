@@ -93,3 +93,79 @@ def test_paused_audio_is_omitted_and_explicit_gap_keeps_wall_time(tmp_path):
     assert store.frames['mic'] == 64000
     assert store.meta['gaps'][0]['start'] == 1
     assert store.meta['gaps'][0]['end'] == 3
+
+
+def browser_recorder(store, monkeypatch):
+    from whisper_daemon import meeting_recorder as mod
+    class VAD:
+        def reset_states(self): pass
+        def __call__(self, samples): return 1
+    monkeypatch.setattr(mod, 'SileroVAD', VAD)
+    jobs = queue.Queue()
+    recorder = mod.MeetingRecorder(jobs, source_label='browser',
+        raw_sink=lambda audio, position: store.append('browser', audio, at=position),
+        sample_filter=store.unpaused_audio)
+    recorder.start_without_device()
+    return recorder, jobs
+
+
+def test_reconnect_replay_uses_capture_positions_not_arrival_time(tmp_path, monkeypatch):
+    now = [0.0]
+    store = RecordingStore(tmp_path, clock=lambda: now[0])
+    recorder, jobs = browser_recorder(store, monkeypatch)
+    for position in range(0, 16384, 512):
+        now[0] = (position + 512) / 16000
+        recorder.feed_audio(np.full(512, .1, dtype=np.float32), position=position)
+    now[0] = 6.144
+    for position in range(16384, 98304, 512):
+        recorder.feed_audio(np.full(512, .2, dtype=np.float32), position=position)
+    recorder.stop_without_device()
+    store.finish(duration=6.144)
+    assert store.frames['browser'] == 98304
+    assert store.meta['gaps'] == []
+    assert np.all(np.fromfile(tmp_path / 'browser.f32', dtype='<f4')[16384:] == .2)
+
+
+def test_capture_time_pause_excludes_replayed_pcm_and_keeps_earlier_audio(tmp_path, monkeypatch):
+    now = [0.0]
+    store = RecordingStore(tmp_path, clock=lambda: now[0])
+    recorder, jobs = browser_recorder(store, monkeypatch)
+    now[0] = 2; store.pause(True)
+    # Late, but captured before pause: it must survive.
+    recorder.feed_audio(np.full(32000, .1, dtype=np.float32), position=0)
+    now[0] = 4; store.pause(False)
+    now[0] = 6
+    recorder.feed_audio(np.full(32000, .9, dtype=np.float32), position=32000)
+    recorder.feed_audio(np.full(32000, .2, dtype=np.float32), position=64000)
+    recorder.stop_without_device()
+    store.finish(duration=6)
+    raw = np.fromfile(tmp_path / 'browser.f32', dtype='<f4')
+    assert np.all(raw[:32000] == .1)
+    assert not np.any(raw[32000:64000])
+    assert np.all(raw[64000:] == .2)
+    while not jobs.empty():
+        chunk = jobs.get_nowait()
+        if chunk is not None: assert not np.any(chunk.audio == .9)
+    assert store.meta['gaps'] == [{'source':'browser', 'start':2., 'end':4., 'reason':'paused'}]
+
+
+def test_one_sample_tail_finishes_and_trailing_loss_is_reported(tmp_path, monkeypatch):
+    store = RecordingStore(tmp_path, clock=lambda: 0)
+    recorder, _ = browser_recorder(store, monkeypatch)
+    recorder.feed_audio(np.zeros(320001, dtype=np.float32), position=0)
+    recorder.stop_without_device()
+    store.finish(duration=21)
+    assert store.frames['browser'] == 320001
+    assert store.meta['gaps'][-1] == {'source':'browser', 'start':320001/16000,
+                                    'end':21., 'reason':'missing audio'}
+
+
+def test_callback_liveness_detects_dead_mic_even_when_paused(monkeypatch, tmp_path):
+    store = RecordingStore(tmp_path, clock=lambda: 0)
+    recorder, _ = browser_recorder(store, monkeypatch)
+    recorder._source_label = 'mic'
+    recorder._paused = lambda: True
+    recorder._last_audio_at = 100
+    assert recorder.check_liveness(111)
+    assert recorder.needs_recovery
+    assert not recorder.check_liveness(112)  # one alert per failure

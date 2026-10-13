@@ -92,6 +92,8 @@ def test_build_status_message_shape():
         "state": "recording",
         "elapsed": 12.5,
         "chunks": 3,
+        "session_id": None,
+        "snapshot": False,
     }
 
 

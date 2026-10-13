@@ -34,9 +34,9 @@ class BrowserAudioBridge:
         self,
         host: str,
         port: int,
-        on_connect: Callable[[str, str], None],
-        on_audio: Callable[[bytes], None],
-        on_disconnect: Callable[[], None],
+        on_connect: Callable[[str, str, str, float], bool | None],
+        on_audio: Callable[[bytes, int], None],
+        on_disconnect: Callable[[str], None],
         on_control: Callable[[dict], None] | None = None,
         pairing_path=None,
     ) -> None:
@@ -85,6 +85,10 @@ class BrowserAudioBridge:
     @property
     def connected(self) -> bool:
         return self._ws is not None
+
+    @property
+    def session_id(self):
+        return self._session_id
 
     def _schedule_send(self, msg: str) -> None:
         """Schedule a send on the bridge loop without ever raising.
@@ -230,6 +234,7 @@ class BrowserAudioBridge:
         if old is not None: await old.close()
         await ws.send(json.dumps({"type": "authenticated"}))
         attached_session = None
+        error_code, error_session = 'invalid_message', None
         try:
             async for message in ws:
                 if isinstance(message, bytes):
@@ -238,15 +243,15 @@ class BrowserAudioBridge:
                     accepted = self._audio_sequence.accept(message)
                     if accepted:
                         audio, gap = accepted
+                        position = self._audio_sequence.frames - len(audio) // 4
                         if gap:
                             if self._on_control:
                                 self._on_control({"type": "audio_gap", "samples": gap,
                                                   "end": (self._audio_sequence.frames - len(audio) // 4) / 16000})
-                            while gap:
-                                size = min(gap, 4096)
-                                self._on_audio(bytes(size * 4))
-                                gap -= size
-                        self._on_audio(audio)
+                        # Preserve capture position all the way to disk. The
+                        # source store inserts/marks gaps without transcribing
+                        # fabricated silence or using reconnect arrival time.
+                        self._on_audio(audio, position)
                     await ws.send(json.dumps({"type": "audio_ack", "session_id": self._session_id,
                                                "sequence": self._audio_sequence.sequence}))
                     continue
@@ -256,26 +261,30 @@ class BrowserAudioBridge:
                 if kind == 'start':
                     session = data['session_id']
                     if session in self._closed_sessions:
+                        error_code, error_session = 'session_ended', session
                         raise ValueError("This meeting has ended; start a new capture")
                     if self._session_id and self._session_id != session:
                         raise ValueError("Another meeting owns the audio bridge")
                     if self._session_id is None:
-                        accepted = self._on_connect(data.get('meeting_title', ''), data.get('meeting_url', ''))
-                        if accepted is False: raise ValueError("Meeting is still being finalized")
                         self._session_id = session
+                        accepted = self._on_connect(data.get('meeting_title', ''), data.get('meeting_url', ''),
+                            session, time.monotonic() - data.get('audio_elapsed', 0))
+                        if accepted is False:
+                            self.end_session()
+                            raise ValueError("Meeting is still being finalized")
                         self._audio_sequence = AudioSequence()
                     attached_session = session
                     await ws.send(json.dumps({'type': 'started', 'session_id': session}))
                 elif kind == 'stop':
                     if data['session_id'] == self._session_id:
                         self.end_session()
-                        self._on_disconnect()
+                        self._on_disconnect(data['session_id'])
                 elif kind == 'ping':
                     await ws.send(json.dumps({'type': 'pong'}))
                 elif kind in _CONTROL_TYPES and self._on_control:
                     self._on_control(data)
         except ValueError as exc:
-            await ws.send(json.dumps({'type': 'error', 'message': str(exc)}))
+            await ws.send(json.dumps({'type': 'error', 'message': str(exc), 'code': error_code, 'session_id': error_session}))
             await ws.close(1008, str(exc)[:100])
         except websockets.exceptions.ConnectionClosed:
             pass

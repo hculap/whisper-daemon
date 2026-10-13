@@ -240,7 +240,7 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     event_queue: queue.Queue[Event] = queue.Queue()
 
     logger.info("Initializing components...")
-    recorder = AudioRecorder(event_queue, silence_timeout=silence_timeout, device=device)
+    recorder = AudioRecorder(event_queue, silence_timeout=settings.dictation_silence if silence_timeout == .7 else silence_timeout, device=device)
     hotkey = HotkeyListener(event_queue)
     daemon = Daemon(event_queue, recorder, model=model, settings=settings)
 

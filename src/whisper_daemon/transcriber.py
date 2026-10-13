@@ -77,7 +77,7 @@ def preload_model(model: str = DEFAULT_MODEL) -> None:
     logger.info("Model preloaded and ready")
 
 
-def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL) -> str:
+def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL, language: str | None = None, initial_prompt: str | None = None) -> str:
     """Transcribe audio array to text using mlx-whisper.
 
     Args:
@@ -107,6 +107,8 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL) -> str:
                     temperature=0,
                     condition_on_previous_text=False,
                     word_timestamps=False,
+                    language=language,
+                    initial_prompt=initial_prompt,
                 )
             finally:
                 watchdog.cancel()

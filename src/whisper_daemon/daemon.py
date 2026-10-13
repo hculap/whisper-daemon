@@ -11,6 +11,9 @@ import numpy as np
 from whisper_daemon import audio_system, supervisor, telemetry
 from whisper_daemon.events import Event, EventType
 from whisper_daemon.paster import paste_text
+from whisper_daemon.focus import capture_target
+from whisper_daemon.history import HistoryStore
+from whisper_daemon.notify import notify
 from whisper_daemon.recorder import AudioRecorder
 from whisper_daemon.sounds import play_error, play_start, play_stop
 from whisper_daemon.transcriber import MLX_LOCK, transcribe
@@ -23,6 +26,7 @@ class State(Enum):
     IDLE = auto()
     RECORDING = auto()
     TRANSCRIBING = auto()
+    REVIEW = auto()
 
 
 class Daemon:
@@ -34,6 +38,7 @@ class Daemon:
         recorder: AudioRecorder,
         model: str = "mlx-community/whisper-large-v3-turbo-q4",
         settings: object | None = None,
+        history_store=None,
     ) -> None:
         self._queue = event_queue
         self._recorder = recorder
@@ -42,8 +47,11 @@ class Daemon:
         self._state = State.IDLE
         self._running = False
         self._recording_started_at: float = 0.0
-        self._history: list[str] = []
-        self._max_history = 5
+        self._history_store = history_store if history_store is not None else HistoryStore()
+        self._history = self._history_store.texts()
+        self._max_history = 100
+        self._paste_target = None
+        self._review_text = ""
 
         # Progressive transcription state
         self._pending_text: str = ""
@@ -106,6 +114,15 @@ class Daemon:
     def _handle_event(self, event: Event) -> None:
         if event.type == EventType.RECORD_TOGGLE:
             self._handle_toggle()
+        elif event.type == EventType.RECORD_CANCEL:
+            self._cancel_dictation()
+        elif event.type == EventType.DICTATION_ACCEPT:
+            if self._state == State.REVIEW:
+                self._deliver_text(event.payload if isinstance(event.payload, str) else self._review_text)
+        elif event.type == EventType.PASTE_HISTORY:
+            text, target = event.payload
+            if target is None or not paste_text(text, target=target):
+                notify("whisper-daemon", "Select an input first", "Focus a text field, then use Paste last or choose an entry from Recent.")
         elif event.type == EventType.RECORD_STOP:
             self._handle_record_stop()
         elif event.type == EventType.RECORD_DEVICE_DEAD:
@@ -123,6 +140,9 @@ class Daemon:
 
     def _handle_toggle(self) -> None:
         if self._state == State.IDLE:
+            self._paste_target = capture_target()
+            if self._settings is not None:
+                self._recorder._silence_timeout = getattr(self._settings, 'dictation_silence', .7)
             try:
                 self._recorder.start_recording()
             except Exception as exc:
@@ -201,7 +221,7 @@ class Daemon:
             logger.warning("Preview skipped — MLX lock busy")
             return
         try:
-            text = transcribe(audio, model=self._model)
+            text = transcribe(audio, model=self._model, **self._transcription_options())
             if gen != self._recording_gen:
                 logger.info("Discarding preview from previous recording")
                 return
@@ -225,7 +245,7 @@ class Daemon:
 
         if audio.size == 0:
             logger.warning("No audio captured")
-            self._queue.put(Event(EventType.TRANSCRIPTION_DONE, ""))
+            self._queue.put(Event(EventType.TRANSCRIPTION_DONE, {"generation": self._recording_gen, "text": ""}))
             return
 
         # Skip transcription when VAD never caught voice — on silent input Whisper
@@ -242,7 +262,7 @@ class Daemon:
                 audio_system.mark_dirty("recording captured only zeros")
                 audio_system.ensure_fresh()
             play_error()
-            self._queue.put(Event(EventType.TRANSCRIPTION_DONE, ""))
+            self._queue.put(Event(EventType.TRANSCRIPTION_DONE, {"generation": self._recording_gen, "text": ""}))
             return
 
         # A preview is never the final result: even a short tail may contain
@@ -252,12 +272,12 @@ class Daemon:
         telemetry.mark("transcribe_start", mode="full", new_audio_sec=round(new_seconds, 1))
         thread = threading.Thread(
             target=self._transcribe_worker,
-            args=(audio,),
+            args=(audio, self._recording_gen),
             daemon=True,
         )
         thread.start()
 
-    def _transcribe_worker(self, audio: np.ndarray) -> None:
+    def _transcribe_worker(self, audio: np.ndarray, generation: int) -> None:
         audio_sec = len(audio) / 16000
         # Generous wait for whatever inference is queued ahead of us
         # (preview, meeting chunk). A genuinely hung holder is handled by
@@ -266,42 +286,59 @@ class Daemon:
 
         if not self._mlx_lock.acquire(timeout=timeout_sec):
             logger.error("MLX lock timeout (>%.0fs) — prior inference stuck", timeout_sec)
-            self._queue.put(Event(EventType.ERROR, "mlx busy"))
+            self._queue.put(Event(EventType.ERROR, {"generation": generation, "message": "mlx busy"}))
             return
         try:
-            text = transcribe(audio, model=self._model)
+            if generation != self._recording_gen: return
+            text = transcribe(audio, model=self._model, **self._transcription_options())
             telemetry.mark("transcribe_done", chars=len(text))
-            self._queue.put(Event(EventType.TRANSCRIPTION_DONE, text))
+            self._queue.put(Event(EventType.TRANSCRIPTION_DONE, {"generation": generation, "text": text}))
         except Exception as exc:
             logger.exception("Transcription worker failed")
-            self._queue.put(Event(EventType.ERROR, str(exc)))
+            self._queue.put(Event(EventType.ERROR, {"generation": generation, "message": str(exc)}))
         finally:
             self._mlx_lock.release()
 
-    def _handle_transcription_done(self, text: str) -> None:
-        # Late posts arrive if the watchdog already recovered state — drop them
-        # so we don't paste into whatever window has focus post-recovery.
-        if self._state != State.TRANSCRIBING:
-            logger.info(
-                "Discarding late transcription (%d chars) — state=%s",
-                len(text), self._state.name,
-            )
+    def _transcription_options(self):
+        language = getattr(self._settings, 'dictation_language', 'auto')
+        vocabulary = getattr(self._settings, 'dictation_vocabulary', [])
+        return {'language': None if language == 'auto' else language,
+                'initial_prompt': ', '.join(vocabulary)[:2000] or None}
+
+    def _cancel_dictation(self):
+        if self._state == State.RECORDING: self._recorder.stop_recording()
+        self._recording_gen += 1
+        self._pending_text = self._review_text = ''
+        self._pending_samples = 0
+        self._state = State.IDLE
+
+    def _handle_transcription_done(self, result) -> None:
+        if not isinstance(result, dict) or result.get('generation') != self._recording_gen:
             return
+        if self._state != State.TRANSCRIBING: return
+        text = result.get('text', '')
+        if text and getattr(self._settings, 'dictation_confirm', False):
+            self._review_text = text
+            self._pending_text = text
+            self._state = State.REVIEW
+            return
+        self._deliver_text(text)
 
+    def _deliver_text(self, text):
         if text:
-            paste_text(text)
-            telemetry.mark("paste_done", chars=len(text))
-            self._history.insert(0, text)
-            if len(self._history) > self._max_history:
-                self._history.pop()
-        else:
-            logger.info("Empty transcription, nothing to paste")
-
-        self._pending_text = ""
+            # Persist first: a focus change or paste failure must never lose a
+            # finished dictation. Cancelled/rejected drafts are not retained.
+            self._history_store.add(text)
+            self._history = self._history_store.texts()
+            if self._paste_target is None or not paste_text(text, target=self._paste_target):
+                notify('whisper-daemon', 'Dictation saved in Recent',
+                       'The focused input changed or cannot be verified. Choose a target and paste from Recent.')
+            else:
+                telemetry.mark('paste_done', chars=len(text))
+        self._pending_text = self._review_text = ''
         self._pending_samples = 0
         self._state = State.IDLE
         telemetry.flush()
-        logger.info("State: TRANSCRIBING -> IDLE")
 
     def _handle_paste_last(self) -> None:
         if self._history:
@@ -345,8 +382,12 @@ class Daemon:
         else:
             logger.info("Clipboard empty, nothing to speak")
 
-    def _handle_error(self, message: str) -> None:
+    def _handle_error(self, message) -> None:
+        if isinstance(message, dict):
+            if message.get("generation") != self._recording_gen: return
+            message = message.get("message", "Transcription failed")
         play_error()
+        notify("whisper-daemon", "Dictation error", str(message)[:200])
         logger.error("Error: %s", message)
         if self._state == State.RECORDING:
             self._recorder.stop_recording()

@@ -21,11 +21,16 @@ SOURCES = ('mic', 'browser')
 
 
 def atomic_json(path: Path, value: object) -> None:
-    temp = path.with_suffix(path.suffix + '.tmp')
-    with temp.open('w', encoding='utf-8') as file:
-        json.dump(value, file, ensure_ascii=False, allow_nan=False)
-        file.flush()
-        os.fsync(file.fileno())
+    import tempfile
+    with tempfile.NamedTemporaryFile(mode='w', dir=path.parent, delete=False, encoding='utf-8') as file:
+        temp = Path(file.name)
+        try:
+            json.dump(value, file, ensure_ascii=False, allow_nan=False)
+            file.flush()
+            os.fsync(file.fileno())
+        except BaseException:
+            temp.unlink(missing_ok=True)
+            raise
     temp.replace(path)
 
 

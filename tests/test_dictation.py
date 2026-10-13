@@ -13,7 +13,7 @@ def test_final_transcription_includes_audio_after_preview(monkeypatch):
     daemon._pending_text = "preview only"
     daemon._pending_samples = 128000
     seen = []
-    daemon._transcribe_worker = lambda final: seen.append(final)
+    daemon._transcribe_worker = lambda final, *args: seen.append(final)
     class InlineThread:
         def __init__(self, target, args, **kwargs): self.target, self.args = target, args
         def start(self): self.target(*self.args)

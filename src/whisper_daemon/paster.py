@@ -18,12 +18,14 @@ V_KEYCODE = 9  # macOS virtual keycode for 'v'
 PASTE_SETTLE_DELAY = 0.2  # seconds to wait for paste to complete
 
 
-def paste_text(text: str) -> None:
+def paste_text(text: str, target=None) -> bool:
     """Paste text into the currently focused text field.
 
     Saves the current clipboard, sets the transcription, simulates Cmd+V,
     then restores the original clipboard content.
     """
+    from whisper_daemon.focus import target_matches
+    if target is not None and not target_matches(target): return False
     pb = NSPasteboard.generalPasteboard()
 
     saved = []
@@ -38,6 +40,7 @@ def paste_text(text: str) -> None:
     pb.setString_forType_(text, NSPasteboardTypeString)
     owned_version = pb.changeCount()
     try:
+        if target is not None and not target_matches(target): return False
         _simulate_cmd_v()
         time.sleep(PASTE_SETTLE_DELAY)
     finally:
@@ -48,6 +51,7 @@ def paste_text(text: str) -> None:
                 pb.writeObjects_(saved)
 
     logger.info("Pasted %d chars", len(text))
+    return True
 
 
 def _simulate_cmd_v() -> None:

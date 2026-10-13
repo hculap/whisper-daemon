@@ -47,3 +47,11 @@ def test_paste_does_not_overwrite_new_user_copy(monkeypatch):
     monkeypatch.setattr(paster.time, "sleep", copy_during_paste)
     paster.paste_text("dictation")
     assert pb.items[0].values == {"public.text": b"new copy"}
+
+
+def test_changed_input_prevents_any_clipboard_mutation(monkeypatch):
+    from whisper_daemon import focus
+    pb = setup(monkeypatch)
+    monkeypatch.setattr(focus, 'target_matches', lambda _: False)
+    assert paster.paste_text('should not paste', target=object()) is False
+    assert pb.version == 0

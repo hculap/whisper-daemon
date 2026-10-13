@@ -274,7 +274,7 @@ class AudioRecorder:
         elif self._voice_detected:
             if self._silence_start is None:
                 self._silence_start = now
-            elif now - self._silence_start >= self._silence_timeout:
+            elif self._silence_timeout > 0 and now - self._silence_start >= self._silence_timeout:
                 telemetry.mark("vad_silence")
                 logger.info("VAD: silence detected (%.1fs)", self._silence_timeout)
                 self._queue.put(Event(EventType.RECORD_STOP))

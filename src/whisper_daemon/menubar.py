@@ -53,6 +53,7 @@ ICONS = {
     State.IDLE: "🎙",
     State.RECORDING: "🔴",
     State.TRANSCRIBING: "⏳",
+    State.REVIEW: "✏️",
 }
 
 MEETING_RECORDING_SYMBOL = "🔴"
@@ -66,6 +67,7 @@ TITLES = {
     State.IDLE: "Ready",
     State.RECORDING: "Recording...",
     State.TRANSCRIBING: "Transcribing...",
+    State.REVIEW: "Review dictation — accept or cancel",
 }
 
 
@@ -99,6 +101,7 @@ class MenuBarDelegate(NSObject):
         # forwarded to the extension — captions are send-once + append (F5).
         self._results_sent_count = 0
         self._last_state = State.IDLE
+        self._last_history = ()
         # Guards cross-thread access to self._settings: set_settings applies on
         # the bridge/worker thread while native menu toggles mutate on the main
         # thread (F14).
@@ -143,6 +146,29 @@ class MenuBarDelegate(NSObject):
         menu.addItem_(self._status_menu_item)
 
         menu.addItem_(NSMenuItem.separatorItem())
+
+        self._preview_item = _make_item("Dictation preview: —", None, None)
+        self._preview_item.setEnabled_(False)
+        menu.addItem_(self._preview_item)
+        menu.addItem_(_make_item("Review / Edit Dictation…", "onReviewDictation:", self))
+        menu.addItem_(_make_item("Cancel Dictation", "onCancelDictation:", self))
+        dictation_menu = NSMenu.alloc().init()
+        self._confirm_item = _make_item("Review before pasting", "onConfirmDictation:", self)
+        self._confirm_item.setState_(1 if self._settings.dictation_confirm else 0)
+        dictation_menu.addItem_(self._confirm_item)
+        for index, language in enumerate(("Auto", "Polski", "English")):
+            item = _make_item(f"Language: {language}", "onDictationLanguage:", self)
+            item.setTag_(index)
+            dictation_menu.addItem_(item)
+        dictation_menu.addItem_(_make_item("Silence before stop…", "onDictationSilence:", self))
+        dictation_menu.addItem_(_make_item("Vocabulary…", "onDictationVocabulary:", self))
+        for index, action in enumerate(("Record", "Paste last", "Cancel", "Accept", "Speak")):
+            item = _make_item(f"Shortcut: {action}…", "onDictationShortcut:", self)
+            item.setTag_(index)
+            dictation_menu.addItem_(item)
+        item = _make_item("Dictation Settings", None, None)
+        item.setSubmenu_(dictation_menu)
+        menu.addItem_(item)
 
         # Recent transcriptions submenu
         self._recent_menu_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -330,12 +356,14 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def pollState_(self, timer):
         supervisor.beat("main-thread")
+        preview = self._daemon._pending_text.replace("\n", " ")
+        self._preview_item.setTitle_("Preview: " + (preview[-180:] or "—"))
         if self._meeting_active:
             elapsed = time.monotonic() - self._meeting_start
             mins, secs = divmod(int(elapsed), 60)
             self._set_icon(State.RECORDING)
             self._meeting_menu_item.setTitle_(f"Stop Recording ({mins}:{secs:02d})")
-            self._status_menu_item.setTitle_(f"Meeting recording ({mins}:{secs:02d})")
+            self._status_menu_item.setTitle_(f"Meeting {'paused' if self._meeting_paused else 'recording'} ({mins}:{secs:02d})")
             return
 
         state = self._daemon._state
@@ -455,34 +483,94 @@ class MenuBarDelegate(NSObject):
 
     def _update_recent_menu(self):
         history = self._daemon.history
-        if not history:
-            return
-
-        current_count = self._recent_menu.numberOfItems()
-        if current_count == len(history):
-            # Check if first item matches — if so, no update needed
-            first = self._recent_menu.itemAtIndex_(0)
-            if first and str(first.title()).startswith(history[0][:30]):
-                return
-
+        if tuple(history) == self._last_history: return
+        self._last_history = tuple(history)
         self._recent_menu.removeAllItems()
-        for i, text in enumerate(history):
-            truncated = text[:50] + "..." if len(text) > 50 else text
-            truncated = truncated.replace("\n", " ")
-            item = _make_item(f"\"{truncated}\"", "onCopyRecent:", self)
-            item.setTag_(i)
+        for index, text in enumerate(history):
+            item = _make_item(text[:70].replace("\n", " "), "onCopyRecent:", self)
+            item.setTag_(index)
+            item.setToolTip_("Paste this dictation into the focused input")
             self._recent_menu.addItem_(item)
 
-    @objc.typedSelector(b"v@:@")
     def onCopyRecent_(self, sender):
-        idx = sender.tag()
+        from whisper_daemon.events import Event, EventType
+        from whisper_daemon.focus import capture_target
         history = self._daemon.history
-        if idx < len(history):
-            from AppKit import NSPasteboard, NSPasteboardTypeString
-            pb = NSPasteboard.generalPasteboard()
-            pb.clearContents()
-            pb.setString_forType_(history[idx], NSPasteboardTypeString)
-            logger.info("Copied transcription #%d to clipboard (%d chars)", idx + 1, len(history[idx]))
+        if 0 <= sender.tag() < len(history):
+            self._daemon._queue.put(Event(EventType.PASTE_HISTORY, (history[sender.tag()], capture_target())))
+
+    def onCancelDictation_(self, sender):
+        from whisper_daemon.events import Event, EventType
+        self._daemon._queue.put(Event(EventType.RECORD_CANCEL))
+
+    def onReviewDictation_(self, sender):
+        from whisper_daemon.events import Event, EventType
+        if self._daemon._state != State.REVIEW:
+            _notify("whisper-daemon", "Dictation review", "Enable Review before pasting in Dictation Settings for editable drafts.")
+            return
+        text = self._ask_text("Review dictation", self._daemon._review_text, "Edit the text. Save accepts it; Cancel leaves the draft available.")
+        if text is not None: self._daemon._queue.put(Event(EventType.DICTATION_ACCEPT, text))
+
+    def _ask_text(self, title, value, description):
+        from AppKit import NSAlert, NSTextField
+        alert = NSAlert.alloc().init()
+        alert.setMessageText_(title)
+        alert.setInformativeText_(description)
+        field = NSTextField.alloc().initWithFrame_(((0, 0), (480, 80)))
+        field.setStringValue_(value)
+        field.setEditable_(True)
+        field.setSelectable_(True)
+        alert.setAccessoryView_(field)
+        alert.addButtonWithTitle_("Save")
+        alert.addButtonWithTitle_("Cancel")
+        return str(field.stringValue()) if alert.runModal() == 1000 else None
+
+    def _save_dictation_settings(self):
+        self._daemon._settings = self._settings
+        save_settings(self._settings)
+
+    def onConfirmDictation_(self, sender):
+        self._settings.dictation_confirm = not self._settings.dictation_confirm
+        sender.setState_(1 if self._settings.dictation_confirm else 0)
+        self._save_dictation_settings()
+
+    def onDictationLanguage_(self, sender):
+        self._settings.dictation_language = ("auto", "pl", "en")[sender.tag()]
+        self._save_dictation_settings()
+        _notify("whisper-daemon", "Dictation language", self._settings.dictation_language)
+
+    def onDictationSilence_(self, sender):
+        value = self._ask_text("Silence before stop", str(self._settings.dictation_silence), "Seconds, from 0 to 30. Use 0 to stop only with the shortcut.")
+        if value is None: return
+        try:
+            seconds = float(value)
+            if not 0 <= seconds <= 30: raise ValueError()
+            self._settings.dictation_silence = seconds
+            self._save_dictation_settings()
+        except ValueError:
+            _notify("whisper-daemon", "Invalid silence duration", "Enter a number between 0 and 30.")
+
+    def onDictationVocabulary_(self, sender):
+        value = self._ask_text("Dictation vocabulary", ", ".join(self._settings.dictation_vocabulary), "Names and specialist words, separated by commas. Used as transcription hints.")
+        if value is not None:
+            self._settings.dictation_vocabulary = [word.strip()[:100] for word in value.split(",") if word.strip()][:100]
+            self._save_dictation_settings()
+
+    def onDictationShortcut_(self, sender):
+        import dataclasses
+        from whisper_daemon.shortcuts import parse_shortcut
+        action = ("record", "paste", "cancel", "accept", "speak")[sender.tag()]
+        key = action + "_hotkey"
+        value = self._ask_text("Shortcut: " + action, getattr(self._settings, key), "Example: cmd+shift+space. Modifiers: cmd, shift, alt, ctrl.")
+        if value is None: return
+        try:
+            parse_shortcut(value)
+            changed = dataclasses.replace(self._settings, **{key: value.lower()})
+            self._hotkey.configure(changed)
+            self._settings = changed
+            self._save_dictation_settings()
+        except ValueError as exc:
+            _notify("whisper-daemon", "Invalid shortcut", str(exc))
 
     # -- Settings actions --
 

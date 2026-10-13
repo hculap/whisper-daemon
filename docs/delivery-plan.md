@@ -13,7 +13,7 @@ the running daemon are preserved until an explicit integration check.
 | M1 | B01 double PCM; B02 merge loss; B06 empty CLI; B07 dictation tail; B08 clipboard; B09 extension races | implemented; 103 Python + 25 JS tests pass |
 | M2 | B03 continuous source audio; B04 crash recovery; B05 session ownership; bounded queues, pause/resume, 110-minute capture | implemented; 111 Python tests pass |
 | M3 | Paired/authenticated bridge, validated sequenced audio; offline models and diarization preflight | implemented; 122 Python + 25 JS tests pass |
-| M4 | Dictation preview/cancel, configurable shortcuts and silence, languages, vocabulary, persistent history, focus protection | pending |
+| M4 | Dictation preview/cancel, configurable shortcuts and silence, languages, vocabulary, persistent history, focus protection | implemented; 133 Python tests pass |
 | M5 | Source health indicators, searchable playback, speaker editing, local summaries and action items | pending |
 | M6 | PR, independent subagent review, corrections, final end-to-end verification | pending |
 
@@ -51,3 +51,7 @@ Regression failures reproduced before fixes: cross-source transcript loss, lost 
 ### M3 evidence
 
 Real loopback WebSocket test rejects an unpaired origin, wrong secret and malformed JSON; reconnect replays are idempotent and missing PCM is filled/marked. Missing-model check runs with socket.connect forbidden. `models check` confirms local Whisper cache, unavailable diarization model, and enforced offline/telemetry policy. Gated model access is still an external requirement; no credentials or recordings were uploaded. Extension now requires explicit pairing; protocol is incompatible with old extension versions.
+
+### M4 evidence
+
+Cancellation generation test rejects a late result after another dictation starts. Focus rejection preserves text in persistent history without touching the clipboard. Review mode needs an explicit accept and supports edited text. Settings roundtrip covers PL, vocabulary, pause and custom shortcut; native AX probe can identify the current input. History is local, limited to 100 entries and mode 0600. Native menu exposes all controls.

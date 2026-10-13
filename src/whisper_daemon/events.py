@@ -8,6 +8,9 @@ from typing import Any
 class EventType(Enum):
     RECORD_TOGGLE = auto()
     RECORD_STOP = auto()
+    RECORD_CANCEL = auto()
+    DICTATION_ACCEPT = auto()
+    PASTE_HISTORY = auto()
     RECORD_DEVICE_DEAD = auto()
     TRANSCRIBE_PREVIEW = auto()
     TRANSCRIPTION_DONE = auto()

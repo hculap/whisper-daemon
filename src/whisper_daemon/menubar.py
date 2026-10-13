@@ -616,6 +616,7 @@ class MenuBarDelegate(NSObject):
 
     def _meeting_worker(self, browser_triggered: bool = False, browser_title: str = "") -> None:
         from whisper_daemon import telemetry
+        from whisper_daemon.meeting_manifest import begin_meeting, finalize_meeting
         from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
         from whisper_daemon.screen_capture import ScreenCapture
         from whisper_daemon.transcriber import transcribe_full
@@ -639,15 +640,20 @@ class MenuBarDelegate(NSObject):
         sentinel_count = 0
 
         all_results: list[tuple[float, dict]] = []
-        all_audio: list[np.ndarray] = []
+        transcription_errors: list[str] = []
+        from whisper_daemon.audio_timeline import mix_timeline
+        all_audio: list[tuple[float, np.ndarray]] = []
         chunk_count = 0
 
         # Prepare output dir early for screenshots
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        title_slug = browser_title.replace(" ", "_")[:30] if browser_title else ""
+        import re
+        title_slug = re.sub(r"[^a-zA-Z0-9_-]+", "_", browser_title)[:30] if browser_title else ""
         dir_name = f"recording_{title_slug}_{timestamp}" if title_slug else f"recording_{timestamp}"
-        rec_dir = self._settings.recording_dir_path / dir_name
+        from uuid import uuid4
+        rec_dir = self._settings.recording_dir_path / f"{dir_name}_{uuid4().hex[:8]}"
         rec_dir.mkdir(parents=True, exist_ok=True)
+        identity = begin_meeting(rec_dir, browser_title or f"Meeting {timestamp}")
 
         screen_capture: ScreenCapture | None = None
         if self._settings.capture_screenshots:
@@ -721,7 +727,7 @@ class MenuBarDelegate(NSObject):
                     try:
                         chunk = chunk_queue.get(timeout=0.5)
                     except queue.Empty:
-                        if _collect_futures(futures, all_results):
+                        if _collect_futures(futures, all_results, errors=transcription_errors):
                             _write_partial(partial_path, all_results)
                             self._send_results_to_browser(all_results, chunk_count)
                         # Health check: warn repeatedly while silent, and
@@ -761,7 +767,7 @@ class MenuBarDelegate(NSObject):
                     )
                     telemetry.meeting_chunk_queued(chunk_count, chunk.duration, chunk.start_time)
                     if self._settings.save_audio or self._settings.diarize:
-                        all_audio.append(chunk.audio.copy())
+                        all_audio.append((chunk.start_time, chunk.audio.copy()))
                     cn = chunk_count  # capture for closure
                     def _transcribe_and_track(audio, m, n):
                         result = transcribe_full(audio, m)
@@ -771,7 +777,7 @@ class MenuBarDelegate(NSObject):
                         return result
                     future = pool.submit(_transcribe_and_track, chunk.audio, model, cn)
                     futures[future] = chunk.start_time
-                    if _collect_futures(futures, all_results):
+                    if _collect_futures(futures, all_results, errors=transcription_errors):
                         _write_partial(partial_path, all_results)
                         self._send_results_to_browser(all_results, chunk_count)
 
@@ -783,7 +789,7 @@ class MenuBarDelegate(NSObject):
                     screen_capture.stop()
 
                 # Wait for in-flight transcription to finish FIRST
-                _collect_futures(futures, all_results, wait=True)
+                _collect_futures(futures, all_results, wait=True, errors=transcription_errors)
 
                 # Now safe to transcribe remaining chunks (no concurrent GPU access)
                 while True:
@@ -795,7 +801,7 @@ class MenuBarDelegate(NSObject):
                         continue
                     chunk_count += 1
                     if self._settings.save_audio or self._settings.diarize:
-                        all_audio.append(chunk.audio.copy())
+                        all_audio.append((chunk.start_time, chunk.audio.copy()))
                     result = transcribe_full(chunk.audio, model)
                     if result.get("text", "").strip():
                         all_results.append((chunk.start_time, result))
@@ -807,6 +813,7 @@ class MenuBarDelegate(NSObject):
             return
 
         if not all_results:
+            finalize_meeting(rec_dir, identity, {"text": "", "segments": []}, transcription_errors)
             _notify("whisper-daemon", "Done", "No speech detected.")
             self._reset_meeting_ui()
             return
@@ -819,7 +826,7 @@ class MenuBarDelegate(NSObject):
                 from whisper_daemon.diarizer import diarize_batch
                 from whisper_daemon.diarize_merge import merge_speakers_with_transcript
 
-                full_audio = np.concatenate(all_audio)
+                full_audio = mix_timeline(all_audio)
                 logger.info("Diarizing %.1fs of audio...", len(full_audio) / 16000)
                 speaker_segments = diarize_batch(full_audio)
                 merged_result = merge_speakers_with_transcript(
@@ -841,7 +848,7 @@ class MenuBarDelegate(NSObject):
 
         if self._settings.save_audio and all_audio:
             audio_path = rec_dir / "recording.wav"
-            full_audio = np.concatenate(all_audio)
+            full_audio = mix_timeline(all_audio)
             _save_wav(audio_path, full_audio, 16000)
             written.append(str(audio_path))
 
@@ -852,6 +859,15 @@ class MenuBarDelegate(NSObject):
         # Remove live partial now that final transcript exists
         partial_path = rec_dir / "transcript_live.txt"
         partial_path.unlink(missing_ok=True)
+
+        # Screenshots, audio and all transcription futures are closed before readiness.
+        try:
+            finalize_meeting(rec_dir, identity, merged_result, transcription_errors)
+        except Exception:
+            logger.exception("Meeting saved, but readiness manifest failed")
+            _notify("whisper-daemon", "Sync pending", "Could not finalize meeting manifest.")
+        if transcription_errors:
+            _notify("whisper-daemon", "Incomplete transcript", "Some chunks failed; automatic analysis is blocked.")
 
         telemetry.meeting_stop(chunk_count, str(rec_dir))
         logger.info("Meeting saved: %s", ", ".join(written))
@@ -994,28 +1010,9 @@ def _save_wav(path: Path, audio: np.ndarray, sample_rate: int) -> None:
     logger.info("Audio saved: %s (%.1fs)", path, len(audio) / sample_rate)
 
 
-def _collect_futures(
-    futures: dict,
-    all_results: list[tuple[float, dict]],
-    wait: bool = False,
-) -> bool:
-    """Collect completed transcription futures. Returns True if any were collected."""
-    if wait and futures:
-        done_set, _ = concurrent.futures.wait(futures.keys())
-    else:
-        done_set = {f for f in futures if f.done()}
-
-    collected = False
-    for future in done_set:
-        start_time = futures.pop(future)
-        try:
-            result = future.result()
-            if result.get("text", "").strip():
-                all_results.append((start_time, result))
-                collected = True
-        except Exception as exc:
-            logger.error("Chunk transcription failed: %s", exc)
-    return collected
+def _collect_futures(futures, all_results, wait=False, *, errors=None) -> bool:
+    from whisper_daemon.meeting_manifest import collect_futures
+    return collect_futures(futures, all_results, errors if errors is not None else [], wait=wait)
 
 
 def _write_partial(path: Path, results: list[tuple[float, dict]]) -> None:

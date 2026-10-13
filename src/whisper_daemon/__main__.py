@@ -7,6 +7,10 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import numpy as np
 
 import click
 
@@ -379,6 +383,7 @@ def transcribe(
 @click.option("--diarize", is_flag=True, help="Enable speaker diarization (requires HF_TOKEN).")
 @click.option("--diarize-mode", type=click.Choice(["batch", "realtime", "hybrid"]), default="hybrid", help="Diarization approach.")
 @click.option("--num-speakers", type=int, default=None, help="Expected number of speakers (improves diarization).")
+@click.option("--orbit-ready", is_flag=True, help="Save in a new meeting directory and publish a sync-ready manifest.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def record(
     output: str,
@@ -391,6 +396,7 @@ def record(
     diarize_mode: str,
     num_speakers: int | None,
     verbose: bool,
+    orbit_ready: bool,
 ) -> None:
     """Record and transcribe a live meeting or long audio session.
 
@@ -411,7 +417,7 @@ def record(
 
     from whisper_daemon.formats import FORMATTERS
     from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
-    from whisper_daemon.transcriber import preload_model, transcribe as transcribe_audio
+    from whisper_daemon.transcriber import preload_model, transcribe_full as transcribe_audio
 
     _setup_logging(verbose)
 
@@ -432,6 +438,15 @@ def record(
     output_path = Path(output)
     output_stem = output_path.stem
     output_dir = output_path.parent
+    identity = None
+    if orbit_ready:
+        from datetime import datetime
+        from uuid import uuid4
+        from whisper_daemon.meeting_manifest import begin_meeting
+        output_dir = output_dir / f"recording_{datetime.now():%Y%m%d_%H%M%S}_{uuid4().hex[:8]}"
+        output_stem = 'transcript'
+        output_dir.mkdir(parents=True, exist_ok=True)
+        identity = begin_meeting(output_dir, output_path.stem)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     click.echo(f"Model: {model}")
@@ -453,6 +468,7 @@ def record(
     chunk_queue: queue_mod.Queue[AudioChunk | None] = queue_mod.Queue()
     recorder = MeetingRecorder(chunk_queue, device=resolved_device, chunk_silence=chunk_silence)
 
+    transcription_errors: list[str] = []
     all_results: list[tuple[float, dict]] = []  # (start_time, result)
     all_audio_chunks: list[tuple[float, np.ndarray]] = []  # for batch diarization
     chunk_count = 0
@@ -468,7 +484,7 @@ def record(
             try:
                 chunk = chunk_queue.get(timeout=0.5)
             except queue_mod.Empty:
-                _collect_results(futures, all_results)
+                _collect_results(futures, all_results, errors=transcription_errors)
                 continue
 
             if chunk is None:
@@ -488,14 +504,14 @@ def record(
             future = pool.submit(transcribe_audio, chunk.audio, model)
             futures[future] = chunk.start_time
 
-            _collect_results(futures, all_results)
+            _collect_results(futures, all_results, errors=transcription_errors)
 
     except KeyboardInterrupt:
         click.echo("\n\nStopping recording...")
         recorder.stop()
 
         # Wait for in-flight transcription FIRST (avoid concurrent GPU access)
-        _collect_results(futures, all_results, wait=True)
+        _collect_results(futures, all_results, wait=True, errors=transcription_errors)
 
         # Now safe to transcribe remaining chunks
         while True:
@@ -511,17 +527,23 @@ def record(
                 all_audio_chunks.append((chunk.start_time, chunk.audio.copy()))
             if speaker_tracker is not None:
                 speaker_tracker.identify(chunk.audio, chunk.start_time)
-            result_text = transcribe_audio(chunk.audio, model)
-            if result_text:
-                all_results.append((chunk.start_time, {"text": result_text, "segments": [], "language": ""}))
+            result = transcribe_audio(chunk.audio, model)
+            if result.get("text", "").strip():
+                all_results.append((chunk.start_time, result))
     finally:
-        pool.shutdown(wait=False)
+        recorder.stop()
+        pool.shutdown(wait=True)
+        _collect_results(futures, all_results, wait=True, errors=transcription_errors)
 
     if not all_results:
+        if identity is not None:
+            from whisper_daemon.meeting_manifest import finalize_meeting
+            finalize_meeting(output_dir, identity, {"text": "", "segments": []}, transcription_errors)
         click.echo("No audio transcribed.")
         return
 
     merged = _merge_results(all_results)
+    manifest_result = merged
 
     if diarize:
         from whisper_daemon.diarize_merge import merge_speakers_with_transcript
@@ -533,6 +555,7 @@ def record(
             click.echo(f"\nDiarizing {len(full_audio) / 16000:.1f}s of audio (batch correction)...")
             batch_segments = diarize_batch(full_audio, num_speakers=num_speakers)
             final_result = merge_speakers_with_transcript(batch_segments, merged)
+            manifest_result = final_result
             speaker_count = len(final_result.get("speakers", []))
             click.echo(f"Found {speaker_count} speaker(s)")
 
@@ -545,6 +568,7 @@ def record(
         elif diarize_mode == "realtime" and speaker_tracker is not None:
             rt_segments = speaker_tracker.get_all_segments()
             rt_result = merge_speakers_with_transcript(rt_segments, merged)
+            manifest_result = rt_result
             speaker_count = len(rt_result.get("speakers", []))
             click.echo(f"\nFound {speaker_count} speaker(s) (realtime)")
 
@@ -560,30 +584,18 @@ def record(
             ext_path.write_text(content, encoding="utf-8")
             click.echo(f"  → {ext_path}")
 
+    if identity is not None:
+        from whisper_daemon.meeting_manifest import finalize_meeting
+        ready = finalize_meeting(output_dir, identity, manifest_result, transcription_errors)
+        click.echo(f"Orbit: {output_dir / ('meeting.ready.json' if ready else 'meeting.failed.json')}")
+
     click.echo(f"\nDone — {chunk_count} chunks, {len(merged.get('segments', []))} segments.")
 
 
 
-def _collect_results(
-    futures: dict,
-    all_results: list[tuple[float, dict]],
-    wait: bool = False,
-) -> None:
-    """Collect completed transcription futures."""
-    if wait and futures:
-        concurrent_futures = __import__("concurrent.futures", fromlist=["concurrent"])
-        done, _ = concurrent_futures.wait(futures.keys())
-    else:
-        done = {f for f in futures if f.done()}
-
-    for future in done:
-        start_time = futures.pop(future)
-        try:
-            text = future.result()
-            if text:
-                all_results.append((start_time, {"text": text, "segments": [], "language": ""}))
-        except Exception as exc:
-            logging.getLogger(__name__).error("Chunk transcription failed: %s", exc)
+def _collect_results(futures, all_results, wait=False, *, errors=None) -> None:
+    from whisper_daemon.meeting_manifest import collect_futures
+    collect_futures(futures, all_results, errors if errors is not None else [], wait=wait)
 
 
 def _merge_results(results: list[tuple[float, dict]]) -> dict:

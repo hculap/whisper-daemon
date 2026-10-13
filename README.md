@@ -90,3 +90,37 @@ You'll hear audio through speakers AND it gets captured by the daemon.
 ## License
 
 MIT
+
+### Orbit: automatic meeting processing
+
+Menu-bar recordings publish `meeting.ready.json` atomically **after** final audio,
+transcripts, screenshots and all transcription futures have finished. The manifest
+contains a stable meeting ID, revision, timestamp with timezone, transcription
+completion status, and SHA-256/size for every file. `transcript.json` is always
+included, even if only text/SRT output was selected. A failed transcription chunk
+writes `meeting.failed.json` and prevents the ready marker. Each recording uses a
+new directory; never overwrite a published revision.
+
+CLI users can opt in:
+
+```bash
+whisper-daemon record ~/Sync/Recordings/meeting.txt --orbit-ready --format txt,srt,json
+```
+
+This creates a fresh `recording_*` directory alongside the requested output.
+The CLI continues to omit audio recording; menu-bar audio follows `save_audio`.
+Orbit verifies every file after sync (the marker may arrive first), archives the
+meeting, analyzes it with Claude, and routes summaries and reviewed actions to
+Resources / Projects / Areas / Tasks / Issues. Install the companion Orbit branch
+`feat/meeting-automation` and follow its `docs/MEETING_AUTOMATION.md`.
+
+The saved menu-bar audio preserves chunk timestamps and mixes overlapping sources,
+so transcript timestamps continue to point to the correct part of the recording.
+
+Portable contract/timeline checks (no microphone, GPU or Cocoa required):
+
+```bash
+PYTHONPATH=src python -m unittest discover -s tests -v
+```
+
+These need NumPy. Actual capture and sync must also be verified on macOS.

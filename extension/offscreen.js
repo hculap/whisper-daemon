@@ -45,10 +45,14 @@ let pcmBufferedBytes = 0;
 // and bail if it no longer matches — so a socket that finishes opening
 // after a stop, or a stale reconnect loop, can't leak into a new session.
 let captureGen = 0;
+let socketGen = 0; // control connections survive a new capture generation
 
 // --- Message handling ---
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  // Content-script broadcasts also reach this document. Only consume the
+  // explicitly routed copy, never both the original and the SW relay.
+  if (msg.target !== "offscreen") return false;
   if (msg.type === "START_CAPTURE") {
     // Legacy popup fallback: capture the tab here via getUserMedia.
     meetTitle = msg.meetTitle || "";
@@ -252,7 +256,7 @@ function flushPcmBuffer() {
 // tear down only the (legacy) capture pipeline; the daemon keeps pushing status
 // over the live socket. Does NOT notify background (state stays CAPTURING until
 // a real teardown) so the WD_STATUS relay tab pointer is preserved.
-function stopForwarding() {
+function stopForwarding(notifyDaemon = true) {
   const wasActive = capturing || sessionStarting;
   // Only invalidate in-flight connect/reconnect callbacks when we actually end
   // an active session. On a meet-left race the full-teardown STOP_CAPTURE runs
@@ -265,10 +269,10 @@ function stopForwarding() {
   sessionStarting = false;
   externalMode = false;
 
-  if (wasActive && ws && ws.readyState === WebSocket.OPEN) {
+  if (notifyDaemon && wasActive && ws && ws.readyState === WebSocket.OPEN) {
     flushPcmBuffer();
     ws.send(JSON.stringify({ type: "stop" }));
-  } else if (wasActive) {
+  } else if (notifyDaemon && wasActive) {
     // Ended an active session but the socket is not OPEN (mid-reconnect or
     // dropped): no 'stop' can be delivered and the daemon will never push a
     // terminal status. Surface an error so background relays WD_ERROR and the
@@ -325,6 +329,8 @@ function stopCapture() {
 }
 
 function cleanup() {
+  captureGen++; // also invalidate pending opens, before ws has been assigned
+  socketGen++;
   capturing = false;
   reconnecting = false;
   sessionStarting = false;
@@ -411,10 +417,11 @@ function openSharedSocket(attempts, gen) {
 }
 
 async function connectWebSocket(attempts, gen) {
+  const connectionGen = socketGen;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       const socket = await openWebSocket(WS_URL);
-      if (gen !== captureGen) {
+      if (connectionGen !== socketGen) {
         try { socket.close(); } catch {}
         return false;
       }
@@ -423,7 +430,7 @@ async function connectWebSocket(attempts, gen) {
       ws.onclose = handleUnexpectedClose;
       return true;
     } catch {
-      if (attempt < attempts - 1 && gen === captureGen) {
+      if (attempt < attempts - 1 && connectionGen === socketGen) {
         await sleep(CONNECT_DELAY_MS);
       }
     }
@@ -447,6 +454,9 @@ function handleServerMessage(event) {
       chunkIndex: data.chunk_index,
     });
   } else if (data.type === "status") {
+    if (data.state === "transcribing" || data.state === "idle") {
+      stopForwarding(false);
+    }
     chrome.runtime.sendMessage({
       type: "STATUS",
       state: data.state,

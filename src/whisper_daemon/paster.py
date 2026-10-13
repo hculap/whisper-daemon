@@ -3,7 +3,7 @@
 import logging
 import time
 
-from AppKit import NSPasteboard, NSPasteboardTypeString
+from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
 from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventPost,
@@ -26,18 +26,26 @@ def paste_text(text: str) -> None:
     """
     pb = NSPasteboard.generalPasteboard()
 
-    old_content = pb.stringForType_(NSPasteboardTypeString)
-
+    saved = []
+    for original in pb.pasteboardItems() or []:
+        item = NSPasteboardItem.alloc().init()
+        for content_type in original.types():
+            data = original.dataForType_(content_type)
+            if data is not None:
+                item.setData_forType_(data, content_type)
+        saved.append(item)
     pb.clearContents()
     pb.setString_forType_(text, NSPasteboardTypeString)
-
-    _simulate_cmd_v()
-
-    time.sleep(PASTE_SETTLE_DELAY)
-
-    pb.clearContents()
-    if old_content is not None:
-        pb.setString_forType_(old_content, NSPasteboardTypeString)
+    owned_version = pb.changeCount()
+    try:
+        _simulate_cmd_v()
+        time.sleep(PASTE_SETTLE_DELAY)
+    finally:
+        # A copy performed by the user during paste belongs to the user.
+        if pb.changeCount() == owned_version:
+            pb.clearContents()
+            if saved:
+                pb.writeObjects_(saved)
 
     logger.info("Pasted %d chars", len(text))
 

@@ -489,7 +489,7 @@ def record(
 
     from whisper_daemon.formats import FORMATTERS
     from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
-    from whisper_daemon.transcriber import preload_model, transcribe as transcribe_audio
+    from whisper_daemon.transcriber import preload_model, transcribe_full as transcribe_audio
 
     _setup_logging(verbose)
 
@@ -563,7 +563,7 @@ def record(
                 if rt_segments:
                     click.echo(f"    → Speaker {rt_segments[0].speaker + 1}")
 
-            future = pool.submit(transcribe_audio, chunk.audio, model)
+            future = pool.submit(transcribe_audio, chunk.audio, model, language)
             futures[future] = chunk.start_time
 
             _collect_results(futures, all_results)
@@ -589,9 +589,9 @@ def record(
                 all_audio_chunks.append((chunk.start_time, chunk.audio.copy()))
             if speaker_tracker is not None:
                 speaker_tracker.identify(chunk.audio, chunk.start_time)
-            result_text = transcribe_audio(chunk.audio, model)
-            if result_text:
-                all_results.append((chunk.start_time, {"text": result_text, "segments": [], "language": ""}))
+            result = transcribe_audio(chunk.audio, model, language)
+            if result.get("text"):
+                all_results.append((chunk.start_time, result))
     finally:
         pool.shutdown(wait=False)
 
@@ -657,9 +657,9 @@ def _collect_results(
     for future in done:
         start_time = futures.pop(future)
         try:
-            text = future.result()
-            if text:
-                all_results.append((start_time, {"text": text, "segments": [], "language": ""}))
+            result = future.result()
+            if result.get("text"):
+                all_results.append((start_time, result))
         except Exception as exc:
             logging.getLogger(__name__).error("Chunk transcription failed: %s", exc)
 

@@ -182,12 +182,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // so the first frames aren't dropped in the boot gap (F11/F23).
     if (sender.tab?.id) {
       if (offscreenReady) {
-        chrome.runtime.sendMessage(msg).catch(() => {});
+        chrome.runtime.sendMessage({ ...msg, target: "offscreen" }).catch(() => {});
       } else {
         ensureOffscreenDocument()
           .then(() => {
             offscreenReady = true;
-            return chrome.runtime.sendMessage(msg).catch(() => {});
+            return chrome.runtime.sendMessage({ ...msg, target: "offscreen" }).catch(() => {});
           })
           .catch(() => {});
       }
@@ -234,6 +234,7 @@ async function startCaptureWithStream(streamId) {
 
     chrome.runtime.sendMessage({
       type: "START_CAPTURE",
+      target: "offscreen",
       streamId,
       tabId: meetTabId,
       meetTitle,
@@ -251,7 +252,7 @@ async function startCaptureWithStream(streamId) {
 function stopCapture() {
   // Reaches the offscreen document if it exists; a missing receiver rejects,
   // which we ignore (nothing to tear down).
-  chrome.runtime.sendMessage({ type: "STOP_CAPTURE" }).catch(() => {});
+  chrome.runtime.sendMessage({ type: "STOP_CAPTURE", target: "offscreen" }).catch(() => {});
 }
 
 // In-flight createDocument promise. Concurrent callers (e.g. two Meet tabs both
@@ -330,7 +331,7 @@ async function resolveMeetTab() {
 async function forwardToOffscreen(msg) {
   try {
     await ensureOffscreenDocument();
-    chrome.runtime.sendMessage(msg).catch(() => {});
+    chrome.runtime.sendMessage({ ...msg, target: "offscreen" }).catch(() => {});
   } catch (err) {
     console.error("Failed to forward to offscreen:", err);
     relayWD("WD_ERROR", { message: "Nie udało się połączyć z offscreen." });

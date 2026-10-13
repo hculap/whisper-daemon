@@ -148,7 +148,7 @@ def transcribe_full(
         "path_or_hf_repo": model,
         "temperature": 0,
         "condition_on_previous_text": False,
-        "word_timestamps": False,
+        "word_timestamps": True,
     }
     if language:
         kwargs["language"] = language
@@ -198,7 +198,7 @@ def transcribe_file(
         "path_or_hf_repo": model,
         "temperature": 0,
         "condition_on_previous_text": False,
-        "word_timestamps": False,
+        "word_timestamps": True,
     }
     if language is not None:
         kwargs["language"] = language

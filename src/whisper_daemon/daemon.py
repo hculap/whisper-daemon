@@ -245,20 +245,10 @@ class Daemon:
             self._queue.put(Event(EventType.TRANSCRIPTION_DONE, ""))
             return
 
-        # If we have a recent preview and audio hasn't grown much since, use it
+        # A preview is never the final result: even a short tail may contain
+        # a name, number or negation. Always include every captured sample.
         new_samples = len(audio) - self._pending_samples
         new_seconds = new_samples / 16000
-        if self._pending_text and new_seconds < 2.5:
-            telemetry.mark("transcribe_start", mode="preview_cached", new_audio_sec=round(new_seconds, 1))
-            telemetry.mark("transcribe_done", chars=len(self._pending_text))
-            logger.info(
-                "Using preview result (%.1fs new audio since preview, skipping re-transcription)",
-                new_seconds,
-            )
-            self._queue.put(Event(EventType.TRANSCRIPTION_DONE, self._pending_text))
-            return
-
-        # Full transcription needed
         telemetry.mark("transcribe_start", mode="full", new_audio_sec=round(new_seconds, 1))
         thread = threading.Thread(
             target=self._transcribe_worker,

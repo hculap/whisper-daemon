@@ -390,6 +390,25 @@
     if (popEl && currentSettings) render(currentSettings);
   }
 
+  function setHealth(sources, paused) {
+    if (!popEl) return;
+    let health = popEl.querySelector("[data-health]");
+    if (!health) {
+      health = document.createElement("div");
+      health.dataset.health = "true";
+      health.setAttribute("role", "status");
+      health.style.cssText = "padding:12px;font-size:12px";
+      popEl.appendChild(health);
+      const pause = document.createElement("button");
+      pause.textContent = "Pauza / wznów";
+      pause.onclick = () => chrome.runtime.sendMessage({type:"WD_PAUSE_MEETING"});
+      popEl.appendChild(pause);
+    }
+    health.textContent = Object.entries(sources).map(([source, value]) =>
+      `${source === "mic" ? "Mikrofon" : "Uczestnicy"}: ${value.age > 3 ? "brak sygnału" : value.rms > .005 ? "mowa" : "cisza"}`
+    ).join(" · ") + (paused ? " · PAUZA" : "");
+  }
+
   WD.panel = {
     init(callbacks) {
       callbacks = callbacks || {};
@@ -403,6 +422,7 @@
     hide,
     toggle,
     setRecording,
+    setHealth,
     teardown,
   };
 })();

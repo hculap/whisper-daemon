@@ -116,6 +116,7 @@ function addTranscriptChunk(text) {
 // --- Timer ---
 
 function startTimer() {
+  if (timerInterval) return;
   recordingStart = Date.now();
   timer.classList.add("visible");
   updateTimerDisplay();
@@ -135,3 +136,20 @@ function updateTimerDisplay() {
   const seconds = String(elapsed % 60).padStart(2, "0");
   timer.textContent = `${minutes}:${seconds}`;
 }
+
+
+document.getElementById("pairCommand").textContent = `Run in Terminal: whisper-daemon pair ${chrome.runtime.id}`;
+document.getElementById("savePair").onclick = async () => {
+  const secret = document.getElementById("pairSecret").value.trim();
+  if (secret.length < 32) { document.getElementById("pairStatus").textContent = "Use the complete pairing key from Terminal."; return; }
+  await chrome.storage.local.set({pairingSecret: secret});
+  document.getElementById("pairSecret").value = "";
+  document.getElementById("pairStatus").textContent = "Key saved. Start capture to connect.";
+};
+document.getElementById("pauseBtn").onclick = () => chrome.runtime.sendMessage({type: "WD_PAUSE_MEETING"});
+chrome.runtime.onMessage.addListener(msg => {
+  if (msg.type === "HEALTH") document.getElementById("sourceHealth").textContent =
+    Object.entries(msg.sources).map(([name, value]) => `${name === "mic" ? "Microphone" : "Participants"}: ${value.age > 3 ? "no signal" : value.rms > .005 ? "speaking" : "quiet"}`).join(" · ") + (msg.paused ? " · PAUSED" : "");
+  if (msg.type === "CAPABILITIES") document.getElementById("capabilityStatus").textContent = msg.diarization.message;
+  if (msg.type === "CAPTURE_ERROR") document.getElementById("capabilityStatus").textContent = msg.message;
+});

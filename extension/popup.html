@@ -99,6 +99,14 @@
     <h1>Whisper Daemon</h1>
   </div>
 
+  <details><summary>Pair with this computer</summary>
+    <p id="pairCommand" style="margin:8px 0;overflow-wrap:anywhere"></p>
+    <label>Pairing key <input id="pairSecret" type="password" autocomplete="off"></label>
+    <button id="savePair">Save key</button><p id="pairStatus" role="status"></p>
+  </details>
+  <div id="sourceHealth" role="status"></div>
+  <button id="pauseBtn" class="btn">Pause / Resume meeting</button>
+  <div id="capabilityStatus" role="status"></div>
   <div id="meetingInfo" class="meeting-info"></div>
   <div id="timer" class="timer">00:00</div>
 

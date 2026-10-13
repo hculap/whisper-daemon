@@ -12,10 +12,17 @@ function fixture() {
     constructor() { this.readyState = 0; this.sent = []; sockets.push(this); }
     open() { this.readyState = 1; this.onopen(); }
     close() { this.readyState = 3; }
-    send(value) { this.sent.push(value); }
+    send(value) {
+      this.sent.push(value);
+      if (typeof value === 'string') {
+        const data = JSON.parse(value);
+        if (data.type === 'auth') queueMicrotask(() => this.onmessage({data: JSON.stringify({type:'authenticated'})}));
+        if (data.type === 'start') queueMicrotask(() => this.onmessage({data: JSON.stringify({type:'started', session_id:data.session_id})}));
+      }
+    }
   }
   const context = vm.createContext({
-    console, chrome: { runtime: {
+    console, crypto: require('node:crypto').webcrypto, chrome: { storage: {local:{get:async () => ({pairingSecret:'test-secret'})}}, runtime: {
       onMessage: { addListener(fn) { receive = fn; } },
       sendMessage(msg) { messages.push(msg); return Promise.resolve(); },
     } }, WebSocket: Socket, Float32Array, Array, Date,
@@ -24,6 +31,7 @@ function fixture() {
   });
   vm.runInContext(fs.readFileSync(path.join(__dirname, '../offscreen.js'), 'utf8'), context);
   return { run: code => vm.runInContext(code, context), sockets, messages,
+    open: async () => { await new Promise(setImmediate); sockets[0].open(); },
     receive: msg => receive(msg, { tab: { id: 1 } }, () => {}) };
 }
 
@@ -39,16 +47,16 @@ test('stop cancels a connection that has not opened yet', async () => {
   const f = fixture();
   const pending = f.run('startExternal()');
   f.run('stopCapture()');
-  f.sockets[0].open();
+  await f.open();
   await pending;
   assert.equal(f.run('capturing'), false);
-  assert.equal(f.sockets[0].sent.length, 0);
+  assert.equal(f.sockets[0].sent.filter(x => JSON.parse(x).type === 'start').length, 0);
 });
 
 test('daemon-side stop permits a subsequent browser start', async () => {
   const f = fixture();
   const pending = f.run('startExternal()');
-  f.sockets[0].open();
+  await f.open();
   await pending;
   f.run('handleServerMessage({data: JSON.stringify({type: "status", state: "recording"})})');
   f.run('handleServerMessage({data: JSON.stringify({type: "status", state: "transcribing"})})');
@@ -61,8 +69,8 @@ test('settings connection racing a start is shared without cancelling capture', 
   const f = fixture();
   const control = f.run('ensureControlConnection()');
   const start = f.run('startExternal()');
+  await f.open();
   assert.equal(f.sockets.length, 1);
-  f.sockets[0].open();
   await Promise.all([control, start]);
   assert.equal(f.run('capturing'), true);
   assert.equal(f.sockets[0].sent.map(JSON.parse).filter(m => m.type === 'start').length, 1);

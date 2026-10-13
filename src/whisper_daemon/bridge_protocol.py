@@ -63,15 +63,56 @@ def _is_safe_str(value: str) -> bool:
     )
 
 
-def is_allowed_origin(origin: str | None) -> bool:
-    """Return True only for chrome-extension:// origins.
+def is_allowed_origin(origin: str | None, extension_id: str | None = None) -> bool:
+    """Fail closed unless the exact, explicitly paired extension is present."""
+    import re
+    return bool(extension_id and re.fullmatch(r"[a-p]{32}", extension_id)
+                and origin == "chrome-extension://" + extension_id)
 
-    Websites (http/https) and a missing Origin header are rejected so the
-    daemon's WebSocket surface cannot be driven by an arbitrary web page.
-    """
-    if origin is None:
-        return False
-    return origin.startswith(ALLOWED_ORIGIN_PREFIX)
+
+def validate_client_message(data):
+    import re
+    if not isinstance(data, dict): raise ValueError("Expected an object")
+    kind = data.get("type")
+    if kind not in {"start", "stop", "ping", "get_settings", "set_settings", "stop_meeting", "pause_meeting"}:
+        raise ValueError("Unknown message type")
+    if kind in {"start", "stop"}:
+        if not isinstance(data.get("session_id"), str) or not re.fullmatch(r"[A-Za-z0-9_-]{16,64}", data["session_id"]):
+            raise ValueError("Invalid session ID")
+    if kind == "start":
+        for field in ("meeting_title", "meeting_url"):
+            value = data.get(field, "")
+            if not isinstance(value, str) or len(value) > 2048 or any(ord(c) < 32 for c in value):
+                raise ValueError("Invalid meeting metadata")
+    if kind == "set_settings" and not isinstance(data.get("patch"), dict):
+        raise ValueError("Invalid settings patch")
+    return data
+
+
+class AudioSequence:
+    """Validate WDA1 / sequence u32 / sample-position u64 / float32-LE PCM."""
+    def __init__(self):
+        self.sequence = -1
+        self.frames = 0
+
+    def accept(self, payload):
+        import struct
+        import math
+        if len(payload) < 20 or len(payload) > 65552 or (len(payload) - 16) % 4:
+            raise ValueError("Invalid PCM packet size")
+        magic, seq, position = struct.unpack_from('<4sIQ', payload)
+        if magic != b'WDA1': raise ValueError("Unsupported audio protocol")
+        samples = payload[16:]
+        if any(not math.isfinite(v[0]) or abs(v[0]) > 1.01 for v in struct.iter_unpack('<f', samples)):
+            raise ValueError("Invalid PCM values")
+        if seq <= self.sequence:
+            return None  # reconnect replay; never write the same samples twice
+        if position < self.frames or position - self.frames > 16000 * 300:
+            raise ValueError("Invalid audio timeline")
+        gap = position - self.frames
+        self.sequence = seq
+        self.frames = position + len(samples) // 4
+        return samples, gap
 
 
 def settings_to_dict(s: Settings) -> dict:

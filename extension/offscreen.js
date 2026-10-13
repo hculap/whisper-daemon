@@ -46,6 +46,10 @@ let pcmBufferedBytes = 0;
 // after a stop, or a stale reconnect loop, can't leak into a new session.
 let captureGen = 0;
 let socketGen = 0; // control connections survive a new capture generation
+let sessionId = "";
+let pcmSequence = 0;
+let pcmPosition = 0;
+let pendingStart = null;
 
 // --- Message handling ---
 
@@ -79,7 +83,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_PCM") {
-    ingestExternalPcm(msg.samples);
+    ingestExternalPcm(msg.samples, msg.position);
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_GET_SETTINGS") {
@@ -88,6 +92,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   } else if (msg.type === "WD_SET_SETTINGS") {
     sendControl({ type: "set_settings", patch: msg.patch || {} });
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_PAUSE_MEETING") {
+    sendControl({ type: "pause_meeting" });
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_STOP_MEETING") {
@@ -107,6 +115,9 @@ async function startCaptureFromStream(streamId) {
     return;
   }
   const gen = ++captureGen;
+  sessionId = crypto.randomUUID();
+  pcmSequence = pcmPosition = 0;
+  sessionStarting = true;
   externalMode = false;
   try {
     mediaStream = await navigator.mediaDevices.getUserMedia({
@@ -119,6 +130,7 @@ async function startCaptureFromStream(streamId) {
       video: false,
     });
 
+    if (gen !== captureGen) { mediaStream.getTracks().forEach(t => t.stop()); return; }
     mediaStream.getAudioTracks().forEach((track) => {
       track.onended = () => {
         console.warn("Capture track ended");
@@ -129,6 +141,7 @@ async function startCaptureFromStream(streamId) {
     audioContext = new AudioContext({ sampleRate: 16000 });
     const source = audioContext.createMediaStreamSource(mediaStream);
     await audioContext.audioWorklet.addModule("pcm-processor.js");
+    if (gen !== captureGen) return;
     const workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
     source.connect(workletNode);
     workletNode.connect(audioContext.destination);
@@ -137,7 +150,7 @@ async function startCaptureFromStream(streamId) {
     if (!ok) return;
 
     workletNode.port.onmessage = (event) => {
-      sendPcm(event.data.buffer);
+      sendPcm(event.data.samples.buffer, event.data.position);
     };
   } catch (err) {
     console.error("Capture failed:", err);
@@ -149,16 +162,20 @@ async function startCaptureFromStream(streamId) {
 // --- External capture (content-script PCM) ---
 
 async function startExternal() {
-  if (capturing) {
+  if (capturing || sessionStarting) {
     chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
     return;
   }
   const gen = ++captureGen;
+  sessionId = crypto.randomUUID();
+  pcmSequence = pcmPosition = 0;
+  pcmBuffer = []; pcmBufferedBytes = 0;
   externalMode = true;
   sessionStarting = true;
   try {
     await beginSession(gen);
   } catch (err) {
+    if (gen !== captureGen) return;
     console.error("External session failed:", err);
     cleanup();
     chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: err.message });
@@ -169,13 +186,14 @@ async function startExternal() {
   }
 }
 
-function ingestExternalPcm(samples) {
-  if (!Array.isArray(samples) || samples.length === 0) return;
+function ingestExternalPcm(samples, position) {
+  if (!Array.isArray(samples) || samples.length === 0 || samples.length > 16384 ||
+      samples.some(v => !Number.isFinite(v) || Math.abs(v) > 1.01)) return;
   // Buffer even before the session is fully up so the first ~256-500ms of
   // audio is not lost while the socket opens and 'start' is sent.
   if (!capturing && !sessionStarting) return;
   const buffer = Float32Array.from(samples).buffer;
-  sendPcm(buffer);
+  sendPcm(buffer, position);
 }
 
 // --- Shared session bring-up (connect + start + ping) ---
@@ -196,9 +214,10 @@ async function beginSession(gen) {
     return false;
   }
 
+  await sendStartMessage();
+  if (gen !== captureGen) return false;
   capturing = true;
   sessionStarting = false;
-  sendStartMessage();
   // Ship any audio buffered while the socket was coming up.
   flushPcmBuffer();
 
@@ -214,42 +233,42 @@ async function beginSession(gen) {
 }
 
 function sendStartMessage() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({
-    type: "start",
-    meeting_title: meetTitle,
-    meeting_url: meetUrl,
-  }));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => { pendingStart = null; reject(new Error("Daemon did not accept this recording")); }, 10000);
+    pendingStart = () => { clearTimeout(timer); pendingStart = null; resolve(); };
+    ws.send(JSON.stringify({type: "start", session_id: sessionId, meeting_title: meetTitle, meeting_url: meetUrl}));
+  });
 }
 
-function sendPcm(buffer) {
-  if (ws && ws.readyState === WebSocket.OPEN && capturing) {
-    ws.send(buffer);
-  } else if (capturing || sessionStarting) {
-    bufferPcm(buffer);
-  }
+function sendPcm(buffer, position) {
+  if (!capturing && !sessionStarting) return;
+  if (position !== undefined && (!Number.isSafeInteger(position) || position < pcmPosition)) return;
+  const start = position === undefined ? pcmPosition : position;
+  const packet = new ArrayBuffer(16 + buffer.byteLength);
+  const header = new DataView(packet);
+  header.setUint32(0, 0x31414457, true); // WDA1
+  header.setUint32(4, pcmSequence++, true);
+  header.setBigUint64(8, BigInt(start), true);
+  new Uint8Array(packet, 16).set(new Uint8Array(buffer));
+  pcmPosition = start + buffer.byteLength / 4;
+  if (!bufferPcm(packet)) return;
+  if (ws && ws.readyState === WebSocket.OPEN && capturing) ws.send(packet);
 }
 
-function bufferPcm(buffer) {
-  if (pcmBufferedBytes + buffer.byteLength > MAX_BUFFERED_BYTES) {
-    // Drop oldest audio first — recent speech matters more.
-    while (pcmBuffer.length > 0 && pcmBufferedBytes + buffer.byteLength > MAX_BUFFERED_BYTES) {
-      pcmBufferedBytes -= pcmBuffer[0].byteLength;
-      pcmBuffer = pcmBuffer.slice(1);
-    }
+function bufferPcm(packet) {
+  if (pcmBufferedBytes + packet.byteLength > MAX_BUFFERED_BYTES) {
+    stopForwarding();
+    chrome.runtime.sendMessage({type: "CAPTURE_ERROR", message: "Audio connection buffer is full. Recording stopped; already delivered audio is saved."});
+    return false;
   }
-  pcmBuffer = [...pcmBuffer, buffer];
-  pcmBufferedBytes += buffer.byteLength;
+  pcmBuffer.push(packet);
+  pcmBufferedBytes += packet.byteLength;
+  return true;
 }
 
 function flushPcmBuffer() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const pending = pcmBuffer;
-  pcmBuffer = [];
-  pcmBufferedBytes = 0;
-  for (const buffer of pending) {
-    ws.send(buffer);
-  }
+  for (const packet of pcmBuffer) ws.send(packet);
 }
 
 // WD_STOP: end the meeting but KEEP the socket open. Stop forwarding PCM and
@@ -271,7 +290,7 @@ function stopForwarding(notifyDaemon = true) {
 
   if (notifyDaemon && wasActive && ws && ws.readyState === WebSocket.OPEN) {
     flushPcmBuffer();
-    ws.send(JSON.stringify({ type: "stop" }));
+    ws.send(JSON.stringify({ type: "stop", session_id: sessionId }));
   } else if (notifyDaemon && wasActive) {
     // Ended an active session but the socket is not OPEN (mid-reconnect or
     // dropped): no 'stop' can be delivered and the daemon will never push a
@@ -314,7 +333,7 @@ function stopCapture() {
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     flushPcmBuffer();
-    ws.send(JSON.stringify({ type: "stop" }));
+    ws.send(JSON.stringify({ type: "stop", session_id: sessionId }));
   }
 
   // Small delay to let the stop message arrive before closing. Generation-check
@@ -446,7 +465,17 @@ function handleServerMessage(event) {
     return; // binary or unparseable — ignore
   }
 
-  if (data.type === "chunk_transcribed") {
+  if (data.type === "started" && data.session_id === sessionId) {
+    if (pendingStart) pendingStart();
+  } else if (data.type === "audio_ack" && data.session_id === sessionId) {
+    while (pcmBuffer.length && new DataView(pcmBuffer[0]).getUint32(4, true) <= data.sequence) {
+      pcmBufferedBytes -= pcmBuffer.shift().byteLength;
+    }
+  } else if (data.type === "health") {
+    chrome.runtime.sendMessage({type: "HEALTH", sources: data.sources, paused: data.paused});
+  } else if (data.type === "capabilities") {
+    chrome.runtime.sendMessage({type: "CAPABILITIES", diarization: data.diarization});
+  } else if (data.type === "chunk_transcribed") {
     chrome.runtime.sendMessage({
       type: "CHUNK_TRANSCRIBED",
       text: data.text,
@@ -499,7 +528,8 @@ async function reconnectLoop(gen) {
     if (connected && capturing && gen === captureGen) {
       reconnecting = false;
       console.info("Reconnected to whisper-daemon — resuming stream");
-      sendStartMessage();
+      try { await sendStartMessage(); } catch { cleanup(); return; }
+      if (gen !== captureGen) return;
       flushPcmBuffer();
       chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
       return;
@@ -518,12 +548,21 @@ async function reconnectLoop(gen) {
   }
 }
 
-function openWebSocket(url) {
+async function openWebSocket(url) {
+  const pairing = await chrome.storage.local.get("pairingSecret");
+  if (!pairing.pairingSecret) throw new Error("Pair this extension in its popup first");
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(url);
+    const timer = setTimeout(() => { socket.close(); reject(new Error("Authentication timeout")); }, 6000);
     socket.binaryType = "arraybuffer";
-    socket.onopen = () => resolve(socket);
-    socket.onerror = (err) => reject(err);
+    socket.onopen = () => socket.send(JSON.stringify({type: "auth", secret: pairing.pairingSecret}));
+    socket.onmessage = event => {
+      let data;
+      try { data = JSON.parse(event.data); } catch { return; }
+      if (data.type === "authenticated") { clearTimeout(timer); resolve(socket); }
+    };
+    socket.onclose = () => { clearTimeout(timer); reject(new Error("Pairing rejected by daemon")); };
+    socket.onerror = err => { clearTimeout(timer); reject(err); };
   });
 }
 

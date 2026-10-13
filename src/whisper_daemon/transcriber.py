@@ -116,7 +116,7 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL) -> str:
         return text
     except Exception:
         logger.exception("Transcription failed")
-        return ""
+        raise
 
 
 def transcribe_full(
@@ -175,7 +175,7 @@ def transcribe_full(
         return result
     except Exception:
         logger.exception("Transcription failed")
-        return {"text": "", "segments": [], "language": ""}
+        raise
 
 
 def transcribe_file(

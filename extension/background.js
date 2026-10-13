@@ -1,3 +1,4 @@
+chrome.storage.local.setAccessLevel({accessLevel: "TRUSTED_CONTEXTS"});
 /**
  * Service worker: manages state machine, tabCapture, and offscreen document lifecycle.
  *
@@ -53,6 +54,7 @@ function updateBadgeForPhase(phase) {
 // --- Messages ---
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.target === "offscreen") return false;
   if (msg.type === "MEET_JOINED") {
     if (state === State.IDLE) {
       meetTabId = sender.tab?.id ?? null;
@@ -77,6 +79,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "MEET_LEFT") {
+    if (sender.tab?.id !== meetTabId) { sendResponse({ok: true}); return; }
     // Leaving the call ends the session: fully tear down the offscreen socket
     // (persistent control channel) regardless of state. Safe if idle — the
     // offscreen just closes the socket.
@@ -142,6 +145,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     updateBadgeForPhase(msg.state);
     sendResponse({ ok: true });
 
+  } else if (msg.type === "HEALTH") {
+    relayWD("WD_HEALTH", {sources: msg.sources, paused: msg.paused});
+    sendResponse({ok: true});
+  } else if (msg.type === "CAPABILITIES") {
+    relayWD("WD_CAPABILITIES", {diarization: msg.diarization});
+    sendResponse({ok: true});
   } else if (msg.type === "SETTINGS") {
     relayWD("WD_SETTINGS", { settings: msg.settings, devices: msg.devices });
     sendResponse({ ok: true });
@@ -149,6 +158,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   } else if (msg.type === "WD_START") {
     // From content script (page gesture). Forward to offscreen.
     if (sender.tab?.id) {
+      if (meetTabId !== null && meetTabId !== sender.tab.id && (state === State.CAPTURING || state === State.STARTING)) {
+        sendResponse({ok: false, error: "Another tab is recording"}); return;
+      }
+      transitionTo(State.STARTING);
       meetTabId = sender.tab.id;
       meetTitle = msg.title || "";
       meetUrl = msg.url || "";
@@ -161,17 +174,18 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // or the status relay would re-point at a left tab (F15). Only refresh the
     // pointer if we still have a live meeting; always forward the stop so the
     // daemon finalizes.
-    if (meetTabId !== null && sender.tab?.id) meetTabId = sender.tab.id;
+    if (sender.tab?.id !== meetTabId) { sendResponse({ok: false}); return; }
     forwardToOffscreen(msg);
     sendResponse({ ok: true });
 
   } else if (
+    msg.type === "WD_PAUSE_MEETING" ||
     msg.type === "WD_STOP_MEETING" ||
     msg.type === "WD_GET_SETTINGS" ||
     msg.type === "WD_SET_SETTINGS"
   ) {
-    if (sender.tab?.id) {
-      meetTabId = sender.tab.id;
+    if (!sender.tab || meetTabId === null || sender.tab.id === meetTabId) {
+      if (meetTabId === null && sender.tab) meetTabId = sender.tab.id;
       forwardToOffscreen(msg);
     }
     sendResponse({ ok: true });
@@ -180,7 +194,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // High-frequency audio relay. Once the offscreen document is known to exist
     // relay synchronously (preserves frame order); before that, await creation
     // so the first frames aren't dropped in the boot gap (F11/F23).
-    if (sender.tab?.id) {
+    if (sender.tab?.id === meetTabId) {
       if (offscreenReady) {
         chrome.runtime.sendMessage({ ...msg, target: "offscreen" }).catch(() => {});
       } else {

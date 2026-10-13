@@ -74,7 +74,9 @@ class RecordingStore:
                 self.meta['gaps'].append({'source': source, 'start': cursor / RATE,
                                          'end': at / RATE, 'reason': 'missing audio'})
             file.seek(at * 4)
-            file.write(samples.tobytes())
+            payload = samples.tobytes()
+            if file.write(payload) != len(payload):
+                raise OSError("Short write while storing source audio")
             self.frames[source] = at + len(samples)
             self.levels[source] = float(np.sqrt(np.mean(samples ** 2))) if len(samples) else 0
             self.last_audio[source] = self.clock()
@@ -127,7 +129,8 @@ class RecordingStore:
                 size = min(RATE, frames - start)
                 mixed = np.zeros(size, dtype=np.float32)
                 for source, reader in readers.items():
-                    data = np.frombuffer(reader.read(size * 4), dtype='<f4')
+                    payload = reader.read(size * 4)
+                    data = np.frombuffer(payload[:len(payload) // 4 * 4], dtype='<f4')
                     data = np.pad(data, (0, size - len(data)))
                     mixed += data
                     writers[source].writeframesraw((data.clip(-1, 1) * 32767).astype('<i2').tobytes())

@@ -676,6 +676,51 @@ def recover(directory, redo_transcript, language):
             (path / f"transcript_recovered.{fmt}").write_text(FORMATTERS[fmt](result), encoding="utf-8")
 
 
+@cli.command()
+@click.argument("extension_id")
+def pair(extension_id):
+    """Authorize one extension ID; paste the printed key into its popup."""
+    from whisper_daemon.pairing import pair as make_pair
+    try:
+        pairing = make_pair(extension_id)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("Paste this key into the extension popup (keep it private):")
+    click.echo(pairing['secret'])
+
+
+@cli.group()
+def models():
+    """Check offline readiness or explicitly download model dependencies."""
+
+
+@models.command('check')
+def check_models():
+    from whisper_daemon.model_policy import local_model, diarization_status
+    from whisper_daemon.transcriber import DEFAULT_MODEL
+    try:
+        local_model(DEFAULT_MODEL)
+        click.echo('Whisper: cached locally')
+    except RuntimeError as exc:
+        click.echo(str(exc))
+    status = diarization_status()
+    click.echo(status['message'])
+    click.echo('Inference offline; pyannote/HF telemetry disabled')
+
+
+@models.command('prepare')
+@click.option('--diarization', is_flag=True)
+def prepare_models(diarization):
+    """Download models. Diarization needs authorized Hugging Face access."""
+    env = dict(os.environ, WHISPER_PREPARE_MODELS='1', HF_HUB_OFFLINE='0', TRANSFORMERS_OFFLINE='0')
+    code = ('from whisper_daemon.diarizer import _get_pipeline; _get_pipeline()' if diarization else
+            'from whisper_daemon.transcriber import preload_model; preload_model()')
+    result = subprocess.run([sys.executable, '-c', code], env=env)
+    if result.returncode:
+        raise click.ClickException('Model preparation failed. For gated models, grant access on Hugging Face and sign in with hf auth login, then retry.')
+    click.echo('Model prepared. Normal recording remains offline.')
+
+
 def _collect_results(
     futures: dict,
     all_results: list[tuple[float, dict]],

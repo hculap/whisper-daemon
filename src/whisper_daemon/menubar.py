@@ -84,6 +84,7 @@ class MenuBarDelegate(NSObject):
         self._meeting_thread = None
         self._meeting_store = None
         self._meeting_paused = False
+        self._diarization_status = {"available": False, "message": "Speaker recognition not checked"}
         self._browser_audio_lock = threading.RLock()
         self._meeting_browser_triggered = False
         # Meeting lifecycle phase reported to the extension's control surface:
@@ -681,7 +682,8 @@ class MenuBarDelegate(NSObject):
         auto_record_meetings preference, which only governs fully-automatic
         starts and is intentionally not consulted here.
         """
-        logger.info("Browser meeting started: %s (%s)", title, url)
+        if self._meeting_phase == "transcribing" or (self._meeting_active and not self._meeting_browser_triggered): return False
+        logger.info("Browser capture requested")
         if not self._meeting_active:
             AppHelper.callAfter(self._start_meeting, True, title)
 
@@ -775,7 +777,12 @@ class MenuBarDelegate(NSObject):
         """
         msg_type = data.get("type")
 
-        if msg_type == "get_settings":
+        if msg_type == "audio_gap":
+            if self._meeting_store:
+                self._meeting_store.meta["gaps"].append({"source": "browser", "start": data["end"] - data["samples"] / 16000, "end": data["end"], "reason": "missing packets"})
+            _notify("whisper-daemon", "Participant audio gap", f'{data["samples"] / 16000:.2f} seconds missing; silence inserted and marked.')
+
+        elif msg_type == "get_settings":
             # _push_settings_snapshot enumerates PortAudio devices (blocking);
             # never run it on the bridge loop or audio reception stalls.
             self._run_off_bridge(self._handle_get_settings)
@@ -869,6 +876,7 @@ class MenuBarDelegate(NSObject):
             # plus the connection-closed callback) — nothing to do.
             return
         self._meeting_active = False
+        self._browser_bridge.end_session()
         self._meeting_phase = "transcribing"
         logger.info("Meeting recording stop requested")
 
@@ -902,6 +910,14 @@ class MenuBarDelegate(NSObject):
         failure = None
         language = None if settings.recording_language == "auto" else settings.recording_language
         try:
+            diarize_ready = False
+            if settings.diarize:
+                from whisper_daemon.model_policy import diarization_status
+                self._diarization_status = diarization_status()
+                diarize_ready = self._diarization_status['available']
+                if not diarize_ready:
+                    _notify("whisper-daemon", "Speaker recognition unavailable", self._diarization_status['message'])
+                self._browser_bridge.send_json_str(__import__('json').dumps({"type": "capabilities", "diarization": self._diarization_status}))
             store = RecordingStore(rec_dir, started_at=self._meeting_start)
             self._meeting_store = store
             jobs = DiskChunkQueue(rec_dir)
@@ -983,7 +999,7 @@ class MenuBarDelegate(NSObject):
                 time.sleep(.05)
             merged = merge_chunk_results(jobs.results())
             merged['duration'] = store.meta['duration']
-            if settings.diarize:
+            if diarize_ready:
                 try:
                     from whisper_daemon.diarizer import diarize_file
                     from whisper_daemon.diarize_merge import merge_speakers_with_transcript
@@ -1066,6 +1082,7 @@ class MenuBarDelegate(NSObject):
         AppKit mutations are dispatched to the main thread."""
         self._meeting_active = False
         self._meeting_browser_triggered = False
+        self._browser_bridge.end_session()
         self._meeting_phase = "idle"
         self._browser_recorder = None
         self._browser_prebuffer = []

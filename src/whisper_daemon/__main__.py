@@ -260,7 +260,9 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
         supervisor.suspend(f"signal {signal.Signals(sig).name}")
         meeting_active = bool(
             menubar_delegate is not None
-            and getattr(menubar_delegate, "_meeting_active", False)
+            and (getattr(menubar_delegate, "_meeting_phase", "idle") != "idle"
+                 or (getattr(menubar_delegate, "_meeting_thread", None) is not None
+                     and menubar_delegate._meeting_thread.is_alive()))
         )
         # Long timeout while a meeting save may be running; exit code 0 so
         # launchd treats this as a requested stop and does not restart.
@@ -528,11 +530,20 @@ def record(
         from whisper_daemon.diarizer import SpeakerTracker
         speaker_tracker = SpeakerTracker()
 
-    chunk_queue: queue_mod.Queue[AudioChunk | None] = queue_mod.Queue()
-    recorder = MeetingRecorder(chunk_queue, device=resolved_device, chunk_silence=chunk_silence)
+    from whisper_daemon.recording_store import RecordingStore, DiskChunkQueue
+    import uuid
+    import time
+    capture_dir = output_dir / f"{output_stem}_audio_{uuid.uuid4().hex[:8]}"
+    store = RecordingStore(capture_dir)
+    chunk_queue = DiskChunkQueue(capture_dir)
+    recorder = MeetingRecorder(chunk_queue, device=resolved_device, chunk_silence=chunk_silence,
+                               raw_sink=lambda audio: store.append("mic", audio))
+    def transcribe_job(chunk):
+        result = transcribe_audio(chunk.audio, model, language)
+        chunk_queue.ack(chunk, result)
+        return result
 
     all_results: list[tuple[float, dict]] = []  # (start_time, result)
-    all_audio_chunks: list[tuple[float, np.ndarray]] = []  # for batch diarization
     chunk_count = 0
 
     click.echo("Recording... press Ctrl+C to stop.\n")
@@ -543,6 +554,11 @@ def record(
 
     try:
         while True:
+            if recorder.error: raise RuntimeError(str(recorder.error))
+            if futures:
+                _collect_results(futures, all_results)
+                time.sleep(.05)
+                continue
             try:
                 chunk = chunk_queue.get(timeout=0.5)
             except queue_mod.Empty:
@@ -555,15 +571,13 @@ def record(
             chunk_count += 1
             click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
 
-            if diarize:
-                all_audio_chunks.append((chunk.start_time, chunk.audio.copy()))
 
             if speaker_tracker is not None:
                 rt_segments = speaker_tracker.identify(chunk.audio, chunk.start_time)
                 if rt_segments:
                     click.echo(f"    → Speaker {rt_segments[0].speaker + 1}")
 
-            future = pool.submit(transcribe_audio, chunk.audio, model, language)
+            future = pool.submit(transcribe_job, chunk)
             futures[future] = chunk.start_time
 
             _collect_results(futures, all_results)
@@ -571,6 +585,7 @@ def record(
     except KeyboardInterrupt:
         click.echo("\n\nStopping recording...")
         recorder.stop()
+        store.finish(duration=time.monotonic() - store.started_at)
 
         # Wait for in-flight transcription FIRST (avoid concurrent GPU access)
         _collect_results(futures, all_results, wait=True)
@@ -585,15 +600,16 @@ def record(
                 break
             chunk_count += 1
             click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
-            if diarize:
-                all_audio_chunks.append((chunk.start_time, chunk.audio.copy()))
             if speaker_tracker is not None:
                 speaker_tracker.identify(chunk.audio, chunk.start_time)
-            result = transcribe_audio(chunk.audio, model, language)
+            result = transcribe_job(chunk)
             if result.get("text"):
                 all_results.append((chunk.start_time, result))
     finally:
+        recorder.abort()
+        if store.files: store.finish(state="interrupted")
         pool.shutdown(wait=False)
+        click.echo(f"Continuous audio: {capture_dir}")
 
     if not all_results:
         click.echo("No audio transcribed.")
@@ -605,11 +621,10 @@ def record(
         from whisper_daemon.diarize_merge import merge_speakers_with_transcript
 
         if diarize_mode in ("batch", "hybrid"):
-            from whisper_daemon.diarizer import diarize_batch
+            from whisper_daemon.diarizer import diarize_file
 
-            full_audio = _concatenate_audio_chunks(all_audio_chunks)
-            click.echo(f"\nDiarizing {len(full_audio) / 16000:.1f}s of audio (batch correction)...")
-            batch_segments = diarize_batch(full_audio, num_speakers=num_speakers)
+            click.echo("\nDiarizing continuous audio...")
+            batch_segments = diarize_file(str(capture_dir / "recording.wav"), num_speakers=num_speakers)
             final_result = merge_speakers_with_transcript(batch_segments, merged)
             speaker_count = len(final_result.get("speakers", []))
             click.echo(f"Found {speaker_count} speaker(s)")
@@ -640,6 +655,25 @@ def record(
 
     click.echo(f"\nDone — {chunk_count} chunks, {len(merged.get('segments', []))} segments.")
 
+
+
+@cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option("--transcribe", "redo_transcript", is_flag=True, help="Rebuild transcript from the recovered continuous audio.")
+@click.option("--language", default=None)
+def recover(directory, redo_transcript, language):
+    """Recover source WAVs after a crash; never changes original raw samples."""
+    from whisper_daemon.recording_store import RecordingStore, atomic_json
+    path = Path(directory)
+    metadata = RecordingStore.recover(path)
+    click.echo(f"Recovered {metadata['duration']:.2f} seconds in {path}")
+    if redo_transcript:
+        from whisper_daemon.transcriber import transcribe_file
+        from whisper_daemon.formats import FORMATTERS
+        result = transcribe_file(str(path / "recording.wav"), language=language)
+        atomic_json(path / "transcript_recovered.json", result)
+        for fmt in ("txt", "srt"):
+            (path / f"transcript_recovered.{fmt}").write_text(FORMATTERS[fmt](result), encoding="utf-8")
 
 
 def _collect_results(

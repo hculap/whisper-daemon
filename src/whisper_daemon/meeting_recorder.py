@@ -43,6 +43,7 @@ class AudioChunk:
     start_time: float  # seconds from recording start
     duration: float  # seconds
     source: str = "mic"  # "mic" or "browser"
+    job_id: str = ""
 
 
 class MeetingRecorder:
@@ -59,11 +60,17 @@ class MeetingRecorder:
         device: str | int | None = None,
         chunk_silence: float = DEFAULT_CHUNK_SILENCE,
         source_label: str = "mic",
+        raw_sink=None,
+        paused=None,
     ) -> None:
         self._chunk_queue = chunk_queue
         self._device = device
         self._chunk_silence = chunk_silence
         self._source_label = source_label
+        self._raw_sink = raw_sink
+        self._paused = paused or (lambda: False)
+        self.error = None
+        self._capture_lock = __import__("threading").RLock()
 
         self._vad = SileroVAD()
         self._channels = self._detect_channels()
@@ -300,6 +307,9 @@ class MeetingRecorder:
 
     def _finalize(self) -> None:
         """Emit remaining audio, send sentinel, reset VAD."""
+        if len(self._vad_buffer):
+            self._process_block(self._vad_buffer)
+            self._vad_buffer = np.array([], dtype=np.float32)
         self._emit_chunk(is_final=True)
         self._chunk_queue.put(None)
         self._vad.reset_states()
@@ -381,6 +391,24 @@ class MeetingRecorder:
 
     def _process_block(self, samples: np.ndarray) -> None:
         """Process a single block of mono audio through VAD and chunk splitting."""
+        if self._paused():
+            if self._frames: self._emit_chunk(is_final=True)
+            return
+        if self._raw_sink is not None:
+            try:
+                start = self._raw_sink(samples)
+                expected = self._chunk_start + self._current_chunk_duration()
+                if start > expected + .01:
+                    self._emit_chunk(is_final=True)
+                    self._chunk_start = start
+                elif not self._frames:
+                    self._chunk_start = start
+            except Exception as exc:
+                self.error = exc
+                self._recording = False
+                logger.exception("Cannot persist audio; stopping this source")
+                return
+        self._last_audio_at = time.monotonic()
         self._frames.append(samples.reshape(-1, 1))
 
         chunk_elapsed = self._current_chunk_duration()
@@ -393,7 +421,7 @@ class MeetingRecorder:
         if rms < RMS_SILENCE_FLOOR:
             speech_prob = 0.0
         else:
-            speech_prob = self._vad(samples.copy())
+            speech_prob = self._vad(np.pad(samples, (0, max(0, BLOCK_SIZE - len(samples)))))
         now = time.monotonic()
 
         if speech_prob > VAD_THRESHOLD:

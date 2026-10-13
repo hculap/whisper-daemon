@@ -82,6 +82,9 @@ class MenuBarDelegate(NSObject):
         self._meeting_active = False
         self._meeting_start = 0.0
         self._meeting_thread = None
+        self._meeting_store = None
+        self._meeting_paused = False
+        self._browser_audio_lock = threading.RLock()
         self._meeting_browser_triggered = False
         # Meeting lifecycle phase reported to the extension's control surface:
         # "idle" -> "recording" -> "transcribing" -> "idle". Distinct from
@@ -157,6 +160,7 @@ class MenuBarDelegate(NSObject):
             "Start Meeting Recording", "onMeeting:", self
         )
         menu.addItem_(self._meeting_menu_item)
+        menu.addItem_(_make_item("Pause / Resume Meeting", "onPauseMeeting:", self))
 
         menu.addItem_(NSMenuItem.separatorItem())
 
@@ -408,7 +412,7 @@ class MenuBarDelegate(NSObject):
         logger.info("Quit from menu bar")
 
         supervisor.suspend("quit from menu bar")
-        meeting_active = self._meeting_active
+        meeting_active = self._meeting_phase != "idle" or bool(self._meeting_thread and self._meeting_thread.is_alive())
         _start_exit_watchdog(330.0 if meeting_active else 15.0, exit_code=0)
 
         self._hotkey.stop()
@@ -682,20 +686,18 @@ class MenuBarDelegate(NSObject):
             AppHelper.callAfter(self._start_meeting, True, title)
 
     def _on_browser_audio(self, data: bytes) -> None:
-        """Raw PCM audio from browser tab."""
-        rec = self._browser_recorder
-        if rec is not None:
-            rec.feed_audio(np.frombuffer(data, dtype=np.float32))
-            return
-        # No recorder yet: stage a bounded amount so the extension's flushed
-        # reconnect buffer isn't lost while the meeting worker spins up. The
-        # worker drains this when it creates the browser recorder; if no
-        # meeting starts it's cleared on the next reset. Drop-oldest keeps
-        # recent speech.
-        self._browser_prebuffer.append(data)
-        self._browser_prebuffer_bytes += len(data)
-        while self._browser_prebuffer_bytes > BROWSER_PREBUFFER_MAX_BYTES and self._browser_prebuffer:
-            self._browser_prebuffer_bytes -= len(self._browser_prebuffer.pop(0))
+        """Stage the startup tail, then hand off atomically to its source."""
+        with self._browser_audio_lock:
+            if self._browser_recorder is not None:
+                self._browser_recorder.feed_audio(np.frombuffer(data, dtype="<f4"))
+                return
+            if self._meeting_phase == "transcribing": return
+            if self._browser_prebuffer_bytes + len(data) > BROWSER_PREBUFFER_MAX_BYTES:
+                self._browser_bridge.send_json_str('{"type":"error","message":"Audio startup buffer full; stop and retry"}')
+                AppHelper.callAfter(self._stop_meeting)
+                return
+            self._browser_prebuffer.append(data)
+            self._browser_prebuffer_bytes += len(data)
 
     def _on_browser_disconnect(self) -> None:
         """Extension disconnected or stopped capture."""
@@ -798,6 +800,9 @@ class MenuBarDelegate(NSObject):
             # Keep the native menu bar checkmarks/labels in sync (main thread).
             AppHelper.callAfter(self._sync_menu_from_settings)
 
+        elif msg_type == "pause_meeting":
+            AppHelper.callAfter(self.onPauseMeeting_, None)
+
         elif msg_type == "stop_meeting":
             if self._meeting_active:
                 AppHelper.callAfter(self._stop_meeting)
@@ -836,7 +841,7 @@ class MenuBarDelegate(NSObject):
         # checks _meeting_active before the first one has run — so the check
         # there is not enough. A second concurrent meeting would open a
         # second mic stream and corrupt the chunk pipeline.
-        if self._meeting_active:
+        if self._meeting_phase != "idle" or (self._meeting_thread is not None and self._meeting_thread.is_alive()):
             logger.info("Meeting already active — ignoring duplicate start")
             return
         self._meeting_active = True
@@ -864,6 +869,7 @@ class MenuBarDelegate(NSObject):
             # plus the connection-closed callback) — nothing to do.
             return
         self._meeting_active = False
+        self._meeting_phase = "transcribing"
         logger.info("Meeting recording stop requested")
 
         # If the worker thread never started or already finished, reset UI immediately
@@ -877,390 +883,143 @@ class MenuBarDelegate(NSObject):
         self._status_menu_item.setTitle_("Finishing transcription...")
 
     def _meeting_worker(self, browser_triggered: bool = False, browser_title: str = "") -> None:
-        from whisper_daemon import telemetry
-        from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
+        from whisper_daemon.meeting_recorder import MeetingRecorder
+        from whisper_daemon.recording_store import RecordingStore, DiskChunkQueue, atomic_json
+        from whisper_daemon.formats import FORMATTERS, merge_chunk_results
         from whisper_daemon.screen_capture import ScreenCapture
         from whisper_daemon.transcriber import transcribe_full
+        import uuid
 
-        model = self._daemon._model
-        device = self._settings.recording_device or None
-        chunk_queue: queue.Queue[AudioChunk | None] = queue.Queue()
-
-        # Which sources to capture (settings snapshot; may be toggled from the
-        # extension between meetings — cold, so read here at meeting start).
-        capture_mic = self._settings.capture_mic
-        capture_tab = self._settings.capture_tab
-
-        # Snapshot the remaining COLD settings the worker consumes, so a
-        # mid-meeting set_settings from the extension cannot alter this
-        # in-progress meeting's output (contract section D).
-        diarize = self._settings.diarize
-        save_audio = self._settings.save_audio
-        recording_formats = list(self._settings.recording_formats)
-        recording_dir_path = self._settings.recording_dir_path
-        capture_screenshots = self._settings.capture_screenshots
-        screenshot_displays = self._settings.screenshot_displays
-        screenshot_interval = self._settings.screenshot_interval
-        # "auto" -> None so Whisper auto-detects; otherwise force the language so
-        # short/quiet chunks stop coming back as the wrong language (Icelandic,
-        # Russian, …) in the live captions and saved transcript.
-        language = (
-            None if self._settings.recording_language == "auto"
-            else self._settings.recording_language
-        )
-
-        # Mic recorder (local device) — only when capture_mic is enabled.
-        mic_recorder: MeetingRecorder | None = None
-        if capture_mic:
-            mic_recorder = MeetingRecorder(chunk_queue, device=device, source_label="mic")
-
-        # Browser recorder (Chrome extension tab audio) — only when capture_tab
-        # is enabled AND a browser-triggered connection is live.
-        browser_recorder: MeetingRecorder | None = None
-        if capture_tab and browser_triggered and self._browser_bridge.connected:
-            browser_recorder = MeetingRecorder(chunk_queue, source_label="browser")
-            browser_recorder.start_without_device()
-            # Drain PCM staged between the extension's 'start' and now so a
-            # reconnect's flushed buffer (or the first frames of a fresh
-            # session) isn't lost.
-            staged = self._browser_prebuffer
-            self._browser_prebuffer = []
-            self._browser_prebuffer_bytes = 0
-            for data in staged:
-                browser_recorder.feed_audio(np.frombuffer(data, dtype=np.float32))
-            self._browser_recorder = browser_recorder
-
-        # No source at all: nothing to record — abort cleanly rather than
-        # spinning an empty meeting that never produces chunks.
-        if mic_recorder is None and browser_recorder is None:
-            logger.warning(
-                "No audio source (capture_mic off and no browser recorder) — "
-                "aborting meeting"
-            )
-            _notify(
-                "whisper-daemon",
-                "No audio source",
-                "Enable microphone or participant capture — nothing to record.",
-            )
-            self._reset_meeting_ui()
-            return
-
-        # Number of recorders determines how many None sentinels to expect
-        sentinel_expected = (1 if mic_recorder else 0) + (1 if browser_recorder else 0)
-        sentinel_count = 0
-
-        all_results: list[tuple[float, dict]] = []
-        all_audio: list[np.ndarray] = []
-        chunk_count = 0
-
-        # Prepare output dir early for screenshots. The meeting title is
-        # untrusted (comes from the extension's 'start' message), so strip it
-        # to a safe filename component — keep only [A-Za-z0-9_-] to prevent
-        # path traversal (e.g. "../../tmp/pwn") out of recording_dir.
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        title_slug = (
-            re.sub(r"[^A-Za-z0-9_-]", "", browser_title.replace(" ", "_"))[:30]
-            if browser_title
-            else ""
-        )
-        dir_name = f"recording_{title_slug}_{timestamp}" if title_slug else f"recording_{timestamp}"
-        base_dir = recording_dir_path
-        rec_dir = base_dir / dir_name
-        # Defense in depth: ensure the resolved dir stays under the configured
-        # recording folder even if the slug logic is ever weakened.
-        if not rec_dir.resolve().is_relative_to(base_dir.resolve()):
-            logger.warning("Meeting dir escaped recording folder — using base dir")
-            rec_dir = base_dir / f"recording_{timestamp}"
-        rec_dir.mkdir(parents=True, exist_ok=True)
-
-        screen_capture: ScreenCapture | None = None
-        if capture_screenshots:
-            screen_capture = ScreenCapture(
-                rec_dir,
-                interval=screenshot_interval,
-                displays=screenshot_displays,
-            )
-            screen_capture.start()
-
-        HEALTH_CHECK_SEC = 120.0  # first warning after 2 min of silence
-        HEALTH_REPEAT_SEC = 120.0  # re-warn every 2 min while still silent
-        RECOVERY_BACKOFF_SEC = 10.0  # min interval between recovery attempts
-
-        telemetry.meeting_start()
-        devices_stopped = False
-        if mic_recorder is not None:
-            try:
-                mic_recorder.start()
-            except Exception as exc:
-                logger.error("Failed to open mic for meeting: %s", exc)
-                # If the browser tab is still feeding audio, keep the meeting
-                # alive on that source alone instead of aborting.
-                if browser_recorder is None:
-                    if screen_capture:
-                        screen_capture.stop()
-                    _notify(
-                        "whisper-daemon",
-                        "Error",
-                        "Could not open microphone for meeting.",
-                    )
-                    self._reset_meeting_ui()
-                    return
-                logger.warning("Mic failed to open — continuing with tab audio only")
-                mic_recorder = None
-                sentinel_expected = 1 if browser_recorder else 0
-
-        if mic_recorder is not None and mic_recorder.fell_back_to_default:
-            _notify(
-                "whisper-daemon",
-                "Microphone fallback",
-                "Preferred device unavailable — using system default mic.",
-            )
-
+        settings = self._settings
+        slug = re.sub(r"[^A-Za-z0-9_-]", "", browser_title.replace(" ", "_"))[:30]
+        rec_dir = settings.recording_dir_path / f"recording_{slug}_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
+        store = None
+        recorders = []
+        screens = None
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        pending = None
+        stopped = False
+        failure = None
+        language = None if settings.recording_language == "auto" else settings.recording_language
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                futures: dict[concurrent.futures.Future, float] = {}
-
-                partial_path = rec_dir / "transcript_live.txt"
-                # Mic liveness is read from the recorder's callback clock
-                # (last_audio_at), not from emitted chunks — steady browser
-                # audio no longer masks a dead microphone.
-                last_health_warn = 0.0
-                last_recovery_attempt = 0.0
-                last_status_push = 0.0
-                mic_lost_notified = False
-
-                while self._meeting_active:
-                    now = time.monotonic()
-
-                    # Push a recording status to the extension about once/sec so
-                    # the in-bar button + timer track the daemon (single source
-                    # of truth) even for menu-bar-started meetings.
-                    if now - last_status_push >= 1.0:
-                        last_status_push = now
-                        elapsed = now - self._meeting_start
-                        self._meeting_chunk_count = chunk_count
-                        try:
-                            self._browser_bridge.send_json_str(
-                                build_status_message("recording", elapsed, chunk_count)
-                            )
-                        except Exception:
-                            logger.debug("Failed to push recording status", exc_info=True)
-
-                    # Check if mic recorder needs device recovery. Retries
-                    # keep firing on a backoff timer until they succeed or
-                    # the meeting ends — devices (Bluetooth, USB) can
-                    # reappear minutes later, so we never give up.
-                    if (
-                        mic_recorder is not None
-                        and mic_recorder.needs_recovery
-                        and now - last_recovery_attempt >= RECOVERY_BACKOFF_SEC
-                    ):
-                        last_recovery_attempt = now
-                        logger.warning("Mic device needs recovery, attempting reopen...")
-                        if mic_recorder.recover_device():
-                            logger.info("Mic recovered, meeting continues")
-                            mic_lost_notified = False
-                            if mic_recorder.fell_back_to_default:
-                                _notify(
-                                    "whisper-daemon",
-                                    "Mic recovered (fallback)",
-                                    "Original device lost — now using system default mic.",
-                                )
-                        elif not mic_lost_notified:
-                            # Notify once per lost-then-recovered cycle to
-                            # avoid hammering the user during extended outages.
-                            mic_lost_notified = True
-                            logger.error("Mic recovery failed, will keep retrying every %.0fs", RECOVERY_BACKOFF_SEC)
-                            _notify(
-                                "whisper-daemon",
-                                "Mic lost",
-                                "Device recovery failed. Will keep retrying; browser audio continues.",
-                            )
-
-                    try:
-                        chunk = chunk_queue.get(timeout=0.5)
-                    except queue.Empty:
-                        if _collect_futures(futures, all_results):
-                            _write_partial(partial_path, all_results)
-                            self._send_results_to_browser(all_results, chunk_count)
-                        # Health check keyed on the mic CALLBACK, not on
-                        # emitted chunks: a quiet room emits no chunks (VAD
-                        # drops silence) yet the callback keeps firing, so
-                        # keying on chunks would false-alarm every 2 min
-                        # while the user is merely listening. last_audio_at
-                        # only goes stale when the stream genuinely stops
-                        # delivering samples — a real dead device.
-                        mic_last_audio = (
-                            mic_recorder.last_audio_at if mic_recorder is not None else 0.0
-                        )
-                        elapsed_silent = now - mic_last_audio if mic_last_audio else 0.0
-                        if (
-                            mic_recorder is not None
-                            and elapsed_silent > HEALTH_CHECK_SEC
-                            and now - last_health_warn >= HEALTH_REPEAT_SEC
-                        ):
-                            last_health_warn = now
-                            logger.warning(
-                                "No mic audio callbacks for %.0fs — mic stream appears dead",
-                                elapsed_silent,
-                            )
-                            _notify(
-                                "whisper-daemon",
-                                "Microphone stopped",
-                                f"No mic audio for {int(elapsed_silent)}s. Attempting to recover.",
-                            )
-                            mic_recorder.request_recovery()
-                        continue
-
-                    if chunk is None:
-                        sentinel_count += 1
-                        if sentinel_count >= sentinel_expected:
-                            break
-                        continue
-
-                    chunk_count += 1
-                    logger.info(
-                        "Meeting chunk %d: %.1fs [%s]",
-                        chunk_count, chunk.duration, chunk.source,
-                    )
-                    telemetry.meeting_chunk_queued(chunk_count, chunk.duration, chunk.start_time)
-                    if save_audio or diarize:
-                        all_audio.append(chunk.audio.copy())
-                    cn = chunk_count  # capture for closure
-                    def _transcribe_and_track(audio, m, n):
-                        result = transcribe_full(audio, m, language)
-                        segs = len(result.get("segments", []))
-                        chars = len(result.get("text", ""))
-                        telemetry.meeting_chunk_transcribed(n, chars, segs)
-                        return result
-                    future = pool.submit(_transcribe_and_track, chunk.audio, model, cn)
-                    futures[future] = chunk.start_time
-                    if _collect_futures(futures, all_results):
-                        _write_partial(partial_path, all_results)
-                        self._send_results_to_browser(all_results, chunk_count)
-
-                # Recording finished — enter the transcription phase so a
-                # get_settings arriving now reports "transcribing" (not idle),
-                # and tell the extension so its button reflects that state.
-                self._meeting_phase = "transcribing"
-                self._meeting_chunk_count = chunk_count
+            store = RecordingStore(rec_dir, started_at=self._meeting_start)
+            self._meeting_store = store
+            jobs = DiskChunkQueue(rec_dir)
+            self._meeting_paused = False
+            if settings.capture_mic:
+                mic = MeetingRecorder(jobs, device=settings.recording_device or None,
+                    raw_sink=lambda audio: store.append("mic", audio),
+                    paused=lambda: self._meeting_paused)
                 try:
-                    self._browser_bridge.send_json_str(
-                        build_status_message("transcribing", 0.0, chunk_count)
-                    )
-                except Exception:
-                    logger.debug("Failed to push transcribing status", exc_info=True)
-
-                if mic_recorder is not None:
-                    mic_recorder.stop()
-                if browser_recorder is not None:
-                    browser_recorder.stop_without_device()
-                    self._browser_recorder = None
-                if screen_capture is not None:
-                    screen_capture.stop()
-                devices_stopped = True
-
-                # Wait for in-flight transcription to finish FIRST
-                _collect_futures(futures, all_results, wait=True)
-
-                # Now safe to transcribe remaining chunks (no concurrent GPU access)
-                while True:
+                    mic.start()
+                    recorders.append(mic)
+                except Exception as exc:
+                    mic.abort()
+                    store.meta['errors'].append(f"Microphone: {exc}")
+                    _notify("whisper-daemon", "Microphone unavailable", str(exc)[:180])
+            if settings.capture_tab and browser_triggered:
+                browser = MeetingRecorder(jobs, source_label="browser",
+                    raw_sink=lambda audio: store.append("browser", audio),
+                    paused=lambda: self._meeting_paused)
+                browser.start_without_device()
+                recorders.append(browser)
+                # The same lock protects staging and handoff: no PCM can land
+                # between draining the prebuffer and publishing the recorder.
+                with self._browser_audio_lock:
+                    for data in self._browser_prebuffer:
+                        browser.feed_audio(np.frombuffer(data, dtype="<f4"))
+                    self._browser_prebuffer = []
+                    self._browser_prebuffer_bytes = 0
+                    self._browser_recorder = browser
+            if not recorders:
+                raise RuntimeError("No audio source is available")
+            if settings.capture_screenshots:
+                screens = ScreenCapture(rec_dir, interval=settings.screenshot_interval,
+                                        displays=settings.screenshot_displays)
+                screens.start()
+            last_status = 0.0
+            last_recovery = 0.0
+            while True:
+                now = time.monotonic()
+                if not self._meeting_active and not stopped:
+                    self._meeting_phase = "transcribing"
+                    with self._browser_audio_lock:
+                        self._browser_recorder = None
+                        for recorder in recorders:
+                            if recorder._source_label == "mic": recorder.stop()
+                            else: recorder.stop_without_device()
+                    if screens: screens.stop()
+                    store.finish(duration=now - self._meeting_start, state="transcribing")
+                    stopped = True
+                for recorder in recorders:
+                    if recorder.error:
+                        raise RuntimeError(f"Audio storage failed: {recorder.error}")
+                    if (not stopped and recorder._source_label == "mic"
+                            and recorder.needs_recovery and now - last_recovery > 10):
+                        last_recovery = now
+                        recorder.recover_device()
+                if pending is not None and pending[0].done():
+                    future, chunk = pending
+                    result = future.result()  # failures keep the durable job for recovery
+                    jobs.ack(chunk, result)
+                    pending = None
+                    self._meeting_chunk_count += 1
+                    results = jobs.results()
+                    _write_partial(rec_dir / "transcript_live.txt", results)
+                    self._send_results_to_browser(results, self._meeting_chunk_count)
+                if pending is None:
                     try:
-                        chunk = chunk_queue.get_nowait()
+                        chunk = jobs.get_nowait()
                     except queue.Empty:
-                        break
-                    if chunk is None:
-                        continue
-                    chunk_count += 1
-                    if save_audio or diarize:
-                        all_audio.append(chunk.audio.copy())
-                    result = transcribe_full(chunk.audio, model, language)
-                    if result.get("text", "").strip():
-                        all_results.append((chunk.start_time, result))
-
-        except Exception:
-            logger.exception("Meeting recording failed")
-            _notify("whisper-daemon", "Error", "Meeting recording failed.")
-            self._reset_meeting_ui()
-            return
-        finally:
-            # Safety net for exception paths that skipped the normal
-            # cleanup: a leaked registered mic stream permanently disables
-            # the PortAudio device refresh for the rest of the process life.
-            # Skipped after a clean stop() (devices_stopped=True).
-            if not devices_stopped:
-                if mic_recorder is not None:
-                    mic_recorder.abort()
-                if browser_recorder is not None:
-                    browser_recorder.stop_without_device()
-                    self._browser_recorder = None
-                if screen_capture is not None:
-                    screen_capture.stop()
-
-        if not all_results:
-            _notify("whisper-daemon", "Done", "No speech detected.")
-            self._reset_meeting_ui()
-            return
-
-        # Finalization runs OUTSIDE the worker's try/except above, so any
-        # failure here (disk full, unwritable recording_dir, malformed
-        # segments) must NOT leave _meeting_phase stuck at "transcribing".
-        # The finally guarantees _reset_meeting_ui() runs and pushes the
-        # terminal "idle" status over the still-open socket (F3).
-        try:
-            from whisper_daemon.formats import merge_chunk_results
-            merged_result = merge_chunk_results(all_results)
-
-            if diarize and all_audio:
+                        if stopped: break
+                    else:
+                        pending = (pool.submit(transcribe_full, chunk.audio, self._daemon._model, language), chunk)
+                if now - last_status >= 1:
+                    last_status = now
+                    self._browser_bridge.send_json_str(build_status_message(
+                        self._meeting_phase, now - self._meeting_start, self._meeting_chunk_count))
+                    self._browser_bridge.send_json_str(__import__("json").dumps({
+                        "type": "health", "sources": store.health(), "paused": self._meeting_paused}))
+                time.sleep(.05)
+            merged = merge_chunk_results(jobs.results())
+            merged['duration'] = store.meta['duration']
+            if settings.diarize:
                 try:
-                    from whisper_daemon.diarizer import diarize_batch
+                    from whisper_daemon.diarizer import diarize_file
                     from whisper_daemon.diarize_merge import merge_speakers_with_transcript
-
-                    full_audio = np.concatenate(all_audio)
-                    logger.info("Diarizing %.1fs of audio...", len(full_audio) / 16000)
-                    speaker_segments = diarize_batch(full_audio)
-                    merged_result = merge_speakers_with_transcript(
-                        speaker_segments, merged_result
-                    )
-                    speaker_count = len(merged_result.get("speakers", []))
-                    logger.info("Diarization done — %d speakers", speaker_count)
-                except Exception:
-                    logger.exception("Diarization failed, saving without speaker labels")
-
-            from whisper_daemon.formats import FORMATTERS
-
-            written: list[str] = []
-            for fmt in recording_formats:
+                    merged = merge_speakers_with_transcript(diarize_file(str(rec_dir / "recording.wav")), merged)
+                except Exception as exc:
+                    store.meta['errors'].append(f"Speaker recognition unavailable: {exc}")
+                    _notify("whisper-daemon", "Speaker recognition unavailable", "Audio and transcript saved without automatic speaker labels.")
+            atomic_json(rec_dir / "transcript.json", merged)
+            for fmt in settings.recording_formats:
                 if fmt in FORMATTERS:
-                    out = rec_dir / f"transcript.{fmt}"
-                    out.write_text(FORMATTERS[fmt](merged_result), encoding="utf-8")
-                    written.append(str(out))
-
-            if save_audio and all_audio:
-                audio_path = rec_dir / "recording.wav"
-                full_audio = np.concatenate(all_audio)
-                _save_wav(audio_path, full_audio, 16000)
-                written.append(str(audio_path))
-
-            screenshots_msg = ""
-            if screen_capture is not None and screen_capture.saved_count > 0:
-                screenshots_msg = f", {screen_capture.saved_count} screenshots"
-
-            # Remove live partial now that final transcript exists
-            partial_path = rec_dir / "transcript_live.txt"
-            partial_path.unlink(missing_ok=True)
-
-            telemetry.meeting_stop(chunk_count, str(rec_dir))
-            logger.info("Meeting saved: %s", ", ".join(written))
-            _notify(
-                "whisper-daemon",
-                f"Meeting recorded ({chunk_count} chunks{screenshots_msg})",
-                str(rec_dir),
-            )
-        except Exception:
-            logger.exception("Meeting finalization failed")
-            _notify("whisper-daemon", "Error", "Failed to save meeting transcript.")
+                    target = rec_dir / f"transcript.{fmt}"
+                    temp = target.with_suffix(target.suffix + ".tmp")
+                    temp.write_text(FORMATTERS[fmt](merged), encoding="utf-8")
+                    temp.replace(target)
+            store.meta['state'] = 'complete'
+            store._save()
+            (rec_dir / "transcript_live.txt").unlink(missing_ok=True)
+            _notify("whisper-daemon", "Meeting saved", str(rec_dir))
+        except Exception as exc:
+            failure = exc
+            logger.exception("Meeting failed; source audio and pending jobs remain recoverable")
+            _notify("whisper-daemon", "Meeting interrupted", f"{exc}. Recoverable files: {rec_dir}")
         finally:
+            with self._browser_audio_lock:
+                self._browser_recorder = None
+                for recorder in recorders:
+                    recorder.abort()
+            if screens: screens.stop()
+            if store and not stopped:
+                try:
+                    if failure: store.meta['errors'].append(str(failure))
+                    store.finish(duration=time.monotonic() - self._meeting_start, state="interrupted")
+                except Exception:
+                    logger.exception("Export failed; raw source files retained")
+            pool.shutdown(wait=False)
+            self._meeting_store = None
             self._reset_meeting_ui()
 
     def _send_results_to_browser(self, all_results: list, chunk_count: int) -> None:
@@ -1329,6 +1088,17 @@ class MenuBarDelegate(NSObject):
 
     # -- File transcription --
 
+    def _finish_file_ui(self) -> None:
+        if self._meeting_phase == "idle":
+            self._set_icon_safe(self._daemon._state)
+            self._set_status_safe("Ready")
+
+    def onPauseMeeting_(self, sender) -> None:
+        if not self._meeting_active: return
+        self._meeting_paused = not self._meeting_paused
+        if self._meeting_store: self._meeting_store.pause(self._meeting_paused)
+        self._set_status_safe("Meeting paused" if self._meeting_paused else "Recording meeting")
+
     def _transcribe_paths_worker(self, paths: list[str]) -> None:
         from whisper_daemon.formats import FORMATTERS
         from whisper_daemon.transcriber import transcribe_file
@@ -1336,8 +1106,9 @@ class MenuBarDelegate(NSObject):
         model = self._daemon._model
         diarize = self._settings.transcription_diarize
 
-        self._set_icon_safe(State.TRANSCRIBING)
-        self._set_status_safe("Transcribing files...")
+        if self._meeting_phase == "idle":
+            self._set_icon_safe(State.TRANSCRIBING)
+            self._set_status_safe("Transcribing files...")
 
         files: list[Path] = []
         ext_set = {"." + e for e in AUDIO_VIDEO_EXTENSIONS}
@@ -1352,7 +1123,7 @@ class MenuBarDelegate(NSObject):
 
         if not files:
             _notify("whisper-daemon", "No files", "No audio/video files found.")
-            self._reset_meeting_ui()
+            self._finish_file_ui()
             return
 
         out_dir = self._settings.transcription_output_dir_path
@@ -1407,7 +1178,7 @@ class MenuBarDelegate(NSObject):
                 "Transcription complete",
                 f"{done}/{len(files)} files transcribed.",
             )
-        self._reset_meeting_ui()
+        self._finish_file_ui()
 
 
 def _diarize_transcript(path: str, result: dict) -> dict:

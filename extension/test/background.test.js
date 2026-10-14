@@ -41,3 +41,25 @@ test('a native recording remains controllable without browser tab ownership',asy
   await f.receive({type:'WD_STOP_MEETING'},2);
   assert.deepEqual(f.messages.map(m=>m.type),['WD_PAUSE_MEETING','WD_STOP_MEETING']);
 });
+test('idle statuses keep the joined call, so leaving it still tears the socket down',async()=>{
+  const f=fixture();
+  await f.receive({type:'MEET_JOINED',title:'t',url:'u'},1);
+  await f.receive({type:'STATUS',state:'idle',snapshot:true});
+  assert.deepEqual({...await f.receive({type:'GET_STATE'})},{state:'detected',meetTabId:1,meetTitle:'t',meetUrl:'u'});
+  await f.receive({type:'WD_START'},1);
+  await f.receive({type:'STATUS',state:'idle',sessionId:'s'});
+  assert.equal((await f.receive({type:'GET_STATE'})).meetTabId,1);
+  await f.receive({type:'MEET_LEFT'},1);
+  assert.ok(f.messages.some(m=>m.type==='STOP_CAPTURE'));
+  assert.ok(f.tabs.some(x=>x.id===1&&x.msg.type==='WD_MEET_LEFT'));
+});
+test('a saving state never refuses a start and is released when the daemon goes away',async()=>{
+  const f=fixture();
+  await f.receive({type:'MEET_JOINED'},1);
+  await f.receive({type:'STATUS',state:'transcribing',sessionId:'s'});
+  await f.receive({type:'CONTROL_CLOSED'});
+  assert.equal((await f.receive({type:'GET_STATE'})).state,'detected');
+  await f.receive({type:'STATUS',state:'transcribing',sessionId:'s'});
+  assert.equal((await f.receive({type:'WD_START'},1)).ok,true);
+  assert.ok(f.messages.some(m=>m.type==='WD_START'));
+});

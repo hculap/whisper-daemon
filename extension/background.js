@@ -13,7 +13,11 @@ chrome.storage.local.setAccessLevel({accessLevel: "TRUSTED_CONTEXTS"});
 const State = { IDLE: "idle", DETECTED: "detected", STARTING: "starting", CAPTURING: "capturing", TRANSCRIBING: "transcribing" };
 
 let state = State.IDLE;
+// The tab in a Meet call. It outlives any single recording in that call, so
+// only leaving the call or closing the tab releases it.
 let meetTabId = null;
+// A menu-bar (native) recording belongs to no tab; any Meet tab may control it.
+let nativeRecording = false;
 let meetTitle = "";
 let meetUrl = "";
 
@@ -37,19 +41,10 @@ function updateBadge() {
   chrome.action.setBadgeBackgroundColor({ color: badge.color });
 }
 
-// Paint the badge from a daemon status phase (idle | recording | transcribing)
-// rather than the background's own state machine, so it tracks the real
-// recording phase across an owned stop that keeps the session's socket alive.
-function updateBadgeForPhase(phase) {
-  const map = {
-    idle: { text: "", color: "#000" },
-    recording: { text: "REC", color: "#F44336" },
-    transcribing: { text: "…", color: "#FF9800" },
-  };
-  const badge = map[phase];
-  if (!badge) return;
-  chrome.action.setBadgeText({ text: badge.text });
-  chrome.action.setBadgeBackgroundColor({ color: badge.color });
+// No recording in progress: back to the joined call, if any.
+function settleIdle() {
+  nativeRecording = false;
+  transitionTo(meetTabId ? State.DETECTED : State.IDLE);
 }
 
 // --- Messages ---
@@ -109,8 +104,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "CAPTURE_STOPPED") {
-    transitionTo(State.IDLE);
-    meetTabId = null;
+    settleIdle();
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "CONTROL_CLOSED") {
+    // The daemon went away: a "saving" or native-recording state can no longer
+    // be confirmed or ended by a status. The daemon decides on the next start.
+    if (state === State.TRANSCRIBING || nativeRecording) settleIdle();
     sendResponse({ ok: true });
 
   } else if (msg.type === 'RECOVERY_AVAILABLE') {
@@ -143,16 +143,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       elapsed: msg.elapsed,
       chunks: msg.chunks,
     });
-    // Track the real recording phase on the toolbar badge (finding 4). WD_STOP
-    // now keeps the socket open and no longer transitions the background out of
-    // CAPTURING, so without this the badge would stay red "REC" for the rest of
-    // the session after an owned stop. Map the daemon phase directly.
-    updateBadgeForPhase(msg.state);
-    if (msg.state === 'idle') { state = State.IDLE; meetTabId = null; }
-    else if (msg.state === 'transcribing') state = State.TRANSCRIBING;
-    else if (msg.state === 'recording') {
-      state = State.CAPTURING;
-      if (!msg.sessionId) meetTabId = null; // native session, no exclusive tab
+    // Track the daemon's real phase (badge included): WD_STOP keeps the socket
+    // open and does not leave CAPTURING by itself. A settings snapshot reports
+    // the phase too, but must not override a start that is being set up.
+    if (!(msg.snapshot && state === State.STARTING)) {
+      if (msg.state === "idle") settleIdle();
+      else if (msg.state === "transcribing") transitionTo(State.TRANSCRIBING);
+      else if (msg.state === "recording") {
+        nativeRecording = !msg.sessionId;
+        transitionTo(State.CAPTURING);
+      }
     }
     sendResponse({ ok: true });
 
@@ -174,9 +174,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   } else if (msg.type === "WD_START") {
     // From content script (page gesture). Forward to offscreen.
+    // A previous meeting still being saved is not refused here: the daemon is
+    // the authority and makes the start wait until it is free.
     if (sender.tab?.id) {
-      if (state === State.TRANSCRIBING) { sendResponse({ok:false,error:'Previous recording is still being saved'}); return; }
-      if (meetTabId !== null && meetTabId !== sender.tab.id && (state === State.CAPTURING || state === State.STARTING)) {
+      if (!nativeRecording && meetTabId !== null && meetTabId !== sender.tab.id &&
+          (state === State.CAPTURING || state === State.STARTING)) {
         sendResponse({ok: false, error: "Another tab is recording"}); return;
       }
       transitionTo(State.STARTING);
@@ -204,7 +206,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     msg.type === "WD_STOP_MEETING" ||
     msg.type === "WD_SET_SETTINGS"
   ) {
-    if (!sender.tab || meetTabId === null || state === State.IDLE || state === State.DETECTED || sender.tab.id === meetTabId) {
+    if (!sender.tab || meetTabId === null || nativeRecording || state === State.IDLE ||
+        state === State.DETECTED || sender.tab.id === meetTabId) {
       forwardToOffscreen(msg);
     }
     sendResponse({ ok: true });

@@ -24,6 +24,12 @@ const RECONNECT_WINDOW_MS = 5 * 60 * 1000;
 const PING_INTERVAL_MS = 25000;
 // 16kHz float32 mono = 64 KB/s; 8 MB ≈ 2 minutes of buffered audio.
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+const START_ACK_TIMEOUT_MS = 10000;
+// While the daemon saves the previous meeting it answers 'busy'; the new
+// session keeps buffering and asks again (bounded by MAX_BUFFERED_BYTES).
+const BUSY_RETRY_MS = 1000;
+const BUSY_WAIT_MS = 5 * 60 * 1000;
+const BUSY_MESSAGE = "Previous recording is still being saved, so the new one could not start.";
 
 let audioContext = null;
 let mediaStream = null;
@@ -136,15 +142,9 @@ async function startCaptureFromStream(streamId) {
     chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
     return;
   }
-  const gen = ++captureGen;
-  if (stoppedSession) await drainStoppedSession();
-  if (gen !== captureGen || stoppedSession) return;
-  sessionId = crypto.randomUUID();
-  streamReady = startSent = false;
-  pcmSequence = pcmPosition = 0;
-  sessionStarting = true;
-  externalMode = false;
+  const gen = prepareSession(false);
   try {
+    if (!await deliverRetainedTail(gen)) return;
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         mandatory: {
@@ -155,7 +155,11 @@ async function startCaptureFromStream(streamId) {
       video: false,
     });
 
-    if (gen !== captureGen) { mediaStream.getTracks().forEach(t => t.stop()); return; }
+    if (gen !== captureGen) {
+      mediaStream.getTracks().forEach(t => t.stop());
+      settleSupersededStart();
+      return;
+    }
     mediaStream.getAudioTracks().forEach((track) => {
       track.onended = () => {
         console.warn("Capture track ended");
@@ -166,7 +170,7 @@ async function startCaptureFromStream(streamId) {
     audioContext = new AudioContext({ sampleRate: 16000 });
     const source = audioContext.createMediaStreamSource(mediaStream);
     await audioContext.audioWorklet.addModule("pcm-processor.js");
-    if (gen !== captureGen) return;
+    if (gen !== captureGen) { settleSupersededStart(); return; }
     const workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
     source.connect(workletNode);
     workletNode.connect(audioContext.destination);
@@ -175,12 +179,11 @@ async function startCaptureFromStream(streamId) {
     workletNode.port.onmessage = (event) => {
       sendPcm(event.data.samples.buffer, event.data.position);
     };
-    const ok = await beginSession(gen);
-    if (!ok) return;
+    if (!await beginSession(gen) && gen !== captureGen) settleSupersededStart();
   } catch (err) {
-    console.error("Capture failed:", err);
-    cleanup();
-    chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: err.message });
+    failStart(gen, err);
+  } finally {
+    if (gen === captureGen) sessionStarting = false;
   }
 }
 
@@ -191,29 +194,57 @@ async function startExternal() {
     chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
     return;
   }
-  const gen = ++captureGen;
-  sessionId = crypto.randomUUID();
-  streamReady = startSent = false;
-  pcmSequence = pcmPosition = 0;
-  pcmBuffer = []; pcmBufferedBytes = 0;
-  externalMode = true;
-  sessionStarting = true;
+  const gen = prepareSession(true);
   try {
-    // New source PCM may already be arriving while the previous failed tail
-    // is being resolved. Stage it under the new identity, never discard it.
-    if (stoppedSession) await drainStoppedSession();
-    if (gen !== captureGen || stoppedSession) return;
-    await beginSession(gen);
+    if (!await deliverRetainedTail(gen)) return;
+    if (!await beginSession(gen) && gen !== captureGen) settleSupersededStart();
   } catch (err) {
-    if (gen !== captureGen) return;
-    console.error("External session failed:", err);
-    cleanup();
-    chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: err.message });
+    failStart(gen, err);
   } finally {
     // Only clear if we still own the generation — a racing start/stop that
     // bumped captureGen owns the flag now.
     if (gen === captureGen) sessionStarting = false;
   }
+}
+
+// New identity first: source PCM arriving while a previous failed tail is
+// resolved, or while the daemon is busy, is staged under it, never discarded.
+function prepareSession(external) {
+  const gen = ++captureGen;
+  sessionId = crypto.randomUUID();
+  streamReady = startSent = false;
+  pcmSequence = pcmPosition = 0;
+  pcmBuffer = []; pcmBufferedBytes = 0;
+  externalMode = external;
+  sessionStarting = true;
+  return gen;
+}
+
+// The previous session's undelivered stop comes first. When this start cannot
+// continue, background has been told why (drain error or settled start).
+async function deliverRetainedTail(gen) {
+  if (stoppedSession) await drainStoppedSession();
+  if (gen !== captureGen) { settleSupersededStart(); return false; }
+  return !stoppedSession;
+}
+
+// A stop raced this start. Unless a newer session owns the state, tell
+// background the start ended so it never stays in STARTING.
+function settleSupersededStart() {
+  if (!capturing && !sessionStarting) chrome.runtime.sendMessage({ type: "CAPTURE_STOPPED" });
+}
+
+function failStart(gen, err) {
+  if (gen !== captureGen) { settleSupersededStart(); return; }
+  console.error("Capture failed:", err);
+  let message = err.message;
+  // The daemon never owned this session; keep what was captured meanwhile.
+  if (err.code === "busy" && pcmBuffer.length) {
+    recoveryTails.push({id: sessionId, packets: pcmBuffer, position: pcmPosition});
+    message += " Audio captured meanwhile is kept for export in the extension popup.";
+  }
+  cleanup();
+  chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message });
 }
 
 function ingestExternalPcm(samples, position) {
@@ -263,16 +294,52 @@ async function beginSession(gen) {
   return true;
 }
 
+// Resolves on the daemon's 'started'. pendingStart() resolves it early (a stop
+// raced the start); pendingStart.reject() fails it. A 'busy' reply means the
+// daemon is saving another meeting and does not own this one yet: audio stays
+// buffered and the start is re-sent on the next idle status or retry tick.
 function sendStartMessage(id = sessionId, position = pcmPosition, track = true) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => { pendingStart = null; reject(new Error("Daemon did not accept this recording")); }, 10000);
-    pendingStart = () => { clearTimeout(timer); pendingStart = null; resolve(); };
-    pendingStart.sessionId = id;
-    pendingStart.reject = error => { clearTimeout(timer); pendingStart = null; reject(error); };
-    if (track) startSent = true;
-    ws.send(JSON.stringify({type: "start", session_id: id, meeting_title: meetTitle, meeting_url: meetUrl,
-      audio_elapsed: Math.min(300, position / 16000)}));
+    const busyDeadline = Date.now() + BUSY_WAIT_MS;
+    let timer = null;
+    const entry = () => settle(resolve);
+    const settle = (finish, value) => {
+      clearTimeout(timer);
+      if (pendingStart === entry) pendingStart = null;
+      finish(value);
+    };
+    const send = () => {
+      entry.waiting = false;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        settle(reject, new Error("Lost connection to whisper-daemon"));
+        return;
+      }
+      clearTimeout(timer);
+      timer = setTimeout(() => settle(reject, new Error("Daemon did not accept this recording")), START_ACK_TIMEOUT_MS);
+      if (track) startSent = true;
+      // Sample 0 was captured audio_elapsed ago, including any busy wait.
+      const elapsed = (track ? pcmPosition : position) / 16000;
+      ws.send(JSON.stringify({type: "start", session_id: id, meeting_title: meetTitle, meeting_url: meetUrl,
+        audio_elapsed: Math.min(300, elapsed)}));
+    };
+    entry.sessionId = id;
+    entry.waiting = false;
+    entry.reject = error => settle(reject, error);
+    entry.busy = () => {
+      if (track) startSent = false;
+      clearTimeout(timer);
+      if (Date.now() >= busyDeadline) { settle(reject, busyError()); return; }
+      entry.waiting = true;
+      timer = setTimeout(send, BUSY_RETRY_MS);
+    };
+    entry.retry = () => { if (entry.waiting) send(); };
+    pendingStart = entry;
+    send();
   });
+}
+
+function busyError() {
+  return Object.assign(new Error(BUSY_MESSAGE), {code: "busy"});
 }
 
 function sendPcm(buffer, position) {
@@ -290,9 +357,15 @@ function sendPcm(buffer, position) {
   if (ws && ws.readyState === WebSocket.OPEN && streamReady) ws.send(packet);
 }
 
+// Bounds only live, unacknowledged audio. Retained recovery tails are already
+// bounded (each was once live) and must never block a new recording.
 function bufferPcm(packet) {
-  const recoveryBytes=recoveryTails.reduce((total,tail)=>total+tail.packets.reduce((sum,p)=>sum+p.byteLength,0),0);
-  if (pcmBufferedBytes + packet.byteLength + recoveryBytes > MAX_BUFFERED_BYTES) {
+  if (pcmBufferedBytes + packet.byteLength > MAX_BUFFERED_BYTES) {
+    // Waited for the daemon as long as audio fits: give up on this start.
+    if (pendingStart?.waiting && pendingStart.sessionId === sessionId) {
+      pendingStart.reject(busyError());
+      return false;
+    }
     stopForwarding();
     chrome.runtime.sendMessage({type: "CAPTURE_ERROR", message: "Audio connection buffer is full. Recording stopped; already delivered audio is saved."});
     return false;
@@ -314,8 +387,11 @@ function flushPcmBuffer() {
 function stopForwarding(notifyDaemon = true) {
   const canFlush = streamReady;
   streamReady = false;
-  // Cancel the old startup/reconnect generation before draining its snapshot.
-  captureGen++;
+  // Cancel the old startup/reconnect generation before draining its snapshot,
+  // but only when one is live. stopCapture() and starts compare captureGen
+  // after awaiting a drain; a bump for an already-stopped session (a late
+  // status, a second stop) would make them skip cleanup and their reply.
+  if (capturing || sessionStarting || reconnecting) captureGen++;
   capturing = false;
   reconnecting = false;
   sessionStarting = false;
@@ -466,13 +542,22 @@ async function sendControl(obj) {
 // ("New browser connection — closing previous one") and the losing socket fires
 // a spurious "WebSocket closed unexpectedly" on the client.
 let connectPromise = null;
-function openSharedSocket(attempts, gen) {
-  if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve(true);
-  if (connectPromise) return connectPromise;
-  connectPromise = connectWebSocket(attempts, gen).finally(() => {
-    connectPromise = null;
-  });
-  return connectPromise;
+async function openSharedSocket(attempts, gen) {
+  const connectionGen = socketGen;
+  for (let left = attempts; left > 0 && connectionGen === socketGen; left--) {
+    if (ws && ws.readyState === WebSocket.OPEN) return true;
+    if (!connectPromise) {
+      connectPromise = connectWebSocket(left, gen).finally(() => {
+        connectPromise = null;
+      });
+      return connectPromise;
+    }
+    // Joined another caller's attempt (often a single reconnect try). Its
+    // failure costs this caller one attempt, not its whole budget.
+    if (await connectPromise) return true;
+    if (left > 1) await sleep(CONNECT_DELAY_MS);
+  }
+  return false;
 }
 
 async function connectWebSocket(attempts, gen) {
@@ -507,6 +592,8 @@ function handleServerMessage(event) {
 
   if (data.type === "started" && data.session_id === pendingStart?.sessionId) {
     pendingStart();
+  } else if (data.type === "error" && data.code === "busy" && data.session_id === pendingStart?.sessionId) {
+    pendingStart.busy();
   } else if (data.type === "audio_ack" && data.session_id === sessionId) {
     while (pcmBuffer.length && new DataView(pcmBuffer[0]).getUint32(4, true) <= data.sequence) {
       pcmBufferedBytes -= pcmBuffer.shift().byteLength;
@@ -523,19 +610,22 @@ function handleServerMessage(event) {
       chunkIndex: data.chunk_index,
     });
   } else if (data.type === "status") {
+    // Any idle means the previous meeting is saved: a waiting start may go.
+    if (data.state === "idle") pendingStart?.retry();
     // Snapshots answer settings reads; only the owning session can terminate
     // capture. A delayed idle from another session is never authoritative.
-    if ((capturing || sessionStarting) && (data.snapshot || data.session_id !== sessionId)) return;
-    if (!data.snapshot && data.session_id && data.session_id !== sessionId) return;
-    if (data.state === "transcribing" || data.state === "idle") {
-      stopForwarding(false);
-    }
+    const live = capturing || sessionStarting;
+    if (live && (data.snapshot || data.session_id !== sessionId)) return;
+    if (live && (data.state === "transcribing" || data.state === "idle")) stopForwarding(false);
+    // Otherwise the daemon's single meeting phase is relayed whatever session
+    // it belongs to, so background never keeps a stale "saving" state.
     chrome.runtime.sendMessage({
       type: "STATUS",
       state: data.state,
       elapsed: data.elapsed,
       chunks: data.chunks,
       sessionId: data.session_id,
+      snapshot: !!data.snapshot,
     });
   } else if (data.type === "settings") {
     chrome.runtime.sendMessage({
@@ -567,8 +657,10 @@ function handleUnexpectedClose() {
   } else {
     // Benign: a daemon restart, or a superseded/idle control connection. The
     // channel reopens on demand (next settings fetch or record start), so this
-    // is not an error worth surfacing.
+    // is not an error worth surfacing. No status can arrive now, so background
+    // must not keep waiting for one (e.g. a "saving" state after a crash).
     console.debug("Control WebSocket closed — will reopen on demand");
+    chrome.runtime.sendMessage({ type: "CONTROL_CLOSED" });
   }
 }
 

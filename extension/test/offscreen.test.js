@@ -153,3 +153,58 @@ test('native-ended session keeps its tail for export and allows a new capture',a
   assert.equal(f.messages.some(m=>m.type==='CAPTURE_ERROR'),false);
   assert.equal(f.sockets[1].sent.filter(m=>typeof m!=='string').length,1);
 });
+
+test('a late status for a stopped session cannot cancel the teardown awaiting its drain', async () => {
+  const f=fixture({autoStart:false});
+  const start=f.run('startExternal()');await f.open();await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');await start;
+  f.receive({type:'WD_PCM',target:'offscreen',samples:[.1,.2],position:0});
+  f.sockets[0].readyState=3;f.sockets[0].onclose();
+  const stop=f.run('stopCapture()');
+  await new Promise(setImmediate);
+  // Before the drain reconnects, the daemon reports the same session saving.
+  f.run('handleServerMessage({data:JSON.stringify({type:"status",state:"transcribing",session_id:sessionId})})');
+  f.sockets[1].open();await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');
+  await stop;
+  assert.equal(JSON.parse(f.sockets[1].sent.at(-1)).type,'stop');
+  assert.equal(f.messages.filter(m=>m.type==='CAPTURE_STOPPED').length,1);
+  assert.equal(f.sockets[1].readyState,3);
+});
+
+test('a popup start superseded while the retained tail drains still settles background', async () => {
+  const f=fixture({autoStart:false});
+  f.run('stoppedSession={id:"old-session-123456",position:2,packets:[new ArrayBuffer(24)]}');
+  const start=f.run('startCaptureFromStream("stream-1")');
+  await f.open();await new Promise(setImmediate);
+  f.receive({type:'WD_STOP',target:'offscreen'});
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:"old-session-123456"})})');
+  await start;
+  assert.ok(f.messages.some(m=>['CAPTURE_STOPPED','CAPTURE_ERROR','CAPTURE_STARTED'].includes(m.type)));
+  assert.equal(f.run('sessionStarting'),false);
+});
+
+test('a busy daemon makes the start wait with audio buffered, then start once idle', async () => {
+  const f=fixture({autoStart:false});
+  const start=f.run('startExternal()');await f.open();await new Promise(setImmediate);
+  const id=f.run('sessionId');
+  f.run(`handleServerMessage({data:JSON.stringify({type:"error",code:"busy",session_id:"${id}"})})`);
+  assert.equal(f.run('startSent'),false); // the daemon does not own it: a stop leaves no tail
+  f.receive({type:'WD_PCM',target:'offscreen',samples:[.1,.2],position:0});
+  f.run('handleServerMessage({data:JSON.stringify({type:"status",state:"idle",session_id:"previous-meeting-1"})})');
+  f.run(`handleServerMessage({data:JSON.stringify({type:"started",session_id:"${id}"})})`);
+  await start;
+  const sent=f.sockets[0].sent.map(x=>typeof x==='string'?JSON.parse(x).type:'pcm');
+  assert.deepEqual(sent.filter(x=>x!=='auth'),['start','start','pcm']);
+  assert.equal(f.run('capturing'),true);
+  assert.equal(f.messages.some(m=>m.type==='CAPTURE_ERROR'),false);
+});
+
+test('a retained recovery tail does not count against the live audio budget', async () => {
+  const f=fixture();
+  f.run('recoveryTails.push({id:"t",position:0,packets:[new ArrayBuffer(MAX_BUFFERED_BYTES)]})');
+  const start=f.run('startExternal()');await f.open();await start;
+  f.receive({type:'WD_PCM',target:'offscreen',samples:[.1,.2],position:0});
+  assert.equal(f.run('capturing'),true);
+  assert.equal(f.messages.some(m=>m.type==='CAPTURE_ERROR'),false);
+});

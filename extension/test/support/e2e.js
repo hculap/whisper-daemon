@@ -151,12 +151,19 @@ function createExtension({port, secret, extensionId, overrides = {}}) {
     }
   }
 
+  const pageUrl = page => `chrome-extension://${extensionId}/${page}`;
+
+  // Like Chrome: an offscreen document gets chrome.runtime only, no storage.
   function chromeFor(name) {
+    const storage = name === 'offscreen' ? {} :
+      {storage: {local: {setAccessLevel() {}, get: async () => ({pairingSecret: secret})}}};
     return {
-      storage: {local: {setAccessLevel() {}, get: async () => ({pairingSecret: secret})}},
+      ...storage,
       runtime: {
+        id: extensionId,
+        getURL: pageUrl,
         onMessage: {addListener(fn) { listeners[name] = fn; }},
-        sendMessage: msg => dispatch(name, msg, {}),
+        sendMessage: msg => dispatch(name, msg, {id: extensionId, url: pageUrl(`${name}.html`)}),
         getContexts: async () => [{}],
       },
       offscreen: {createDocument: async () => {}},

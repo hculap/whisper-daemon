@@ -695,14 +695,21 @@ async function reconnectLoop(gen) {
   }
 }
 
+// Offscreen documents get chrome.runtime only (no chrome.storage), so the
+// service worker reads the pairing key on our behalf.
+async function readPairingSecret() {
+  const reply = await chrome.runtime.sendMessage({ type: "GET_PAIRING_SECRET" });
+  return reply?.secret || null;
+}
+
 async function openWebSocket(url) {
-  const pairing = await chrome.storage.local.get("pairingSecret");
-  if (!pairing.pairingSecret) throw new Error("Pair this extension in its popup first");
+  const secret = await readPairingSecret();
+  if (!secret) throw new Error("Pair this extension in its popup first");
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(url);
     const timer = setTimeout(() => { socket.close(); reject(new Error("Authentication timeout")); }, 6000);
     socket.binaryType = "arraybuffer";
-    socket.onopen = () => socket.send(JSON.stringify({type: "auth", secret: pairing.pairingSecret}));
+    socket.onopen = () => socket.send(JSON.stringify({type: "auth", secret}));
     socket.onmessage = event => {
       let data;
       try { data = JSON.parse(event.data); } catch { return; }

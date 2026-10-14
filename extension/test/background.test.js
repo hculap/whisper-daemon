@@ -6,17 +6,19 @@ const path=require('node:path');
 function fixture(){
   let receive; const messages=[],tabs=[];
   const noop=()=>{};
-  const chrome={storage:{local:{setAccessLevel:noop}},
-    runtime:{onMessage:{addListener(fn){receive=fn;}},getContexts:async()=>[{}],sendMessage:async msg=>messages.push(msg)},
+  const chrome={storage:{local:{setAccessLevel:noop,get:async()=>({pairingSecret:'stored-key'})}},
+    runtime:{id:'ext',getURL:page=>`chrome-extension://ext/${page}`,
+      onMessage:{addListener(fn){receive=fn;}},getContexts:async()=>[{}],sendMessage:async msg=>messages.push(msg)},
     action:{setBadgeText:noop,setBadgeBackgroundColor:noop},
     notifications:{create:noop,onClicked:{addListener:noop}},
     tabs:{onRemoved:{addListener:noop},query:async()=>[{id:1},{id:2}],sendMessage:async(id,msg)=>tabs.push({id,msg})}};
   const ctx=vm.createContext({chrome,console});
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../background.js'),'utf8'),ctx);
-  return {messages,tabs,receive:async(msg,id)=>{
-    let response;receive(msg,id?{tab:{id}}:{},r=>response=r);
+  const deliver=async(msg,sender)=>{
+    let response;receive(msg,sender,r=>response=r);
     await new Promise(setImmediate);return response;
-  }};
+  };
+  return {messages,tabs,receive:(msg,id)=>deliver(msg,id?{tab:{id}}:{}),deliver};
 }
 test('settings reads from two tabs never claim recording ownership',async()=>{
   const f=fixture();
@@ -62,4 +64,12 @@ test('a saving state never refuses a start and is released when the daemon goes 
   await f.receive({type:'STATUS',state:'transcribing',sessionId:'s'});
   assert.equal((await f.receive({type:'WD_START'},1)).ok,true);
   assert.ok(f.messages.some(m=>m.type==='WD_START'));
+});
+test('only the offscreen document can read the pairing key',async()=>{
+  const f=fixture();
+  const ask={type:'GET_PAIRING_SECRET'};
+  assert.equal((await f.deliver(ask,{id:'ext',url:'chrome-extension://ext/offscreen.html'})).secret,'stored-key');
+  assert.equal((await f.deliver(ask,{id:'ext',url:'chrome-extension://ext/popup.html'})).secret,null);
+  assert.equal((await f.deliver(ask,{id:'ext',url:'chrome-extension://ext/offscreen.html',tab:{id:1}})).secret,null);
+  assert.equal((await f.deliver(ask,{id:'other',url:'chrome-extension://ext/offscreen.html'})).secret,null);
 });

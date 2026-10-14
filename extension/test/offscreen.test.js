@@ -22,9 +22,14 @@ function fixture({autoStart = true} = {}) {
     }
   }
   const context = vm.createContext({
-    console, crypto: require('node:crypto').webcrypto, chrome: { storage: {local:{get:async () => ({pairingSecret:'test-secret'})}}, runtime: {
+    // Like Chrome, an offscreen document has chrome.runtime only: no storage.
+    console, crypto: require('node:crypto').webcrypto, chrome: { runtime: {
       onMessage: { addListener(fn) { receive = fn; } },
-      sendMessage(msg) { messages.push(msg); return Promise.resolve(); },
+      sendMessage(msg) {
+        // The service worker answers pairing reads for this document.
+        if (msg.type === 'GET_PAIRING_SECRET') return Promise.resolve({ secret: 'test-secret' });
+        messages.push(msg); return Promise.resolve();
+      },
     } }, WebSocket: Socket, Float32Array, Array, Date,
     setInterval() { return 1; }, clearInterval() {},
     setTimeout() { return 2; }, clearTimeout() {},

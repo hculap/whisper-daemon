@@ -51,6 +51,19 @@ function settleIdle() {
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   if (msg.target === "offscreen") return false;
+  if (msg.type === "GET_PAIRING_SECRET") {
+    // chrome.runtime is the only API an offscreen document has, so it asks the
+    // service worker for the key. Only that document may read it.
+    if (sender.id !== chrome.runtime.id || sender.tab ||
+        sender.url !== chrome.runtime.getURL("offscreen.html")) {
+      sendResponse({ secret: null });
+      return;
+    }
+    chrome.storage.local.get("pairingSecret")
+      .then(({ pairingSecret }) => sendResponse({ secret: pairingSecret || null }))
+      .catch(() => sendResponse({ secret: null }));
+    return true;
+  }
   if (msg.type === "MEET_JOINED") {
     if (state === State.IDLE) {
       meetTabId = sender.tab?.id ?? null;

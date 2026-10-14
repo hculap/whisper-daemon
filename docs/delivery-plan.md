@@ -130,3 +130,12 @@ Script conventions (shebang, logging, type hints) were corrected. Final run: 158
 Python and 53 Node tests (8 e2e scenarios plus the mid-recording leave) pass three
 consecutive times; `verify_110_minutes.py` 6,600 s per source, no gaps, 19,431,424-byte
 RSS growth, 60.9 s; `verify_speech_e2e.py` preserves both "42" sentences in 10.6 s.
+
+Live Chrome check after merge: a paired extension never connected. The offscreen
+document read the pairing key with `chrome.storage`, but offscreen documents only
+get `chrome.runtime`; the read threw and was reported as "daemon unreachable". The
+test fakes had given the offscreen realm a storage API, so 21 tests passed falsely.
+The service worker now hands the key only to its own offscreen document, and the
+fakes match Chrome (21 failed before the fix, 54/54 pass after). In a real Meet call
+the settings panel loaded, a 43 s recording and a leave-mid-recording session both
+saved `complete`, and leaving closed the socket.

@@ -87,3 +87,97 @@ def test_stop_during_worker_startup_preserves_acknowledged_pcm():
     method('_on_browser_disconnect',AppHelper=helper)(obj, 'test-session')
     assert not obj._meeting_active
     assert obj._browser_prebuffer == [(b'audio',0)]
+
+
+def run_worker(tmp_path, transcribe):
+    """The real _meeting_worker for a staged browser tail; Whisper/devices faked."""
+    import concurrent.futures, datetime, logging, queue, re, sys, threading, time, types
+    from dataclasses import dataclass
+    import numpy as np
+    from whisper_daemon.bridge_protocol import build_status_message
+    from whisper_daemon.config import Settings
+
+    @dataclass(frozen=True)
+    class AudioChunk:  # meeting_recorder.AudioChunk; that module needs PortAudio
+        audio: np.ndarray
+        start_time: float
+        duration: float
+        source: str = 'mic'
+        job_id: str = ''
+
+    class Recorder:  # stores PCM before queueing a job, like MeetingRecorder
+        error, needs_recovery = None, False
+        def __init__(self, jobs, source_label='mic', raw_sink=None, **kwargs):
+            self.jobs, self._source_label, self.raw_sink = jobs, source_label, raw_sink
+        def start_without_device(self): pass
+        def feed_audio(self, samples, position=None):
+            start = self.raw_sink(samples, position)
+            self.jobs.put(AudioChunk(samples, start, len(samples) / 16000, self._source_label))
+        def stop_without_device(self): pass
+        def abort(self): pass
+
+    modules = {'whisper_daemon.meeting_recorder': types.SimpleNamespace(MeetingRecorder=Recorder, AudioChunk=AudioChunk),
+               'whisper_daemon.screen_capture': types.SimpleNamespace(ScreenCapture=None),
+               'whisper_daemon.transcriber': types.SimpleNamespace(transcribe_full=transcribe)}
+    tree = ast.parse(Path('src/whisper_daemon/menubar.py').read_text())
+    write_partial = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_write_partial')
+    space = {'Path': Path}
+    exec(compile(ast.Module(body=[write_partial], type_ignores=[]), 'menubar.py', 'exec'), space)
+    notes = []
+    worker = method('_meeting_worker', re=re, datetime=datetime.datetime, timedelta=datetime.timedelta,
+        concurrent=concurrent, np=np, time=time, queue=queue, logger=logging.getLogger('test'),
+        _notify=lambda *parts: notes.append(parts), _write_partial=space['_write_partial'],
+        build_status_message=build_status_message)
+    now = time.monotonic()
+    obj = SimpleNamespace(_settings=Settings(recording_dir=str(tmp_path), capture_mic=False, capture_screenshots=False),
+        _daemon=SimpleNamespace(_model='model'), _meeting_active=False, _meeting_paused=False,
+        _meeting_start=now - 5, _meeting_stopped_at=now, _meeting_session_id='session-12345678',
+        _browser_bridge=SimpleNamespace(send_json_str=lambda text: None), _browser_audio_lock=threading.RLock(),
+        _browser_prebuffer=[(np.full(16000, .1, dtype='<f4').tobytes(), 0)], _browser_prebuffer_bytes=64000,
+        _browser_recorder=None, _meeting_store=None, _last_meeting_dir=None, _diarization_status=None,
+        _meeting_phase='transcribing', _meeting_chunk_count=0, _attach_recording_store=lambda store: None,
+        _send_results_to_browser=lambda *args: None, _reset_meeting_ui=lambda: None)
+    real_modules = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    try:
+        worker(obj, True, 'CRM review', True)  # browser_only: a stopped, recovered tail
+    finally:
+        for name, module in real_modules.items():
+            if module is None: sys.modules.pop(name, None)
+            else: sys.modules[name] = module
+    return next(tmp_path.glob('recording_*')), notes
+
+
+def test_finished_meeting_publishes_ready_manifest_last(tmp_path):
+    import hashlib, json, datetime
+    folder, notes = run_worker(tmp_path, lambda audio, model, language: {
+        'text': 'Szymon wyśle ofertę.', 'language': 'pl',
+        'segments': [{'start': 0, 'end': 1, 'text': 'Szymon wyśle ofertę.'}]})
+    manifest = json.loads((folder / 'meeting.ready.json').read_text())
+    paths = {f['path']: f for f in manifest['files']}
+    assert {'transcript.json', 'transcript.txt', 'notes.json', 'session.json', 'recording.wav', 'browser.wav'} <= set(paths)
+    assert not [p for p in paths if p.startswith('chunks/') or p.endswith('.f32') or p.startswith('meeting.')]
+    assert paths['transcript.json']['role'] == 'transcript' and paths['browser.wav']['role'] == 'audio'
+    for entry in manifest['files']:
+        content = (folder / entry['path']).read_bytes()
+        assert entry['sha256'] == hashlib.sha256(content).hexdigest() and entry['size'] == len(content)
+        assert (folder / entry['path']).stat().st_mtime_ns <= (folder / 'meeting.ready.json').stat().st_mtime_ns
+    assert json.loads((folder / 'session.json').read_text())['state'] == 'complete'
+    assert json.loads((folder / 'transcript.json').read_text())['segments'][0]['source'] == 'browser'
+    assert manifest['title'] == 'CRM review' and manifest['transcription_complete']
+    started = datetime.datetime.fromisoformat(manifest['started_at'])
+    assert 4 < (datetime.datetime.now().astimezone() - started).total_seconds() < 60  # meeting, not worker, start
+    assert not (folder / 'meeting.in-progress.json').exists() and not (folder / 'meeting.failed.json').exists()
+    assert [n[1] for n in notes] == ['Meeting saved']
+
+
+def test_failed_chunk_marks_meeting_failed_and_never_ready(tmp_path):
+    import json
+    def broken(audio, model, language):
+        raise RuntimeError('decoder failed')
+    folder, notes = run_worker(tmp_path, broken)
+    assert not (folder / 'meeting.ready.json').exists()
+    failed = json.loads((folder / 'meeting.failed.json').read_text())
+    assert failed['transcription_errors'] == ['RuntimeError: decoder failed']
+    assert list((folder / 'chunks').glob('*.npz'))  # the job is still recoverable
+    assert [n[1] for n in notes] == ['Meeting interrupted']

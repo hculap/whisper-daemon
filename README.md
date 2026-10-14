@@ -102,6 +102,7 @@ Each meeting folder contains:
 - `chunks/`: durable pending jobs and completed results.
 - `transcript.json` plus selected text/subtitle formats.
 - `notes.json`: editable summary and task suggestions with source timestamps.
+- `meeting.ready.json` or `meeting.failed.json`: the Orbit readiness marker (see below).
 
 Audio is always retained for recovery. The old optional `save_audio` setting no
 longer disables source capture. Allow about 810 MB/hour for two raw sources plus
@@ -144,6 +145,38 @@ whisper-daemon transcribe meeting.mp3 --format txt,srt,json
 CLI recording ends with Ctrl+C and saves continuous audio in an adjacent unique
 `*_audio_*` folder. Native/browser speaker recognition runs after capture; the CLI
 also retains experimental realtime/hybrid speaker tracking options.
+
+## Orbit: automatic meeting processing
+
+Every meeting folder carries a readiness contract for Orbit, the server-side
+meeting analyzer. Recording starts by writing `meeting.in-progress.json`.
+`meeting.ready.json` is written atomically and **last**: after every chunk job is
+acknowledged and the WAV exports, screenshots, `transcript.json`, selected formats,
+`notes.json` and the final `session.json` are on disk. It holds a stable meeting ID,
+a revision, the start time with timezone, the transcription status and the
+SHA-256, size and role (`audio`, `transcript` or `attachment`) of every published
+file. Raw `*.f32` sources and `chunks/` are local recovery material and are not
+listed. An empty transcript, a failed chunk or a failed recording writes
+`meeting.failed.json` instead; a killed process leaves only
+`meeting.in-progress.json`. Neither ever gets the ready marker. A published
+revision is never rewritten; each recording uses a new folder.
+
+Orbit reads `<synced root>/*/meeting.ready.json`, so every meeting must be a direct
+child of the synced folder: point the menu-bar recording directory at it. CLI
+recordings opt in:
+
+```sh
+whisper-daemon record ~/Sync/Recordings/meeting.txt --orbit-ready --format txt,srt
+```
+
+Instead of `meeting.txt` plus a `*_audio_*` folder, this saves the continuous audio,
+`transcript.json` (always, whatever `--format` says), the selected `transcript.*`
+formats and the manifest in one new `recording_*` folder next to the requested
+output. Orbit verifies every listed file after sync (the marker may arrive first),
+archives the meeting and analyzes it; see Orbit's `docs/MEETING_AUTOMATION.md`.
+The contract tests run without a microphone, GPU or Cocoa
+(`tests/test_meeting_manifest.py`, `tests/test_record_manifest.py`,
+`tests/test_meeting_lifecycle.py`); capture and sync must still be verified on macOS.
 
 ## Verification
 

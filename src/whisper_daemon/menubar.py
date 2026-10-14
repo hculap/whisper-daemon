@@ -13,7 +13,7 @@ import threading
 import time
 import wave
 from collections.abc import Callable
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -1021,6 +1021,7 @@ class MenuBarDelegate(NSObject):
         self._status_menu_item.setTitle_("Finishing transcription...")
 
     def _meeting_worker(self, browser_triggered: bool = False, browser_title: str = "", browser_only: bool = False) -> None:
+        from whisper_daemon.meeting_manifest import begin_meeting, fail_meeting, finalize_meeting
         from whisper_daemon.meeting_recorder import MeetingRecorder
         from whisper_daemon.recording_store import RecordingStore, DiskChunkQueue, atomic_json
         from whisper_daemon.formats import FORMATTERS, merge_chunk_results
@@ -1032,6 +1033,7 @@ class MenuBarDelegate(NSObject):
         slug = re.sub(r"[^A-Za-z0-9_-]", "", browser_title.replace(" ", "_"))[:30]
         rec_dir = settings.recording_dir_path / f"recording_{slug}_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
         store = None
+        identity = None
         recorders = []
         screens = None
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -1053,6 +1055,10 @@ class MenuBarDelegate(NSObject):
             use_tab = browser_triggered and (settings.capture_tab or browser_only)
             sources = (['mic'] if use_mic else []) + (['browser'] if use_tab else [])
             store = RecordingStore(rec_dir, started_at=self._meeting_start, sources=sources)
+            # Wall-clock start of the meeting, not of this worker: a deferred or
+            # recovered browser session began before the worker did.
+            started_at = datetime.now().astimezone() - timedelta(seconds=max(0.0, time.monotonic() - self._meeting_start))
+            identity = begin_meeting(rec_dir, browser_title or f"Meeting {started_at:%Y-%m-%d %H:%M}", started_at=started_at)
             self._attach_recording_store(store)
             jobs = DiskChunkQueue(rec_dir)
             if use_mic and self._meeting_active:
@@ -1157,11 +1163,24 @@ class MenuBarDelegate(NSObject):
             store.meta['state'] = 'complete'
             store._save()
             (rec_dir / "transcript_live.txt").unlink(missing_ok=True)
+            # Orbit readiness goes last: every chunk is acknowledged, audio exports,
+            # screenshots, transcript.json, formats, notes and session.json are final.
+            try:
+                if finalize_meeting(rec_dir, identity, None, []) is None:
+                    _notify("whisper-daemon", "Not sent for analysis", "Transcript is empty or incomplete; see meeting.failed.json.")
+            except Exception:
+                logger.exception("Meeting saved, but its readiness manifest failed")
+                _notify("whisper-daemon", "Sync pending", "Could not publish the meeting manifest.")
             _notify("whisper-daemon", "Meeting saved", str(rec_dir))
         except Exception as exc:
             failure = exc
             logger.exception("Meeting failed; source audio and pending jobs remain recoverable")
             _notify("whisper-daemon", "Meeting interrupted", f"{exc}. Recoverable files: {rec_dir}")
+            if identity is not None and not (rec_dir / "meeting.ready.json").exists():
+                try:
+                    fail_meeting(rec_dir, identity, [f"{type(exc).__name__}: {exc}"])
+                except Exception:
+                    logger.exception("Could not write meeting.failed.json")
         finally:
             with self._browser_audio_lock:
                 self._browser_recorder = None

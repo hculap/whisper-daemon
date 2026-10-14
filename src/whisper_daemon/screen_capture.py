@@ -61,6 +61,7 @@ class ScreenCapture:
         self._displays = displays
         self._paused = paused or (lambda: False)
         self._running = False
+        self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._start_time: float = 0.0
         self._last_hashes: dict[int, np.ndarray] = {}  # display_id → last hash
@@ -75,6 +76,7 @@ class ScreenCapture:
     def start(self) -> None:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._running = True
+        self._stop_event.clear()
         self._start_time = time.monotonic()
         self._last_hashes = {}
         self._saved_count = 0
@@ -89,9 +91,12 @@ class ScreenCapture:
 
     def stop(self) -> None:
         self._running = False
+        self._stop_event.set()
         if self._thread is not None:
-            self._thread.join(timeout=5)
+            self._thread.join()
             self._thread = None
+        with self._capture_lock:
+            pass  # wait for an external capture_now writer too
         logger.info("Screen capture stopped — %d screenshots saved", self._saved_count)
 
     def capture_now(self) -> None:
@@ -99,6 +104,8 @@ class ScreenCapture:
         if not self._running or self._paused():
             return
         with self._capture_lock:
+            if not self._running:
+                return
             try:
                 self._capture_all_displays()
                 self._consecutive_failures = 0
@@ -116,7 +123,7 @@ class ScreenCapture:
     def _capture_loop(self) -> None:
         while self._running:
             self.capture_now()
-            time.sleep(self._interval)
+            self._stop_event.wait(self._interval)
 
     def _capture_all_displays(self) -> None:
         elapsed = time.monotonic() - self._start_time

@@ -146,7 +146,7 @@ class MeetingRecorder:
         """
         self._needs_recovery = True
 
-    def check_liveness(self, now, timeout=10):
+    def check_liveness(self, now: float, timeout: float = 10) -> bool:
         """Detect missing device callbacks even while paused or transcribing."""
         if self._source_label == 'mic' and not self._needs_recovery and now - self._last_audio_at > timeout:
             self.request_recovery()

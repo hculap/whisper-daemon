@@ -128,6 +128,9 @@ class MenuBarDelegate(NSObject):
         self._browser_prebuffer: list[tuple[bytes, int]] = []
         self._meeting_session_id = None
         self._browser_prebuffer_bytes = 0
+        # Session whose accepted 'start' still waits for the main thread. The
+        # staged prebuffer belongs to it until start_if_current has run.
+        self._browser_start_pending = None
 
         return self
 
@@ -779,16 +782,26 @@ class MenuBarDelegate(NSObject):
         auto_record_meetings preference, which only governs fully-automatic
         starts and is intentionally not consulted here.
         """
-        if self._meeting_phase != "idle" or (self._meeting_thread and self._meeting_thread.is_alive()): return False
+        if (self._meeting_phase != "idle" or self._browser_start_pending
+                or (self._meeting_thread and self._meeting_thread.is_alive())):
+            return False
         with self._browser_audio_lock:
             self._browser_prebuffer = []
             self._browser_prebuffer_bytes = 0
+        self._browser_start_pending = session_id
         logger.info("Browser capture requested")
         def start_if_current():
             # Stop may arrive before Cocoa runs this callback. A cancelled
-            # session must never open the microphone later.
+            # session must never open the microphone later. Staged audio means
+            # the stop ended a delivered recording (e.g. a recovered tail sent
+            # as start, PCM, stop): save that audio alone instead of dropping it.
+            self._browser_start_pending = None
             if self._browser_bridge.session_id == session_id:
                 self._start_meeting(True, title, started_at, session_id)
+            elif self._browser_prebuffer:
+                logger.info("Browser session stopped before it started; saving its staged audio")
+                self._start_meeting(True, title, started_at, session_id, browser_only=True)
+                self._stop_meeting()
         AppHelper.callAfter(start_if_current)
 
     def _on_browser_audio(self, data: bytes, position: int) -> None:
@@ -953,7 +966,8 @@ class MenuBarDelegate(NSObject):
 
     # -- Meeting recording --
 
-    def _start_meeting(self, browser_triggered: bool = False, browser_title: str = "", started_at=None, session_id=None) -> None:
+    def _start_meeting(self, browser_triggered: bool = False, browser_title: str = "", started_at=None, session_id=None,
+                       browser_only: bool = False) -> None:
         # Guard against duplicate starts: two rapid browser 'start' messages
         # each schedule _start_meeting via callAfter, and _on_browser_connect
         # checks _meeting_active before the first one has run — so the check
@@ -980,7 +994,7 @@ class MenuBarDelegate(NSObject):
 
         self._meeting_thread = threading.Thread(
             target=self._meeting_worker,
-            args=(browser_triggered, browser_title),
+            args=(browser_triggered, browser_title, browser_only),
             daemon=False,
         )
         self._meeting_thread.start()
@@ -1006,7 +1020,7 @@ class MenuBarDelegate(NSObject):
         self._set_icon(State.TRANSCRIBING)
         self._status_menu_item.setTitle_("Finishing transcription...")
 
-    def _meeting_worker(self, browser_triggered: bool = False, browser_title: str = "") -> None:
+    def _meeting_worker(self, browser_triggered: bool = False, browser_title: str = "", browser_only: bool = False) -> None:
         from whisper_daemon.meeting_recorder import MeetingRecorder
         from whisper_daemon.recording_store import RecordingStore, DiskChunkQueue, atomic_json
         from whisper_daemon.formats import FORMATTERS, merge_chunk_results
@@ -1034,11 +1048,14 @@ class MenuBarDelegate(NSObject):
                 if not diarize_ready:
                     _notify("whisper-daemon", "Speaker recognition unavailable", self._diarization_status['message'])
                 self._browser_bridge.send_json_str(__import__('json').dumps({"type": "capabilities", "diarization": self._diarization_status}))
-            sources = (['mic'] if settings.capture_mic else []) + (['browser'] if settings.capture_tab and browser_triggered else [])
+            # browser_only: already-captured browser audio; never open devices for it.
+            use_mic = settings.capture_mic and not browser_only
+            use_tab = browser_triggered and (settings.capture_tab or browser_only)
+            sources = (['mic'] if use_mic else []) + (['browser'] if use_tab else [])
             store = RecordingStore(rec_dir, started_at=self._meeting_start, sources=sources)
             self._attach_recording_store(store)
             jobs = DiskChunkQueue(rec_dir)
-            if settings.capture_mic and self._meeting_active:
+            if use_mic and self._meeting_active:
                 mic = MeetingRecorder(jobs, device=settings.recording_device or None,
                     raw_sink=lambda audio: store.append("mic", audio),
                     paused=lambda: self._meeting_paused)
@@ -1049,7 +1066,7 @@ class MenuBarDelegate(NSObject):
                     mic.abort()
                     store.meta['errors'].append(f"Microphone: {exc}")
                     _notify("whisper-daemon", "Microphone unavailable", str(exc)[:180])
-            if settings.capture_tab and browser_triggered:
+            if use_tab:
                 browser = MeetingRecorder(jobs, source_label="browser",
                     raw_sink=lambda audio, position: store.append("browser", audio, at=position),
                     sample_filter=store.unpaused_audio)
@@ -1065,7 +1082,7 @@ class MenuBarDelegate(NSObject):
                     self._browser_recorder = browser
             if not recorders:
                 raise RuntimeError("No audio source is available")
-            if settings.capture_screenshots and self._meeting_active:
+            if settings.capture_screenshots and not browser_only and self._meeting_active:
                 screens = ScreenCapture(rec_dir, interval=settings.screenshot_interval,
                                         displays=settings.screenshot_displays, paused=lambda: self._meeting_paused)
                 screens.start()

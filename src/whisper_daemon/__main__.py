@@ -747,7 +747,7 @@ def prepare_models(diarization):
     click.echo('Model prepared. Normal recording remains offline.')
 
 
-def _speaker_model_ready(requested):
+def _speaker_model_ready(requested: bool) -> bool:
     if not requested: return False
     from whisper_daemon.model_policy import diarization_status
     status = diarization_status()
@@ -755,7 +755,7 @@ def _speaker_model_ready(requested):
     return status['available']
 
 
-def _with_optional_speakers(result, audio_path, num_speakers):
+def _with_optional_speakers(result: dict, audio_path: str, num_speakers: int | None) -> dict:
     try:
         from whisper_daemon.diarizer import diarize_file
         from whisper_daemon.diarize_merge import merge_speakers_with_transcript

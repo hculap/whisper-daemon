@@ -5,6 +5,7 @@ on process termination. Exports are streamed in bounded blocks, never concatenat
 in RAM. A process crash loses no samples already written; fsync limits the power
 failure window to one second. Raw sources are retained for recovery/reprocessing.
 """
+from collections.abc import Iterator
 import json
 import os
 from pathlib import Path
@@ -18,6 +19,9 @@ import numpy as np
 
 RATE = 16000
 SOURCES = ('mic', 'browser')
+# A source ending this close to the wall-clock stop is delivery latency (last
+# packet/device block in flight), not missing audio. Matches append()'s slack.
+TRAILING_SLACK = RATE // 4
 
 
 def atomic_json(path: Path, value: object) -> None:
@@ -107,7 +111,7 @@ class RecordingStore:
             self.meta['pauses'].append({'time': self.clock() - self.started_at if at is None else at, 'paused': paused})
             self.flush()
 
-    def _intervals(self, start, end):
+    def _intervals(self, start: int, end: int) -> Iterator[tuple[int, int, bool]]:
         """Split a capture-time interval into paused/unpaused sample ranges."""
         paused = False
         cursor = start
@@ -121,7 +125,7 @@ class RecordingStore:
             cursor, paused = position, event['paused']
         if cursor < end: yield cursor, end, paused
 
-    def unpaused_audio(self, samples, position):
+    def unpaused_audio(self, samples: np.ndarray, position: int) -> list[tuple[int, np.ndarray]]:
         # Take the interval snapshot under the same lock used by Pause. No
         # receipt-time flag: replay may arrive on either side of a later pause.
         with self.lock:
@@ -142,7 +146,7 @@ class RecordingStore:
             self.files.clear()
             frames = max(max(self.frames.values(), default=0), round((duration or 0) * RATE))
             for source in self.enabled_sources | self.frames.keys():
-                if self.frames.get(source, 0) < frames:
+                if frames - self.frames.get(source, 0) > TRAILING_SLACK:
                     self._record_gap(source, self.frames.get(source, 0), frames)
             self.meta.update(state=state, duration=frames / RATE)
             self._save()

@@ -161,7 +161,11 @@ listed. An empty transcript, a failed chunk or a failed recording writes
 `meeting.in-progress.json`. Neither ever gets the ready marker. A published
 revision is never rewritten; each recording uses a new folder. Saving edits in
 the meeting review changes published files, so it publishes the next revision
-with fresh hashes, which Orbit ingests and analyzes again.
+with fresh hashes, which Orbit ingests and analyzes again (Orbit waits a few
+minutes first, so a burst of saves costs one analysis). `whisper-daemon recover`
+on a ready meeting does the same, because it re-exports the WAVs. Screenshots
+appear atomically and screen capture stops within 10 s, so a hung capture
+cannot hold back the ready marker.
 
 Orbit reads `<synced root>/*/meeting.ready.json`, so every meeting must be a direct
 child of the synced folder: point the menu-bar recording directory at it. CLI
@@ -178,7 +182,8 @@ output. Orbit verifies every listed file after sync (the marker may arrive first
 archives the meeting and analyzes it; see Orbit's `docs/MEETING_AUTOMATION.md`.
 The contract tests run without a microphone, GPU or Cocoa
 (`tests/test_meeting_manifest.py`, `tests/test_record_manifest.py`,
-`tests/test_meeting_lifecycle.py`); capture and sync must still be verified on macOS.
+`tests/test_meeting_lifecycle.py`, `tests/test_screen_capture_stop.py`); capture and
+sync must still be verified on macOS.
 
 ## Verification
 

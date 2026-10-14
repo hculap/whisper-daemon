@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Accelerated 110-minute capture through real WebSocket/ingress/recorder/store.
 
 No devices or inference: synthetic PCM and silent VAD. A reconnect replays ten
@@ -9,6 +10,7 @@ import json
 import logging
 import resource
 import struct
+import sys
 import tempfile
 import threading
 import time
@@ -25,13 +27,13 @@ from whisper_daemon.pairing import pair
 from whisper_daemon.recording_store import RecordingStore, DiskChunkQueue
 
 class SilentVAD:
-    def reset_states(self): pass
-    def __call__(self, samples): return 0
+    def reset_states(self) -> None: pass
+    def __call__(self, samples: np.ndarray) -> float: return 0
 mod.SileroVAD = SilentVAD
-logging.disable(logging.WARNING)
+logger = logging.getLogger('verify_110_minutes')
 
 
-async def verify(path):
+async def verify(path: Path) -> dict:
     now = [0.0]
     store = RecordingStore(path, clock=lambda: now[0])
     jobs = DiskChunkQueue(path)
@@ -78,7 +80,7 @@ async def verify(path):
                 for delayed in backlog: await ws.send(delayed); await ws.recv()
                 await ws.send(backlog[-1]); await ws.recv()  # lost-ACK replay
             await ws.send(packet); await ws.recv()
-            if second%1200 == 0: print(json.dumps({'captured_minutes':second//60}), flush=True)
+            if second%1200 == 0: logger.info('captured %d minutes', second//60)
         await ws.send(json.dumps({'type':'stop', 'session_id':'verification-110-minutes'}))
         await ws.send(json.dumps({'type':'ping'})); await ws.recv(); await ws.close()
     assert len(starts) == 1
@@ -101,8 +103,11 @@ async def verify(path):
         'gaps':store.meta['gaps'], 'rss_growth_bytes':rss_delta}
 
 if __name__ == '__main__':
+    # Library logs would drown the progress lines; keep only this script's own.
+    logging.basicConfig(level=logging.ERROR, stream=sys.stderr, format='%(message)s')
+    logger.setLevel(logging.INFO)
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix='whisper-110min-') as directory:
         report = asyncio.run(verify(Path(directory)))
     report['runtime_seconds'] = round(time.monotonic()-started, 2)
-    print(json.dumps(report))
+    sys.stdout.write(json.dumps(report) + '\n')

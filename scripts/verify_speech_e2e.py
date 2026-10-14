@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """macOS synthetic speech -> real VAD/bridge/store/Whisper -> meeting exports.
 
 Uses installed system voices and cached models; forbids external connections.
@@ -5,9 +6,11 @@ Does not touch the running daemon, user configuration, history or recordings.
 """
 import asyncio
 import json
+import logging
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -24,6 +27,8 @@ from whisper_daemon.pairing import pair
 from whisper_daemon.recording_store import RecordingStore, DiskChunkQueue, atomic_json
 from whisper_daemon.transcriber import transcribe_full
 
+logger = logging.getLogger("verify_speech_e2e")
+
 original_connect = socket.socket.connect
 def local_only(sock, address):
     if isinstance(address, tuple) and address[0] in ('127.0.0.1', '::1'):
@@ -32,7 +37,7 @@ def local_only(sock, address):
 socket.socket.connect = local_only
 
 
-async def verify(path):
+async def verify(path: Path) -> dict:
     source_audio = {}
     for lang, voice, sentence in [
         ('en', 'Samantha', 'We agreed to send the proposal on Friday. Anna will prepare the report. The final number is forty two.'),
@@ -82,7 +87,7 @@ async def verify(path):
     for source in ('mic', 'browser'):
         text = ' '.join(s['text'] for s in merged['segments'] if s['source'] == source)
         assert '42' in text, (source, text)
-        print(json.dumps({'source':source, 'text':text}, ensure_ascii=False), flush=True)
+        logger.info('%s transcript: %s', source, text)
     merged['duration'] = store.meta['duration']
     atomic_json(store.path/'transcript.json', merged)
     for fmt in ('txt', 'srt', 'vtt'):
@@ -94,8 +99,9 @@ async def verify(path):
         'segments':len(merged['segments']), 'languages':['en','pl'], 'final_number_preserved':True}
 
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr, format='%(message)s')
     started = time.monotonic()
     with tempfile.TemporaryDirectory(prefix='whisper-speech-e2e-') as directory:
         result = asyncio.run(verify(Path(directory)))
     result['runtime_seconds'] = round(time.monotonic()-started, 2)
-    print(json.dumps(result))
+    sys.stdout.write(json.dumps(result) + '\n')

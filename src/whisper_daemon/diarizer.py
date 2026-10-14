@@ -5,6 +5,18 @@ so the user can benchmark quality vs speed and choose.
 """
 
 import logging
+import threading
+from functools import wraps
+
+_DIARIZE_LOCK = threading.RLock()
+
+def serialized(fn):
+    @wraps(fn)
+    def call(*args, **kwargs):
+        with _DIARIZE_LOCK:
+            return fn(*args, **kwargs)
+    return call
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -45,6 +57,7 @@ class SpeakerSegment:
 # ---------------------------------------------------------------------------
 
 
+@serialized
 def _get_pipeline():
     """Lazy-load and cache the pyannote pipeline."""
     global _pipeline
@@ -58,7 +71,11 @@ def _get_pipeline():
     token = os.environ.get("HF_TOKEN") or _get_hf_token()
 
     logger.info("Loading pyannote pipeline (%s)...", PIPELINE_MODEL)
-    _pipeline = Pipeline.from_pretrained(PIPELINE_MODEL, token=token)
+    from whisper_daemon.model_policy import local_model
+    checkpoint = PIPELINE_MODEL if os.environ.get("WHISPER_PREPARE_MODELS") == "1" else local_model(PIPELINE_MODEL)
+    loaded = Pipeline.from_pretrained(checkpoint, token=token)
+    if loaded is None: raise RuntimeError("Speaker model unavailable or access not granted")
+    _pipeline = loaded
 
     if torch.backends.mps.is_available():
         _pipeline.to(torch.device("mps"))
@@ -105,6 +122,7 @@ def _result_to_segments(result: object) -> list[SpeakerSegment]:
     return segments
 
 
+@serialized
 def diarize_batch(
     audio: np.ndarray,
     num_speakers: int | None = None,
@@ -141,26 +159,24 @@ def diarize_batch(
     return _result_to_segments(result)
 
 
+@serialized
 def diarize_file(
     path: str,
     num_speakers: int | None = None,
 ) -> list[SpeakerSegment]:
     """Run diarization on an audio/video file (ffmpeg decodes it)."""
-    pipeline = _get_pipeline()
-
-    kwargs = {}
-    if num_speakers is not None:
-        kwargs["num_speakers"] = num_speakers
-
-    logger.info("Diarizing file: %s", path)
-    try:
-        result = pipeline(path, **kwargs)
-    except ValueError as exc:
-        if "samples instead of the expected" in str(exc):
-            logger.warning("Audio too short for diarization: %s", exc)
-            return []
-        raise
-    return _result_to_segments(result)
+    # Decode with the known ffmpeg executable, independently of torchcodec's
+    # fragile shared-library ABI. A file-backed array avoids a second full copy.
+    import tempfile
+    import subprocess
+    from whisper_daemon.ffmpeg_path import ensure_ffmpeg_on_path
+    if ensure_ffmpeg_on_path() is None: raise RuntimeError("ffmpeg is required for diarization")
+    with tempfile.TemporaryFile() as file:
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-f", "f32le",
+                        "-ac", "1", "-ar", "16000", "pipe:1"], stdout=file, check=True)
+        if file.tell() == 0: return []
+        audio = np.memmap(file, dtype='<f4', mode='c', shape=(file.tell() // 4,))
+        return diarize_batch(audio, num_speakers=num_speakers)
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +250,7 @@ class SpeakerTracker:
             embedding = model(waveform)
         except Exception:
             logger.exception("Embedding extraction failed")
-            return []
+            raise
 
         if isinstance(embedding, torch.Tensor):
             embedding = embedding.cpu().numpy()

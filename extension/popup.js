@@ -24,6 +24,8 @@ chrome.runtime.onMessage.addListener((msg) => {
   } else if (msg.type === "CHUNK_TRANSCRIBED") {
     addTranscriptChunk(msg.text);
   }
+  if(msg.type==='STATUS')updateUI(msg.state==='recording'?'capturing':msg.state);
+  if(msg.type==='CAPTURE_ERROR' || msg.type==='RECOVERY_AVAILABLE')refreshRecovery();
 });
 
 // --- Button ---
@@ -39,7 +41,7 @@ actionBtn.addEventListener("click", async () => {
     return;
   }
 
-  if (response.state === "starting") return;
+  if (response.state === "starting" || response.state === 'transcribing') return;
 
   // Get tab to capture
   const tabId = response.meetTabId || (await getActiveTabId());
@@ -86,8 +88,8 @@ function updateUI(state, title) {
     actionBtn.disabled = false;
     startTimer();
     transcript.classList.add("visible");
-  } else if (state === "starting") {
-    actionBtn.textContent = "Starting...";
+  } else if (state === "starting" || state === 'transcribing') {
+    actionBtn.textContent = state==='starting'?'Starting...':'Saving recording...';
     actionBtn.className = "btn btn-record";
     actionBtn.disabled = true;
   } else {
@@ -116,6 +118,7 @@ function addTranscriptChunk(text) {
 // --- Timer ---
 
 function startTimer() {
+  if (timerInterval) return;
   recordingStart = Date.now();
   timer.classList.add("visible");
   updateTimerDisplay();
@@ -135,3 +138,37 @@ function updateTimerDisplay() {
   const seconds = String(elapsed % 60).padStart(2, "0");
   timer.textContent = `${minutes}:${seconds}`;
 }
+
+
+document.getElementById("pairCommand").textContent = `Run in Terminal: whisper-daemon pair ${chrome.runtime.id}`;
+document.getElementById("savePair").onclick = async () => {
+  const secret = document.getElementById("pairSecret").value.trim();
+  if (secret.length < 32) { document.getElementById("pairStatus").textContent = "Use the complete pairing key from Terminal."; return; }
+  await chrome.storage.local.set({pairingSecret: secret});
+  document.getElementById("pairSecret").value = "";
+  document.getElementById("pairStatus").textContent = "Key saved. Start capture to connect.";
+};
+document.getElementById("pauseBtn").onclick = () => chrome.runtime.sendMessage({type: "WD_PAUSE_MEETING"});
+chrome.runtime.onMessage.addListener(msg => {
+  if (msg.type === "HEALTH") document.getElementById("sourceHealth").textContent =
+    Object.entries(msg.sources).map(([name, value]) => `${name === "mic" ? "Microphone" : "Participants"}: ${value.age > 3 ? "no signal" : value.rms > .005 ? "speaking" : "quiet"}`).join(" · ") + (msg.paused ? " · PAUSED" : "");
+  if (msg.type === "CAPABILITIES") document.getElementById("capabilityStatus").textContent = msg.diarization.message;
+  if (msg.type === "CAPTURE_ERROR" || msg.type === 'RECOVERY_AVAILABLE') document.getElementById("capabilityStatus").textContent = msg.message;
+});
+
+async function refreshRecovery(){
+  try{const state=await chrome.runtime.sendMessage({target:'offscreen',type:'GET_RECOVERY'});
+    document.getElementById('recovery').hidden=!(state?.count || state?.pending);
+  }catch{}
+}
+document.getElementById('exportRecovery').onclick=async()=>{
+  const result=await chrome.runtime.sendMessage({target:'offscreen',type:'EXPORT_RECOVERY'});
+  if(!result?.url)return;
+  const link=document.createElement('a');link.href=result.url;link.download=result.filename;link.click();
+  document.getElementById('clearRecovery').disabled=false;
+};
+document.getElementById('clearRecovery').onclick=async()=>{
+  await chrome.runtime.sendMessage({target:'offscreen',type:'CLEAR_EXPORTED_RECOVERY'});
+  document.getElementById('clearRecovery').disabled=true;refreshRecovery();
+};
+refreshRecovery();

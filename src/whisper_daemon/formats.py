@@ -6,6 +6,8 @@ output is unchanged (backward compatible).
 """
 
 import json
+import html
+import re
 
 COMPACT_STRIP_KEYS = {"tokens", "seek", "compression_ratio", "temperature", "avg_logprob", "no_speech_prob"}
 
@@ -75,7 +77,7 @@ def to_vtt(result: dict) -> str:
         text = seg["text"].strip()
         if has_speakers:
             label = speakers.get(seg.get("speaker", 0), f"Speaker {seg.get('speaker', 0) + 1}")
-            text = f"<v {label}>{text}</v>"
+            text = f"<v {html.escape(label)}>{html.escape(text)}</v>"
         lines.append(f"{start} --> {end}\n{text}\n")
 
     return "\n".join(lines)
@@ -101,6 +103,9 @@ def _strip_segments(result: dict) -> dict:
         }
         if has_speakers:
             compact["speaker"] = seg["speaker"]
+        for key in ("source", "words"):
+            if key in seg:
+                compact[key] = seg[key]
         compact_segments.append(compact)
 
     cleaned = {
@@ -108,6 +113,8 @@ def _strip_segments(result: dict) -> dict:
         "segments": compact_segments,
         "language": result.get("language", ""),
     }
+    for key in ("duration", "gaps", "diarization"):
+        if key in result: cleaned[key] = result[key]
     if "speakers" in result:
         cleaned["speakers"] = result["speakers"]
     return cleaned
@@ -122,32 +129,55 @@ FORMATTERS = {
 
 
 def merge_chunk_results(results: list[tuple[float, dict]]) -> dict:
-    """Merge overlapping chunk results into a single result, deduplicating overlap zones.
+    """Merge on a shared clock, deduplicating within each source only.
 
-    Each result is (start_offset, whisper_result). Segments whose adjusted start
-    falls before the high-water mark of previously merged segments are dropped,
-    preventing duplicate text from chunk overlap regions.
+    Word timestamps allow trimming just the overlap. Legacy segments without
+    words use conservative suffix/prefix text matching; novel speech is never
+    discarded merely because its segment starts inside an overlap.
     """
     sorted_results = sorted(results, key=lambda r: r[0])
-
     merged_segments: list[dict] = []
-    high_water: float = 0.0
-
+    high_water: dict[str, float] = {}
+    previous_text: dict[str, str] = {}
     for start_offset, result in sorted_results:
-        for seg in result.get("segments", []):
+        source = result.get("source", "mic")
+        segments = result.get("segments", [])
+        if not segments and result.get("text", "").strip():
+            segments = [{"start": 0.0, "end": result.get("duration", 0.0),
+                         "text": result["text"]}]
+        for seg in segments:
             adjusted_start = seg["start"] + start_offset
             adjusted_end = seg["end"] + start_offset
-
-            if adjusted_start < high_water:
+            boundary = high_water.get(source, -1.0)
+            text = seg.get("text", "").strip()
+            words = [{**w, "start": w["start"] + start_offset,
+                      "end": w["end"] + start_offset} for w in seg.get("words", [])]
+            if adjusted_start < boundary:
+                if words:
+                    words = [w for w in words if w["end"] > boundary + 0.02]
+                    text = " ".join(w["word"].strip() for w in words)
+                    if words:
+                        adjusted_start = max(boundary, words[0]["start"])
+                else:
+                    old = previous_text.get(source, "").split()
+                    new = text.split()
+                    norm = lambda t: re.sub(r"[^\w]", "", t.casefold())
+                    for size in range(min(len(old), len(new)), 0, -1):
+                        if list(map(norm, old[-size:])) == list(map(norm, new[:size])):
+                            text = " ".join(new[size:])
+                            break
+            if not text:
                 continue
-
-            merged_segments.append({
-                **seg,
-                "start": adjusted_start,
-                "end": adjusted_end,
-            })
-            high_water = adjusted_end
-
+            item = {**seg, "source": source, "start": adjusted_start,
+                    "end": adjusted_end, "text": text}
+            if words:
+                item["words"] = words
+            merged_segments.append(item)
+            high_water[source] = max(boundary, adjusted_end)
+            previous_text[source] = (previous_text.get(source, "") + " " + text)[-2000:]
+    merged_segments.sort(key=lambda seg: (seg["start"], seg["end"], seg["source"]))
+    for index, seg in enumerate(merged_segments):
+        seg["id"] = index
     merged_text = " ".join(
         seg["text"].strip() for seg in merged_segments if seg.get("text", "").strip()
     )

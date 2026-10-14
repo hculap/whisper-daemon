@@ -1,3 +1,4 @@
+chrome.storage.local.setAccessLevel({accessLevel: "TRUSTED_CONTEXTS"});
 /**
  * Service worker: manages state machine, tabCapture, and offscreen document lifecycle.
  *
@@ -9,10 +10,14 @@
  * recording, transcription, diarization, and output automatically.
  */
 
-const State = { IDLE: "idle", DETECTED: "detected", STARTING: "starting", CAPTURING: "capturing" };
+const State = { IDLE: "idle", DETECTED: "detected", STARTING: "starting", CAPTURING: "capturing", TRANSCRIBING: "transcribing" };
 
 let state = State.IDLE;
+// The tab in a Meet call. It outlives any single recording in that call, so
+// only leaving the call or closing the tab releases it.
 let meetTabId = null;
+// A menu-bar (native) recording belongs to no tab; any Meet tab may control it.
+let nativeRecording = false;
 let meetTitle = "";
 let meetUrl = "";
 
@@ -29,30 +34,23 @@ function updateBadge() {
     [State.DETECTED]: { text: "!", color: "#FF9800" },
     [State.STARTING]: { text: "...", color: "#FF9800" },
     [State.CAPTURING]: { text: "REC", color: "#F44336" },
+    [State.TRANSCRIBING]: { text: "…", color: "#FF9800" },
   };
   const badge = badges[state];
   chrome.action.setBadgeText({ text: badge.text });
   chrome.action.setBadgeBackgroundColor({ color: badge.color });
 }
 
-// Paint the badge from a daemon status phase (idle | recording | transcribing)
-// rather than the background's own state machine, so it tracks the real
-// recording phase across an owned stop that keeps the session's socket alive.
-function updateBadgeForPhase(phase) {
-  const map = {
-    idle: { text: "", color: "#000" },
-    recording: { text: "REC", color: "#F44336" },
-    transcribing: { text: "…", color: "#FF9800" },
-  };
-  const badge = map[phase];
-  if (!badge) return;
-  chrome.action.setBadgeText({ text: badge.text });
-  chrome.action.setBadgeBackgroundColor({ color: badge.color });
+// No recording in progress: back to the joined call, if any.
+function settleIdle() {
+  nativeRecording = false;
+  transitionTo(meetTabId ? State.DETECTED : State.IDLE);
 }
 
 // --- Messages ---
 
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg.target === "offscreen") return false;
   if (msg.type === "MEET_JOINED") {
     if (state === State.IDLE) {
       meetTabId = sender.tab?.id ?? null;
@@ -77,6 +75,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "MEET_LEFT") {
+    if (sender.tab?.id !== meetTabId) { sendResponse({ok: true}); return; }
     // Leaving the call ends the session: fully tear down the offscreen socket
     // (persistent control channel) regardless of state. Safe if idle — the
     // offscreen just closes the socket.
@@ -105,10 +104,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "CAPTURE_STOPPED") {
-    transitionTo(State.IDLE);
-    meetTabId = null;
+    settleIdle();
     sendResponse({ ok: true });
 
+  } else if (msg.type === "CONTROL_CLOSED") {
+    // The daemon went away: a "saving" or native-recording state can no longer
+    // be confirmed or ended by a status. The daemon decides on the next start.
+    if (state === State.TRANSCRIBING || nativeRecording) settleIdle();
+    sendResponse({ ok: true });
+
+  } else if (msg.type === 'RECOVERY_AVAILABLE') {
+    chrome.notifications.create('audio-recovery', {type:'basic',iconUrl:'icons/icon128.png',
+      title:'Audio recovery',message:msg.message});
+    sendResponse({ok:true});
   } else if (msg.type === "CAPTURE_ERROR") {
     chrome.notifications.create("capture-error", {
       type: "basic",
@@ -135,20 +143,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       elapsed: msg.elapsed,
       chunks: msg.chunks,
     });
-    // Track the real recording phase on the toolbar badge (finding 4). WD_STOP
-    // now keeps the socket open and no longer transitions the background out of
-    // CAPTURING, so without this the badge would stay red "REC" for the rest of
-    // the session after an owned stop. Map the daemon phase directly.
-    updateBadgeForPhase(msg.state);
+    // Track the daemon's real phase (badge included): WD_STOP keeps the socket
+    // open and does not leave CAPTURING by itself. A settings snapshot reports
+    // the phase too, but must not override a start that is being set up.
+    if (!(msg.snapshot && state === State.STARTING)) {
+      if (msg.state === "idle") settleIdle();
+      else if (msg.state === "transcribing") transitionTo(State.TRANSCRIBING);
+      else if (msg.state === "recording") {
+        nativeRecording = !msg.sessionId;
+        transitionTo(State.CAPTURING);
+      }
+    }
     sendResponse({ ok: true });
 
+  } else if (msg.type === "HEALTH") {
+    relayWD("WD_HEALTH", {sources: msg.sources, paused: msg.paused});
+    sendResponse({ok: true});
+  } else if (msg.type === "CAPABILITIES") {
+    relayWD("WD_CAPABILITIES", {diarization: msg.diarization});
+    sendResponse({ok: true});
   } else if (msg.type === "SETTINGS") {
-    relayWD("WD_SETTINGS", { settings: msg.settings, devices: msg.devices });
+    // Global read-only snapshot: initialize every content surface without
+    // granting any of them ownership of a recording.
+    chrome.tabs.query({url:'https://meet.google.com/*'}).then(tabs => {
+      for (const tab of tabs) chrome.tabs.sendMessage(tab.id, {
+        type:'WD_SETTINGS', settings:msg.settings, devices:msg.devices,
+      }).catch(() => {});
+    }).catch(() => {});
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_START") {
     // From content script (page gesture). Forward to offscreen.
+    // A previous meeting still being saved is not refused here: the daemon is
+    // the authority and makes the start wait until it is free.
     if (sender.tab?.id) {
+      if (!nativeRecording && meetTabId !== null && meetTabId !== sender.tab.id &&
+          (state === State.CAPTURING || state === State.STARTING)) {
+        sendResponse({ok: false, error: "Another tab is recording"}); return;
+      }
+      transitionTo(State.STARTING);
       meetTabId = sender.tab.id;
       meetTitle = msg.title || "";
       meetUrl = msg.url || "";
@@ -161,17 +194,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // or the status relay would re-point at a left tab (F15). Only refresh the
     // pointer if we still have a live meeting; always forward the stop so the
     // daemon finalizes.
-    if (meetTabId !== null && sender.tab?.id) meetTabId = sender.tab.id;
+    if (sender.tab?.id !== meetTabId) { sendResponse({ok: false}); return; }
     forwardToOffscreen(msg);
     sendResponse({ ok: true });
 
+  } else if (msg.type === 'WD_GET_SETTINGS') {
+    forwardToOffscreen(msg);
+    sendResponse({ok:true});
   } else if (
+    msg.type === "WD_PAUSE_MEETING" ||
     msg.type === "WD_STOP_MEETING" ||
-    msg.type === "WD_GET_SETTINGS" ||
     msg.type === "WD_SET_SETTINGS"
   ) {
-    if (sender.tab?.id) {
-      meetTabId = sender.tab.id;
+    if (!sender.tab || meetTabId === null || nativeRecording || state === State.IDLE ||
+        state === State.DETECTED || sender.tab.id === meetTabId) {
       forwardToOffscreen(msg);
     }
     sendResponse({ ok: true });
@@ -180,14 +216,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // High-frequency audio relay. Once the offscreen document is known to exist
     // relay synchronously (preserves frame order); before that, await creation
     // so the first frames aren't dropped in the boot gap (F11/F23).
-    if (sender.tab?.id) {
+    if (sender.tab?.id === meetTabId) {
       if (offscreenReady) {
-        chrome.runtime.sendMessage(msg).catch(() => {});
+        chrome.runtime.sendMessage({ ...msg, target: "offscreen" }).catch(() => {});
       } else {
         ensureOffscreenDocument()
           .then(() => {
             offscreenReady = true;
-            return chrome.runtime.sendMessage(msg).catch(() => {});
+            return chrome.runtime.sendMessage({ ...msg, target: "offscreen" }).catch(() => {});
           })
           .catch(() => {});
       }
@@ -234,6 +270,7 @@ async function startCaptureWithStream(streamId) {
 
     chrome.runtime.sendMessage({
       type: "START_CAPTURE",
+      target: "offscreen",
       streamId,
       tabId: meetTabId,
       meetTitle,
@@ -251,7 +288,7 @@ async function startCaptureWithStream(streamId) {
 function stopCapture() {
   // Reaches the offscreen document if it exists; a missing receiver rejects,
   // which we ignore (nothing to tear down).
-  chrome.runtime.sendMessage({ type: "STOP_CAPTURE" }).catch(() => {});
+  chrome.runtime.sendMessage({ type: "STOP_CAPTURE", target: "offscreen" }).catch(() => {});
 }
 
 // In-flight createDocument promise. Concurrent callers (e.g. two Meet tabs both
@@ -317,8 +354,7 @@ async function resolveMeetTab() {
     const tabs = await chrome.tabs.query({ url: "https://meet.google.com/*" });
     if (tabs && tabs.length) {
       const t = tabs.find((x) => x.active) || tabs[0];
-      meetTabId = t.id ?? null;
-      return meetTabId;
+      return t.id ?? null;
     }
   } catch (err) {
     console.warn("wd: resolveMeetTab failed", err);
@@ -330,7 +366,7 @@ async function resolveMeetTab() {
 async function forwardToOffscreen(msg) {
   try {
     await ensureOffscreenDocument();
-    chrome.runtime.sendMessage(msg).catch(() => {});
+    chrome.runtime.sendMessage({ ...msg, target: "offscreen" }).catch(() => {});
   } catch (err) {
     console.error("Failed to forward to offscreen:", err);
     relayWD("WD_ERROR", { message: "Nie udało się połączyć z offscreen." });

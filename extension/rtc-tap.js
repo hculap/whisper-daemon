@@ -52,14 +52,9 @@ class WdPcmProcessor extends AudioWorkletProcessor {
     const input = inputs[0];
     if (!input || !input[0]) return true;
     const channelData = input[0];
-    for (let i = 0; i < channelData.length; i++) {
-      this._buffer[this._bytesWritten++] = channelData[i];
-      if (this._bytesWritten >= this._bufferSize) {
-        this.port.postMessage(this._buffer);
-        this._buffer = new Float32Array(this._bufferSize);
-        this._bytesWritten = 0;
-      }
-    }
+    this.port.postMessage({samples: channelData.slice(), position: this._position || 0});
+    this._position = (this._position || 0) + channelData.length;
+
     return true;
   }
 }
@@ -145,15 +140,20 @@ registerProcessor("wd-pcm", WdPcmProcessor);
 
   // --- Session lifecycle ---
 
+  let generation = 0;
+  let starting = false;
   async function start() {
+    if (starting || capturing) return;
+    starting = true;
+    const gen = ++generation;
     try {
-      if (capturing) return;
       ctx = new AudioContext({ sampleRate: 16000 });
       workletUrl = URL.createObjectURL(
         new Blob([WORKLET_CODE], { type: "application/javascript" })
       );
       await ctx.audioWorklet.addModule(workletUrl);
 
+      if (gen !== generation) return;
       gain = ctx.createGain();
       gain.gain.value = 1;
       workletNode = new AudioWorkletNode(ctx, "wd-pcm");
@@ -166,7 +166,8 @@ registerProcessor("wd-pcm", WdPcmProcessor);
           post({
             source: "wd-rtc",
             type: "WD_RTC_PCM",
-            samples: Array.from(e.data),
+            samples: Array.from(e.data.samples),
+            position: e.data.position,
           });
         } catch {}
       };
@@ -175,16 +176,19 @@ registerProcessor("wd-pcm", WdPcmProcessor);
       // resume. If it stays suspended, the next START retries (fresh context).
       try { await ctx.resume(); } catch {}
 
+      if (gen !== generation) return;
       capturing = true;
       for (const track of remoteTracks.values()) wireTrack(track);
       postState();
     } catch (err) {
       try { console.warn("wd-rtc: start failed", err); } catch {}
-      stop();
-    }
+      if (gen === generation) stop();
+    } finally { if (gen === generation) starting = false; }
   }
 
   function stop() {
+    generation++;
+    starting = false;
     capturing = false;
     for (const entry of sourceNodes.values()) {
       try { entry.node.disconnect(); } catch {}

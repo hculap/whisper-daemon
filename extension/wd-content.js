@@ -38,6 +38,9 @@
   let currentSettings = null;
   let localCapture = null; // {mode, audioContext, stream, worklet} when WE capture
   let starting = false; // re-entrancy guard for startCapture (F4)
+  let capturePosition = 0;
+  let sourceBase = 0;
+  let captureGeneration = 0;
   let sessionOwned = false; // true once WE issued WD_START (tab OR mic-only)
 
   // --- RTC tap (MAIN-world rtc-tap.js) state ---
@@ -188,6 +191,8 @@
       return;
     }
     starting = true;
+    captureGeneration++;
+    capturePosition = sourceBase = 0;
     try {
       // Honor capture_tab (F9): when participant capture is off, start a mic-only
       // meeting and let the daemon record the local mic natively.
@@ -227,6 +232,7 @@
   // the PCM source. Preserves the no-audio-track guard and the AudioContext /
   // worklet path.
   async function startDisplayMediaCapture(opts) {
+    const gen = captureGeneration;
     const resumeSession = !!(opts && opts.resumeSession);
     let stream;
     try {
@@ -257,7 +263,7 @@
       // acquired stream instead of wiring WD_PCM (and possibly WD_START) into a
       // dead/next session — which would leave an orphaned tab share with no UI
       // to stop it and block the next start (localCapture stuck non-null).
-      if (resumeSession && !sessionOwned) {
+      if (gen !== captureGeneration || (resumeSession && !sessionOwned)) {
         try { stream.getTracks().forEach((t) => t.stop()); } catch {}
         return;
       }
@@ -292,16 +298,19 @@
       await audioContext.audioWorklet.addModule(
         chrome.runtime.getURL("pcm-processor.js")
       );
+      if (gen !== captureGeneration) { await audioContext.close(); stream.getTracks().forEach(t => t.stop()); return; }
       const worklet = new AudioWorkletNode(audioContext, "pcm-processor");
       source.connect(worklet);
       // Do NOT connect to destination — avoid echoing meeting audio locally.
 
       resetSilenceWatch(); // fresh source — re-arm the dead-capture watch
       worklet.port.onmessage = (event) => {
-        const f32 = event.data;
+        const f32 = event.data.samples;
         checkTabSilence(f32); // warn if the shared tab has no participant audio
         // runtime messaging serializes via JSON, so ship a plain number array.
-        wdSend({ type: "WD_PCM", samples: Array.from(f32) });
+        const position = sourceBase + event.data.position;
+        wdSend({ type: "WD_PCM", samples: Array.from(f32), position });
+        capturePosition = position + f32.length;
       };
 
       // The user (or another audio track) ending the share stops recording.
@@ -328,6 +337,7 @@
   // Stops the RTC tap but keeps the already-started daemon session, then swaps
   // the PCM source so we never double-feed WD_PCM.
   async function startDisplayMediaFallback() {
+    sourceBase = capturePosition;
     if (!localCapture || localCapture.mode !== "rtc") return;
     try { window.postMessage({ source: "wd", type: "WD_RTC_STOP" }, location.origin); } catch {}
     localCapture = null; // release RTC ownership before opening the picker
@@ -371,6 +381,7 @@
   }
 
   function teardownLocalCapture() {
+    captureGeneration++;
     clearBanner();
     if (!localCapture) return;
     const cap = localCapture;
@@ -390,6 +401,7 @@
   }
 
   function stopCapture() {
+    captureGeneration++;
     const owned = sessionOwned;
     sessionOwned = false;
     teardownLocalCapture(); // no-op for a mic-only or menu-bar meeting
@@ -449,7 +461,11 @@
   chrome.runtime.onMessage.addListener((msg) => {
     if (!msg || typeof msg !== "object") return;
 
-    if (msg.type === "WD_STATUS") {
+    if (msg.type === "WD_HEALTH") {
+      panel.setHealth(msg.sources, msg.paused);
+    } else if (msg.type === "WD_CAPABILITIES") {
+      if (!msg.diarization.available) toast(msg.diarization.message);
+    } else if (msg.type === "WD_STATUS") {
       daemonState = msg.state || "idle";
       lastElapsed = typeof msg.elapsed === "number" ? msg.elapsed : lastElapsed;
       injector.setButtonState(daemonState, msg.elapsed);
@@ -518,7 +534,9 @@
       if (!Array.isArray(data.samples) || data.samples.length === 0) return;
       checkTabSilence(Float32Array.from(data.samples)); // dead-capture watch
       // Same relay the worklet path uses; the array is already JSON-safe.
-      wdSend({ type: "WD_PCM", samples: data.samples });
+      const position = sourceBase + data.position;
+      wdSend({ type: "WD_PCM", samples: data.samples, position });
+      capturePosition = position + data.samples.length;
     } else if (data.type === "WD_RTC_STATE") {
       remoteTrackCount = typeof data.tracks === "number" ? data.tracks : remoteTrackCount;
       handleRtcState();

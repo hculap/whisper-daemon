@@ -17,8 +17,8 @@ dependencies = [
     "onnxruntime>=1.16",
     "Pillow>=10.0",
     "click>=8.0",
-    "pyannote-audio>=3.3",
-    "websockets>=12.0",
+    "pyannote-audio>=4.0,<5",
+    "websockets>=13.0",
 ]
 
 [project.optional-dependencies]
@@ -29,3 +29,6 @@ whisper-daemon = "whisper_daemon.__main__:cli"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+whisper_daemon = ["review_assets/*"]

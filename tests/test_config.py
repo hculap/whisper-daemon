@@ -160,3 +160,14 @@ def test_recording_language_invalid_coerced_to_auto(tmp_path, monkeypatch):
         '[recording]\nlanguage = "klingon"\n', encoding="utf-8"
     )
     assert config_mod.load_settings().recording_language == "auto"
+
+
+def test_dictation_settings_roundtrip(tmp_path, monkeypatch):
+    from whisper_daemon import config
+    monkeypatch.setattr(config, 'CONFIG_DIR', tmp_path)
+    monkeypatch.setattr(config, 'CONFIG_FILE', tmp_path / 'config.toml')
+    settings = config.Settings(dictation_language='pl', dictation_silence=3,
+        dictation_confirm=True, dictation_vocabulary=['EdgeMCP', 'Szymon'],
+        cancel_hotkey='ctrl+alt+escape')
+    config.save_settings(settings)
+    assert config.load_settings() == settings

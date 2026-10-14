@@ -1,3 +1,25 @@
+# Current recording and review architecture
+
+MeetingRecorder writes continuous sources through RecordingStore before VAD.
+DiskChunkQueue persists voiced jobs; one inference job is active at a time.
+Raw float32 files are authoritative for crash recovery; bounded WAV export aligns
+sources on one timeline. Browser PCM uses an authenticated WDA1 sequence/sample
+header; duplicates are idempotent and gaps are marked. Native finalization owns the
+meeting until its worker finishes. File transcription cannot reset that lifecycle.
+
+Dictation has IDLE, RECORDING, TRANSCRIBING and optional REVIEW states. Generation
+IDs invalidate cancelled results. History is durable before paste and AX target
+identity protects app/window/input delivery. Offline policy runs before model imports.
+
+ReviewServer serves packaged HTML/CSS/JS over an unguessable loopback URL. It handles
+range playback and validated edits, retains the original transcript and rebuilds
+exports. Notes are source-linked extractive suggestions with manual verification.
+
+The design below describes the earlier baseline and historical rationale. See
+README and delivery-plan.md for current behavior and executed acceptance evidence.
+
+---
+
 # Architektura — whisper-daemon
 
 **Wersja:** 0.2 (PoC)

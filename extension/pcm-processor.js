@@ -27,15 +27,8 @@ class PCMProcessor extends AudioWorkletProcessor {
       output[0].set(channelData);
     }
 
-    for (let i = 0; i < channelData.length; i++) {
-      this._buffer[this._bytesWritten++] = channelData[i];
-
-      if (this._bytesWritten >= this._bufferSize) {
-        this.port.postMessage(this._buffer);
-        this._buffer = new Float32Array(this._bufferSize);
-        this._bytesWritten = 0;
-      }
-    }
+    this.port.postMessage({samples: channelData.slice(), position: this._position || 0});
+    this._position = (this._position || 0) + channelData.length;
 
     return true;
   }

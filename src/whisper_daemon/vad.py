@@ -1,6 +1,8 @@
 """Silero VAD using ONNX Runtime directly — no torch dependency."""
 
 import logging
+import os
+import tempfile
 import urllib.request
 from pathlib import Path
 
@@ -64,12 +66,23 @@ class SileroVAD:
 
 
 def _ensure_model() -> Path:
-    """Download the Silero VAD ONNX model if not cached."""
+    """Use the local VAD; only explicit model preparation may download it."""
     if MODEL_PATH.exists():
         return MODEL_PATH
 
+    if os.environ.get('WHISPER_PREPARE_MODELS') != '1':
+        raise RuntimeError('Silero VAD is not installed locally. Run whisper-daemon models prepare before recording offline.')
+
     MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     logger.info("Downloading Silero VAD ONNX model (~2MB)...")
-    urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+    with tempfile.NamedTemporaryFile(dir=MODEL_CACHE_DIR, suffix='.onnx', delete=False) as file:
+        temp = Path(file.name)
+    try:
+        urllib.request.urlretrieve(MODEL_URL, temp)
+        # A partial download must never look like a prepared model.
+        ort.InferenceSession(str(temp), providers=['CPUExecutionProvider'])
+        temp.replace(MODEL_PATH)
+    finally:
+        temp.unlink(missing_ok=True)
     logger.info("Model saved to %s", MODEL_PATH)
     return MODEL_PATH

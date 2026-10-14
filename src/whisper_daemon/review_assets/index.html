@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="pl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Spotkanie · Whisper</title><link rel="stylesheet" href="review.css"></head>
+<body><header><div><span class="eyebrow">WHISPER · LOKALNIE</span><h1>Twoje spotkanie</h1><p id="meta"></p></div><button id="save">Zapisz zmiany</button></header>
+<div id="status" role="status" aria-live="polite"></div>
+<section class="player"><label for="source">Źródło audio</label><select id="source"></select><audio id="audio" controls preload="metadata"></audio><p id="gaps"></p></section>
+<main><section><div class="section-title"><h2>Transkrypcja</h2><span id="count"></span></div><label class="search">Szukaj wypowiedzi<input id="search" type="search" placeholder="Słowo, nazwisko, ustalenie…"></label><div id="speakers"></div><button id="addSpeaker" class="secondary">+ Dodaj mówcę</button><p class="hint">Kliknij czas, aby odsłuchać wypowiedź. Nazwy i przypisanie mówców możesz poprawić.</p><div id="segments"></div></section>
+<aside><h2>Notatki ze spotkania</h2><p class="hint">Początkowy wybór to cytaty z transkrypcji. Sprawdź je w nagraniu i uzupełnij własne podsumowanie.</p><label for="summary">Podsumowanie</label><textarea id="summary" rows="10"></textarea><div class="section-title"><h2>Zadania</h2><button id="addTask" class="secondary">+ Dodaj</button></div><p class="hint">Propozycje wymagają potwierdzenia. Osobę i termin wpisujesz samodzielnie.</p><div id="tasks"></div></aside></main>
+<footer>Audio i zmiany pozostają na tym komputerze. Kopia pierwotnej transkrypcji jest zachowana.</footer><script src="review.js"></script></body></html>

@@ -26,6 +26,8 @@ from AppKit import (
 from whisper_daemon import secure_input
 from whisper_daemon.carbon_hotkey import CMD_KEY, SHIFT_KEY, CarbonHotkeys
 from whisper_daemon.events import Event, EventType
+from whisper_daemon.shortcuts import parse_shortcut
+from whisper_daemon.config import load_settings
 from whisper_daemon.notify import notify
 
 logger = logging.getLogger(__name__)
@@ -88,26 +90,36 @@ class HotkeyListener:
         self._secure_holder_pid: int | None = None
         self._carbon = CarbonHotkeys()
         self._record_via_carbon = False
+        self._registered_actions = set()
+        self._combos = {}
 
     def _handle_key(self, ns_event: object) -> None:
-        flags = ns_event.modifierFlags()
+        flags = ns_event.modifierFlags() & ((1 << 20) | (1 << 19) | (1 << 18) | (1 << 17))
         keycode = ns_event.keyCode()
+        for action, (combo, event_type) in self._combos.items():
+            if (flags, keycode) == combo[:2] and action not in self._registered_actions:
+                self._queue.put(Event(event_type))
 
-        modifier_mask = NSCommandKeyMask | NSShiftKeyMask
-        if (flags & modifier_mask) != modifier_mask:
-            return
-
-        self._last_event_at = time.monotonic()
-
-        if keycode == RECORD_COMBO[1]:
-            if not self._record_via_carbon:
-                self._on_record()
-        elif keycode == PASTE_LAST_COMBO[1]:
-            logger.info("Hotkey: paste last transcription")
-            self._queue.put(Event(EventType.PASTE_LAST))
-        elif keycode == SPEAK_COMBO[1]:
-            logger.info("Hotkey: copy & speak")
-            self._queue.put(Event(EventType.SPEAK_CLIPBOARD))
+    def configure(self, settings=None):
+        settings = settings or load_settings()
+        mapping = {'record': EventType.RECORD_TOGGLE, 'paste': EventType.PASTE_LAST,
+                   'cancel': EventType.RECORD_CANCEL, 'accept': EventType.DICTATION_ACCEPT,
+                   'speak': EventType.SPEAK_CLIPBOARD}
+        combos = {name: (parse_shortcut(getattr(settings, name + '_hotkey')), event)
+                  for name, event in mapping.items()}
+        if len({value[0][:2] for value in combos.values()}) != len(combos):
+            raise ValueError('Each dictation action needs a different shortcut')
+        self._carbon.unregister_all()
+        self._registered_actions.clear()
+        self._combos = combos
+        for action, (combo, event_type) in combos.items():
+            try:
+                self._carbon.register(combo[1], combo[2], lambda e=event_type: self._queue.put(Event(e)))
+                self._registered_actions.add(action)
+            except OSError:
+                logger.exception('Hotkey unavailable: %s', action)
+                notify('whisper-daemon', 'Shortcut conflict', getattr(settings, action + '_hotkey'))
+        self._record_via_carbon = 'record' in self._registered_actions
 
     def _on_record(self) -> None:
         self._last_event_at = time.monotonic()
@@ -211,7 +223,7 @@ class HotkeyListener:
                 AppHelper.callAfter(self._install_monitor)
 
     def start(self) -> None:
-        self._register_carbon_record()
+        self.configure()
         self._install_monitor()
 
         self._wake_observer = _WakeObserver.alloc().initWithCallback_(self._on_wake)

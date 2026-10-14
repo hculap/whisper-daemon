@@ -3,7 +3,7 @@
 import logging
 import time
 
-from AppKit import NSPasteboard, NSPasteboardTypeString
+from AppKit import NSPasteboard, NSPasteboardItem, NSPasteboardTypeString
 from Quartz import (
     CGEventCreateKeyboardEvent,
     CGEventPost,
@@ -18,28 +18,40 @@ V_KEYCODE = 9  # macOS virtual keycode for 'v'
 PASTE_SETTLE_DELAY = 0.2  # seconds to wait for paste to complete
 
 
-def paste_text(text: str) -> None:
+def paste_text(text: str, target=None) -> bool:
     """Paste text into the currently focused text field.
 
     Saves the current clipboard, sets the transcription, simulates Cmd+V,
     then restores the original clipboard content.
     """
+    from whisper_daemon.focus import target_matches
+    if target is not None and not target_matches(target): return False
     pb = NSPasteboard.generalPasteboard()
 
-    old_content = pb.stringForType_(NSPasteboardTypeString)
-
+    saved = []
+    for original in pb.pasteboardItems() or []:
+        item = NSPasteboardItem.alloc().init()
+        for content_type in original.types():
+            data = original.dataForType_(content_type)
+            if data is not None:
+                item.setData_forType_(data, content_type)
+        saved.append(item)
     pb.clearContents()
     pb.setString_forType_(text, NSPasteboardTypeString)
-
-    _simulate_cmd_v()
-
-    time.sleep(PASTE_SETTLE_DELAY)
-
-    pb.clearContents()
-    if old_content is not None:
-        pb.setString_forType_(old_content, NSPasteboardTypeString)
+    owned_version = pb.changeCount()
+    try:
+        if target is not None and not target_matches(target): return False
+        _simulate_cmd_v()
+        time.sleep(PASTE_SETTLE_DELAY)
+    finally:
+        # A copy performed by the user during paste belongs to the user.
+        if pb.changeCount() == owned_version:
+            pb.clearContents()
+            if saved:
+                pb.writeObjects_(saved)
 
     logger.info("Pasted %d chars", len(text))
+    return True
 
 
 def _simulate_cmd_v() -> None:

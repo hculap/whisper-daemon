@@ -14,8 +14,8 @@ from whisper_daemon.config import Settings
 @pytest.mark.parametrize(
     "origin,expected",
     [
-        ("chrome-extension://abcdefghijklmnop", True),
-        ("chrome-extension://", True),
+        ("chrome-extension://abcdefghijklmnop", False),
+        ("chrome-extension://", False),
         ("https://meet.google.com", False),
         ("http://localhost:9876", False),
         ("moz-extension://abc", False),
@@ -92,6 +92,8 @@ def test_build_status_message_shape():
         "state": "recording",
         "elapsed": 12.5,
         "chunks": 3,
+        "session_id": None,
+        "snapshot": False,
     }
 
 

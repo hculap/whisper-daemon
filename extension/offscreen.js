@@ -24,6 +24,12 @@ const RECONNECT_WINDOW_MS = 5 * 60 * 1000;
 const PING_INTERVAL_MS = 25000;
 // 16kHz float32 mono = 64 KB/s; 8 MB ≈ 2 minutes of buffered audio.
 const MAX_BUFFERED_BYTES = 8 * 1024 * 1024;
+const START_ACK_TIMEOUT_MS = 10000;
+// While the daemon saves the previous meeting it answers 'busy'; the new
+// session keeps buffering and asks again (bounded by MAX_BUFFERED_BYTES).
+const BUSY_RETRY_MS = 1000;
+const BUSY_WAIT_MS = 5 * 60 * 1000;
+const BUSY_MESSAGE = "Previous recording is still being saved, so the new one could not start.";
 
 let audioContext = null;
 let mediaStream = null;
@@ -45,10 +51,40 @@ let pcmBufferedBytes = 0;
 // and bail if it no longer matches — so a socket that finishes opening
 // after a stop, or a stale reconnect loop, can't leak into a new session.
 let captureGen = 0;
+let socketGen = 0; // control connections survive a new capture generation
+let sessionId = "";
+let pcmSequence = 0;
+let pcmPosition = 0;
+let pendingStart = null;
+let streamReady = false; // start ACK + ordered replay completed on this socket
+let startSent = false; // daemon may own a session even before its ACK arrives
+let stopPromise = null;
+let stoppedSession = null; // retain undelivered PCM until Stop can reach daemon
+const recoveryTails = [];
 
 // --- Message handling ---
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  // Content-script broadcasts also reach this document. Only consume the
+  // explicitly routed copy, never both the original and the SW relay.
+  if (msg.target !== "offscreen") return false;
+  if (msg.type === 'GET_RECOVERY') {
+    sendResponse({count:recoveryTails.length, pending:!!stoppedSession});return;
+  }
+  if (msg.type === 'EXPORT_RECOVERY') {
+    const tail=recoveryTails[0] || stoppedSession;
+    if (!tail || !tail.packets.length) {sendResponse({error:'Brak bufora audio'});return;}
+    const {blob,offset}=recoveryWav(tail.packets);
+    if(tail.url)URL.revokeObjectURL(tail.url);
+    tail.url=URL.createObjectURL(blob);
+    sendResponse({url:tail.url,filename:`whisper-tail-${tail.id}-from-${Math.round(offset*1000)}ms.wav`});return;
+  }
+  if (msg.type === 'CLEAR_EXPORTED_RECOVERY') {
+    // Explicit user action after checking the downloaded file; never automatic.
+    const tail=recoveryTails[0] || stoppedSession;
+    if(tail?.url){URL.revokeObjectURL(tail.url);if(recoveryTails[0]===tail)recoveryTails.shift();else stoppedSession=null;}
+    sendResponse({ok:true});return;
+  }
   if (msg.type === "START_CAPTURE") {
     // Legacy popup fallback: capture the tab here via getUserMedia.
     meetTitle = msg.meetTitle || "";
@@ -75,7 +111,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_PCM") {
-    ingestExternalPcm(msg.samples);
+    ingestExternalPcm(msg.samples, msg.position);
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_GET_SETTINGS") {
@@ -84,6 +120,10 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 
   } else if (msg.type === "WD_SET_SETTINGS") {
     sendControl({ type: "set_settings", patch: msg.patch || {} });
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "WD_PAUSE_MEETING") {
+    sendControl({ type: "pause_meeting" });
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_STOP_MEETING") {
@@ -97,14 +137,14 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // --- Capture pipeline (legacy popup tab-capture) ---
 
 async function startCaptureFromStream(streamId) {
-  if (capturing) {
+  if (capturing || sessionStarting) {
     console.warn("START_CAPTURE while already capturing — ignoring");
     chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
     return;
   }
-  const gen = ++captureGen;
-  externalMode = false;
+  const gen = prepareSession(false);
   try {
+    if (!await deliverRetainedTail(gen)) return;
     mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         mandatory: {
@@ -115,6 +155,11 @@ async function startCaptureFromStream(streamId) {
       video: false,
     });
 
+    if (gen !== captureGen) {
+      mediaStream.getTracks().forEach(t => t.stop());
+      settleSupersededStart();
+      return;
+    }
     mediaStream.getAudioTracks().forEach((track) => {
       track.onended = () => {
         console.warn("Capture track ended");
@@ -125,39 +170,36 @@ async function startCaptureFromStream(streamId) {
     audioContext = new AudioContext({ sampleRate: 16000 });
     const source = audioContext.createMediaStreamSource(mediaStream);
     await audioContext.audioWorklet.addModule("pcm-processor.js");
+    if (gen !== captureGen) { settleSupersededStart(); return; }
     const workletNode = new AudioWorkletNode(audioContext, "pcm-processor");
     source.connect(workletNode);
     workletNode.connect(audioContext.destination);
 
-    const ok = await beginSession(gen);
-    if (!ok) return;
-
+    // Install before the handshake: preserve startup PCM and its sample clock.
     workletNode.port.onmessage = (event) => {
-      sendPcm(event.data.buffer);
+      sendPcm(event.data.samples.buffer, event.data.position);
     };
+    if (!await beginSession(gen) && gen !== captureGen) settleSupersededStart();
   } catch (err) {
-    console.error("Capture failed:", err);
-    cleanup();
-    chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: err.message });
+    failStart(gen, err);
+  } finally {
+    if (gen === captureGen) sessionStarting = false;
   }
 }
 
 // --- External capture (content-script PCM) ---
 
 async function startExternal() {
-  if (capturing) {
+  if (capturing || sessionStarting) {
     chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
     return;
   }
-  const gen = ++captureGen;
-  externalMode = true;
-  sessionStarting = true;
+  const gen = prepareSession(true);
   try {
-    await beginSession(gen);
+    if (!await deliverRetainedTail(gen)) return;
+    if (!await beginSession(gen) && gen !== captureGen) settleSupersededStart();
   } catch (err) {
-    console.error("External session failed:", err);
-    cleanup();
-    chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: err.message });
+    failStart(gen, err);
   } finally {
     // Only clear if we still own the generation — a racing start/stop that
     // bumped captureGen owns the flag now.
@@ -165,13 +207,54 @@ async function startExternal() {
   }
 }
 
-function ingestExternalPcm(samples) {
-  if (!Array.isArray(samples) || samples.length === 0) return;
+// New identity first: source PCM arriving while a previous failed tail is
+// resolved, or while the daemon is busy, is staged under it, never discarded.
+function prepareSession(external) {
+  const gen = ++captureGen;
+  sessionId = crypto.randomUUID();
+  streamReady = startSent = false;
+  pcmSequence = pcmPosition = 0;
+  pcmBuffer = []; pcmBufferedBytes = 0;
+  externalMode = external;
+  sessionStarting = true;
+  return gen;
+}
+
+// The previous session's undelivered stop comes first. When this start cannot
+// continue, background has been told why (drain error or settled start).
+async function deliverRetainedTail(gen) {
+  if (stoppedSession) await drainStoppedSession();
+  if (gen !== captureGen) { settleSupersededStart(); return false; }
+  return !stoppedSession;
+}
+
+// A stop raced this start. Unless a newer session owns the state, tell
+// background the start ended so it never stays in STARTING.
+function settleSupersededStart() {
+  if (!capturing && !sessionStarting) chrome.runtime.sendMessage({ type: "CAPTURE_STOPPED" });
+}
+
+function failStart(gen, err) {
+  if (gen !== captureGen) { settleSupersededStart(); return; }
+  console.error("Capture failed:", err);
+  let message = err.message;
+  // The daemon never owned this session; keep what was captured meanwhile.
+  if (err.code === "busy" && pcmBuffer.length) {
+    recoveryTails.push({id: sessionId, packets: pcmBuffer, position: pcmPosition});
+    message += " Audio captured meanwhile is kept for export in the extension popup.";
+  }
+  cleanup();
+  chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message });
+}
+
+function ingestExternalPcm(samples, position) {
+  if (!Array.isArray(samples) || samples.length === 0 || samples.length > 16384 ||
+      samples.some(v => !Number.isFinite(v) || Math.abs(v) > 1.01)) return;
   // Buffer even before the session is fully up so the first ~256-500ms of
   // audio is not lost while the socket opens and 'start' is sent.
   if (!capturing && !sessionStarting) return;
   const buffer = Float32Array.from(samples).buffer;
-  sendPcm(buffer);
+  sendPcm(buffer, position);
 }
 
 // --- Shared session bring-up (connect + start + ping) ---
@@ -192,11 +275,13 @@ async function beginSession(gen) {
     return false;
   }
 
+  await sendStartMessage();
+  if (gen !== captureGen) return false;
   capturing = true;
   sessionStarting = false;
-  sendStartMessage();
   // Ship any audio buffered while the socket was coming up.
   flushPcmBuffer();
+  streamReady = true;
 
   clearInterval(pingInterval);
   pingInterval = setInterval(() => {
@@ -209,75 +294,125 @@ async function beginSession(gen) {
   return true;
 }
 
-function sendStartMessage() {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify({
-    type: "start",
-    meeting_title: meetTitle,
-    meeting_url: meetUrl,
-  }));
+// Resolves on the daemon's 'started'. pendingStart() resolves it early (a stop
+// raced the start); pendingStart.reject() fails it. A 'busy' reply means the
+// daemon is saving another meeting and does not own this one yet: audio stays
+// buffered and the start is re-sent on the next idle status or retry tick.
+function sendStartMessage(id = sessionId, position = pcmPosition, track = true) {
+  return new Promise((resolve, reject) => {
+    const busyDeadline = Date.now() + BUSY_WAIT_MS;
+    let timer = null;
+    const entry = () => settle(resolve);
+    const settle = (finish, value) => {
+      clearTimeout(timer);
+      if (pendingStart === entry) pendingStart = null;
+      finish(value);
+    };
+    const send = () => {
+      entry.waiting = false;
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        settle(reject, new Error("Lost connection to whisper-daemon"));
+        return;
+      }
+      clearTimeout(timer);
+      timer = setTimeout(() => settle(reject, new Error("Daemon did not accept this recording")), START_ACK_TIMEOUT_MS);
+      if (track) startSent = true;
+      // Sample 0 was captured audio_elapsed ago, including any busy wait.
+      const elapsed = (track ? pcmPosition : position) / 16000;
+      ws.send(JSON.stringify({type: "start", session_id: id, meeting_title: meetTitle, meeting_url: meetUrl,
+        audio_elapsed: Math.min(300, elapsed)}));
+    };
+    entry.sessionId = id;
+    entry.waiting = false;
+    entry.reject = error => settle(reject, error);
+    entry.busy = () => {
+      if (track) startSent = false;
+      clearTimeout(timer);
+      if (Date.now() >= busyDeadline) { settle(reject, busyError()); return; }
+      entry.waiting = true;
+      timer = setTimeout(send, BUSY_RETRY_MS);
+    };
+    entry.retry = () => { if (entry.waiting) send(); };
+    pendingStart = entry;
+    send();
+  });
 }
 
-function sendPcm(buffer) {
-  if (ws && ws.readyState === WebSocket.OPEN && capturing) {
-    ws.send(buffer);
-  } else if (capturing || sessionStarting) {
-    bufferPcm(buffer);
-  }
+function busyError() {
+  return Object.assign(new Error(BUSY_MESSAGE), {code: "busy"});
 }
 
-function bufferPcm(buffer) {
-  if (pcmBufferedBytes + buffer.byteLength > MAX_BUFFERED_BYTES) {
-    // Drop oldest audio first — recent speech matters more.
-    while (pcmBuffer.length > 0 && pcmBufferedBytes + buffer.byteLength > MAX_BUFFERED_BYTES) {
-      pcmBufferedBytes -= pcmBuffer[0].byteLength;
-      pcmBuffer = pcmBuffer.slice(1);
+function sendPcm(buffer, position) {
+  if (!capturing && !sessionStarting) return;
+  if (position !== undefined && (!Number.isSafeInteger(position) || position < pcmPosition)) return;
+  const start = position === undefined ? pcmPosition : position;
+  const packet = new ArrayBuffer(16 + buffer.byteLength);
+  const header = new DataView(packet);
+  header.setUint32(0, 0x31414457, true); // WDA1
+  header.setUint32(4, pcmSequence++, true);
+  header.setBigUint64(8, BigInt(start), true);
+  new Uint8Array(packet, 16).set(new Uint8Array(buffer));
+  pcmPosition = start + buffer.byteLength / 4;
+  if (!bufferPcm(packet)) return;
+  if (ws && ws.readyState === WebSocket.OPEN && streamReady) ws.send(packet);
+}
+
+// Bounds only live, unacknowledged audio. Retained recovery tails are already
+// bounded (each was once live) and must never block a new recording.
+function bufferPcm(packet) {
+  if (pcmBufferedBytes + packet.byteLength > MAX_BUFFERED_BYTES) {
+    // Waited for the daemon as long as audio fits: give up on this start.
+    if (pendingStart?.waiting && pendingStart.sessionId === sessionId) {
+      pendingStart.reject(busyError());
+      return false;
     }
+    stopForwarding();
+    chrome.runtime.sendMessage({type: "CAPTURE_ERROR", message: "Audio connection buffer is full. Recording stopped; already delivered audio is saved."});
+    return false;
   }
-  pcmBuffer = [...pcmBuffer, buffer];
-  pcmBufferedBytes += buffer.byteLength;
+  pcmBuffer.push(packet);
+  pcmBufferedBytes += packet.byteLength;
+  return true;
 }
 
 function flushPcmBuffer() {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  const pending = pcmBuffer;
-  pcmBuffer = [];
-  pcmBufferedBytes = 0;
-  for (const buffer of pending) {
-    ws.send(buffer);
-  }
+  for (const packet of pcmBuffer) ws.send(packet);
 }
 
 // WD_STOP: end the meeting but KEEP the socket open. Stop forwarding PCM and
 // tear down only the (legacy) capture pipeline; the daemon keeps pushing status
 // over the live socket. Does NOT notify background (state stays CAPTURING until
 // a real teardown) so the WD_STATUS relay tab pointer is preserved.
-function stopForwarding() {
-  const wasActive = capturing || sessionStarting;
-  // Only invalidate in-flight connect/reconnect callbacks when we actually end
-  // an active session. On a meet-left race the full-teardown STOP_CAPTURE runs
-  // first (capturing already false); an unconditional bump here would advance
-  // captureGen past the generation its delayed cleanup() timer captured, so the
-  // timer would no-op and the socket + ping would leak (finding 1).
-  if (wasActive) captureGen++;
+function stopForwarding(notifyDaemon = true) {
+  const canFlush = streamReady;
+  streamReady = false;
+  // Cancel the old startup/reconnect generation before draining its snapshot,
+  // but only when one is live. stopCapture() and starts compare captureGen
+  // after awaiting a drain; a bump for an already-stopped session (a late
+  // status, a second stop) would make them skip cleanup and their reply.
+  if (capturing || sessionStarting || reconnecting) captureGen++;
   capturing = false;
   reconnecting = false;
   sessionStarting = false;
   externalMode = false;
 
-  if (wasActive && ws && ws.readyState === WebSocket.OPEN) {
-    flushPcmBuffer();
-    ws.send(JSON.stringify({ type: "stop" }));
-  } else if (wasActive) {
-    // Ended an active session but the socket is not OPEN (mid-reconnect or
-    // dropped): no 'stop' can be delivered and the daemon will never push a
-    // terminal status. Surface an error so background relays WD_ERROR and the
-    // in-bar button's optimistic 'transcribing' paint is reset (finding 2).
-    chrome.runtime.sendMessage({
-      type: "CAPTURE_ERROR",
-      message: "Połączenie z whisper-daemon zostało utracone.",
-    });
+  let stopped = Promise.resolve(true);
+  if (notifyDaemon && startSent && ws && ws.readyState === WebSocket.OPEN) {
+    if (canFlush) {
+      flushPcmBuffer();
+      ws.send(JSON.stringify({ type: "stop", session_id: sessionId }));
+    } else {
+      stoppedSession = {id:sessionId, packets:pcmBuffer, position:pcmPosition};
+    }
+  } else if (notifyDaemon && startSent) {
+    // An authenticated control connection can stop a disconnected session
+    // without starting capture again. Keep teardown alive until this is sent.
+    stoppedSession = {id:sessionId, packets:pcmBuffer, position:pcmPosition};
   }
+  startSent = false;
+  if (pendingStart?.sessionId === sessionId && !stopPromise) pendingStart();
+  if (notifyDaemon && stoppedSession) stopped = drainStoppedSession();
   // A new session must not inherit audio that never made it out.
   pcmBuffer = [];
   pcmBufferedBytes = 0;
@@ -292,42 +427,48 @@ function stopForwarding() {
     mediaStream.getTracks().forEach((track) => track.stop());
     mediaStream = null;
   }
+  return stopped;
+}
+
+function drainStoppedSession() {
+  if (stopPromise) return stopPromise;
+  const ending = stoppedSession;
+  stopPromise = (async () => {
+    try {
+      const connected = await openSharedSocket(CONNECT_ATTEMPTS, captureGen);
+      if (!connected) throw new Error('Daemon unavailable');
+      await sendStartMessage(ending.id, ending.position, false);
+      for (const packet of ending.packets) ws.send(packet);
+      ws.send(JSON.stringify({type:'stop',session_id:ending.id}));
+      if (stoppedSession === ending) stoppedSession = null;
+      return true;
+    } catch (error) {
+      if(stoppedSession===ending)chrome.runtime.sendMessage({type:'CAPTURE_ERROR',message:'Nie udało się przekazać końcówki audio. Pozostaje w buforze rozszerzenia; po przywróceniu połączenia ponów Stop albo pobierz WAV z popupu. Mikrofon można zatrzymać w menu aplikacji.'});
+      return false;
+    } finally { stopPromise = null; }
+  })();
+  return stopPromise;
 }
 
 // STOP_CAPTURE (meet-left / tab close / popup stop): full teardown — close the
 // socket and everything else.
-function stopCapture() {
-  if (!capturing) {
-    // Already stopped forwarding (WD_STOP keep-alive) — just close the socket.
-    cleanup();
-    chrome.runtime.sendMessage({ type: "CAPTURE_STOPPED" });
-    return;
-  }
-  captureGen++;  // invalidate any in-flight connect/reconnect callbacks
-  capturing = false;
-  reconnecting = false;
-  sessionStarting = false;
-
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    flushPcmBuffer();
-    ws.send(JSON.stringify({ type: "stop" }));
-  }
-
-  // Small delay to let the stop message arrive before closing. Generation-check
-  // (F8): a start within 500ms of this stop must not be torn down by the stale
-  // timer.
+async function stopCapture() {
+  const stopped = stopForwarding();
   const gen = captureGen;
-  setTimeout(() => {
-    if (gen !== captureGen) return;
-    cleanup();
-    chrome.runtime.sendMessage({ type: "CAPTURE_STOPPED" });
-  }, 500);
+  if (!await stopped) return; // do not discard the retained tail
+  if (gen !== captureGen) return;
+  cleanup();
+  chrome.runtime.sendMessage({ type: "CAPTURE_STOPPED" });
 }
 
 function cleanup() {
+  captureGen++; // also invalidate pending opens, before ws has been assigned
+  socketGen++;
   capturing = false;
   reconnecting = false;
   sessionStarting = false;
+  streamReady = startSent = false;
+  if (pendingStart) pendingStart();
   externalMode = false;
   pcmBuffer = [];
   pcmBufferedBytes = 0;
@@ -401,20 +542,30 @@ async function sendControl(obj) {
 // ("New browser connection — closing previous one") and the losing socket fires
 // a spurious "WebSocket closed unexpectedly" on the client.
 let connectPromise = null;
-function openSharedSocket(attempts, gen) {
-  if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve(true);
-  if (connectPromise) return connectPromise;
-  connectPromise = connectWebSocket(attempts, gen).finally(() => {
-    connectPromise = null;
-  });
-  return connectPromise;
+async function openSharedSocket(attempts, gen) {
+  const connectionGen = socketGen;
+  for (let left = attempts; left > 0 && connectionGen === socketGen; left--) {
+    if (ws && ws.readyState === WebSocket.OPEN) return true;
+    if (!connectPromise) {
+      connectPromise = connectWebSocket(left, gen).finally(() => {
+        connectPromise = null;
+      });
+      return connectPromise;
+    }
+    // Joined another caller's attempt (often a single reconnect try). Its
+    // failure costs this caller one attempt, not its whole budget.
+    if (await connectPromise) return true;
+    if (left > 1) await sleep(CONNECT_DELAY_MS);
+  }
+  return false;
 }
 
 async function connectWebSocket(attempts, gen) {
+  const connectionGen = socketGen;
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       const socket = await openWebSocket(WS_URL);
-      if (gen !== captureGen) {
+      if (connectionGen !== socketGen) {
         try { socket.close(); } catch {}
         return false;
       }
@@ -423,7 +574,7 @@ async function connectWebSocket(attempts, gen) {
       ws.onclose = handleUnexpectedClose;
       return true;
     } catch {
-      if (attempt < attempts - 1 && gen === captureGen) {
+      if (attempt < attempts - 1 && connectionGen === socketGen) {
         await sleep(CONNECT_DELAY_MS);
       }
     }
@@ -439,7 +590,19 @@ function handleServerMessage(event) {
     return; // binary or unparseable — ignore
   }
 
-  if (data.type === "chunk_transcribed") {
+  if (data.type === "started" && data.session_id === pendingStart?.sessionId) {
+    pendingStart();
+  } else if (data.type === "error" && data.code === "busy" && data.session_id === pendingStart?.sessionId) {
+    pendingStart.busy();
+  } else if (data.type === "audio_ack" && data.session_id === sessionId) {
+    while (pcmBuffer.length && new DataView(pcmBuffer[0]).getUint32(4, true) <= data.sequence) {
+      pcmBufferedBytes -= pcmBuffer.shift().byteLength;
+    }
+  } else if (data.type === "health") {
+    chrome.runtime.sendMessage({type: "HEALTH", sources: data.sources, paused: data.paused});
+  } else if (data.type === "capabilities") {
+    chrome.runtime.sendMessage({type: "CAPABILITIES", diarization: data.diarization});
+  } else if (data.type === "chunk_transcribed") {
     chrome.runtime.sendMessage({
       type: "CHUNK_TRANSCRIBED",
       text: data.text,
@@ -447,11 +610,22 @@ function handleServerMessage(event) {
       chunkIndex: data.chunk_index,
     });
   } else if (data.type === "status") {
+    // Any idle means the previous meeting is saved: a waiting start may go.
+    if (data.state === "idle") pendingStart?.retry();
+    // Snapshots answer settings reads; only the owning session can terminate
+    // capture. A delayed idle from another session is never authoritative.
+    const live = capturing || sessionStarting;
+    if (live && (data.snapshot || data.session_id !== sessionId)) return;
+    if (live && (data.state === "transcribing" || data.state === "idle")) stopForwarding(false);
+    // Otherwise the daemon's single meeting phase is relayed whatever session
+    // it belongs to, so background never keeps a stale "saving" state.
     chrome.runtime.sendMessage({
       type: "STATUS",
       state: data.state,
       elapsed: data.elapsed,
       chunks: data.chunks,
+      sessionId: data.session_id,
+      snapshot: !!data.snapshot,
     });
   } else if (data.type === "settings") {
     chrome.runtime.sendMessage({
@@ -460,6 +634,14 @@ function handleServerMessage(event) {
       devices: data.devices,
     });
   } else if (data.type === "error") {
+    if(data.code==='session_ended' && stoppedSession?.id===data.session_id){
+      recoveryTails.push(stoppedSession);stoppedSession=null;
+      // The rejected socket is closing. A new session must use a fresh one.
+      if(ws){ws.onclose=null;ws.close();ws=null;}
+      if(pendingStart)pendingStart.reject(new Error('Session ended; tail retained for local export'));
+      chrome.runtime.sendMessage({type:'RECOVERY_AVAILABLE',message:'Poprzednie spotkanie jest zamknięte. Końcówka audio czeka na lokalny eksport w popupie rozszerzenia. Możesz rozpocząć nowe nagranie.'});
+      return;
+    }
     console.warn("Daemon error:", data.message);
     chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message: data.message });
   }
@@ -468,14 +650,17 @@ function handleServerMessage(event) {
 
 function handleUnexpectedClose() {
   ws = null;
+  streamReady = false;
   if (capturing && !reconnecting) {
     console.warn("WebSocket closed during recording — reconnecting");
     reconnectLoop(captureGen);
   } else {
     // Benign: a daemon restart, or a superseded/idle control connection. The
     // channel reopens on demand (next settings fetch or record start), so this
-    // is not an error worth surfacing.
+    // is not an error worth surfacing. No status can arrive now, so background
+    // must not keep waiting for one (e.g. a "saving" state after a crash).
     console.debug("Control WebSocket closed — will reopen on demand");
+    chrome.runtime.sendMessage({ type: "CONTROL_CLOSED" });
   }
 }
 
@@ -485,12 +670,14 @@ async function reconnectLoop(gen) {
   const deadline = Date.now() + RECONNECT_WINDOW_MS;
 
   while (capturing && gen === captureGen && Date.now() < deadline) {
-    const connected = await connectWebSocket(1, gen);
+    const connected = await openSharedSocket(1, gen);
     if (connected && capturing && gen === captureGen) {
-      reconnecting = false;
       console.info("Reconnected to whisper-daemon — resuming stream");
-      sendStartMessage();
+      try { await sendStartMessage(); } catch { cleanup(); return; }
+      if (gen !== captureGen) return;
       flushPcmBuffer();
+      streamReady = true;
+      reconnecting = false;
       chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
       return;
     }
@@ -508,12 +695,21 @@ async function reconnectLoop(gen) {
   }
 }
 
-function openWebSocket(url) {
+async function openWebSocket(url) {
+  const pairing = await chrome.storage.local.get("pairingSecret");
+  if (!pairing.pairingSecret) throw new Error("Pair this extension in its popup first");
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(url);
+    const timer = setTimeout(() => { socket.close(); reject(new Error("Authentication timeout")); }, 6000);
     socket.binaryType = "arraybuffer";
-    socket.onopen = () => resolve(socket);
-    socket.onerror = (err) => reject(err);
+    socket.onopen = () => socket.send(JSON.stringify({type: "auth", secret: pairing.pairingSecret}));
+    socket.onmessage = event => {
+      let data;
+      try { data = JSON.parse(event.data); } catch { return; }
+      if (data.type === "authenticated") { clearTimeout(timer); resolve(socket); }
+    };
+    socket.onclose = () => { clearTimeout(timer); reject(new Error("Pairing rejected by daemon")); };
+    socket.onerror = err => { clearTimeout(timer); reject(err); };
   });
 }
 

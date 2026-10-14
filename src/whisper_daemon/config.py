@@ -91,6 +91,15 @@ class Settings:
     transcription_formats: list[str] = field(default_factory=lambda: ["txt"])
     transcription_output_dir: str = ""  # empty = same as input file
     transcription_diarize: bool = False  # diarize files transcribed from disk
+    dictation_language: str = "auto"
+    dictation_silence: float = .7  # 0 disables automatic silence stop
+    dictation_confirm: bool = False
+    dictation_vocabulary: list[str] = field(default_factory=list)
+    record_hotkey: str = "cmd+shift+space"
+    paste_hotkey: str = "cmd+shift+v"
+    cancel_hotkey: str = "cmd+shift+escape"
+    accept_hotkey: str = "cmd+shift+enter"
+    speak_hotkey: str = "cmd+shift+c"
     server_host: str = "127.0.0.1"
     server_port: int = 9876
 
@@ -117,6 +126,7 @@ def load_settings() -> Settings:
         rec = data.get("recording", {})
         trans = data.get("transcription", {})
         srv = data.get("server", {})
+        dic = data.get("dictation", {})
 
         return Settings(
             recording_dir=rec.get("dir", "~/Desktop"),
@@ -142,6 +152,15 @@ def load_settings() -> Settings:
             transcription_formats=_validate_formats(trans.get("formats", ["txt"])),
             transcription_output_dir=trans.get("output_dir", ""),
             transcription_diarize=trans.get("diarize", False),
+            dictation_language=_validate_language(dic.get("language", "auto")),
+            dictation_silence=max(0., min(30., float(dic.get("silence", .7)))),
+            dictation_confirm=bool(dic.get("confirm", False)),
+            dictation_vocabulary=[w[:100] for w in dic.get("vocabulary", []) if isinstance(w, str)][:100],
+            record_hotkey=_validate_shortcut(dic.get("record_hotkey"), "cmd+shift+space"),
+            paste_hotkey=_validate_shortcut(dic.get("paste_hotkey"), "cmd+shift+v"),
+            cancel_hotkey=_validate_shortcut(dic.get("cancel_hotkey"), "cmd+shift+escape"),
+            accept_hotkey=_validate_shortcut(dic.get("accept_hotkey"), "cmd+shift+enter"),
+            speak_hotkey=_validate_shortcut(dic.get("speak_hotkey"), "cmd+shift+c"),
             server_host=srv.get("host", "127.0.0.1"),
             server_port=srv.get("port", 9876),
         )
@@ -185,16 +204,39 @@ def save_settings(settings: Settings) -> None:
         "[tts]",
         f"language = {_toml_str(settings.tts_language)}",
         "",
+        "[dictation]",
+        f"language = {_toml_str(settings.dictation_language)}",
+        f"silence = {settings.dictation_silence}",
+        f'confirm = {"true" if settings.dictation_confirm else "false"}',
+        f"vocabulary = [{', '.join(_toml_str(w) for w in settings.dictation_vocabulary)}]",
+        *[f"{name}_hotkey = {_toml_str(getattr(settings, name + '_hotkey'))}" for name in ("record", "paste", "cancel", "accept", "speak")],
+        "",
         "[server]",
         f"host = {_toml_str(settings.server_host)}",
         f"port = {settings.server_port}",
         "",
     ]
 
-    CONFIG_FILE.write_text("\n".join(lines), encoding="utf-8")
+    import tempfile
+    import os
+    with tempfile.NamedTemporaryFile(mode="w", dir=CONFIG_DIR, delete=False, encoding="utf-8") as file:
+        file.write("\n".join(lines))
+        file.flush()
+        os.fsync(file.fileno())
+        temp = Path(file.name)
+    temp.replace(CONFIG_FILE)
     logger.info("Settings saved to %s", CONFIG_FILE)
 
 
 def _validate_formats(formats: list[str]) -> list[str]:
     valid = [f for f in formats if f in VALID_FORMATS]
     return valid if valid else ["txt"]
+
+
+def _validate_shortcut(value, default):
+    from whisper_daemon.shortcuts import parse_shortcut
+    try:
+        parse_shortcut(value)
+        return value.lower()
+    except (ValueError, AttributeError):
+        return default

@@ -50,7 +50,7 @@ def cli(ctx: click.Context) -> None:
 
 @cli.command()
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
-@click.option("--silence-timeout", default=0.7, type=float, help="Seconds of silence before auto-stop.")
+@click.option("--silence-timeout", default=None, type=click.FloatRange(0, 30), help="Override configured silence timeout (0 = manual stop).")
 @click.option("--no-menubar", is_flag=True, help="Run without menu bar icon.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def start(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> None:
@@ -74,8 +74,9 @@ def start(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -
     cmd = [
         sys.executable, "-m", "whisper_daemon", "run",
         "--model", model,
-        "--silence-timeout", str(silence_timeout),
     ]
+    if silence_timeout is not None:
+        cmd.extend(['--silence-timeout', str(silence_timeout)])
     if no_menubar:
         cmd.append("--no-menubar")
     if verbose:
@@ -209,7 +210,7 @@ def status() -> None:
 
 @cli.command()
 @click.option("--model", default="mlx-community/whisper-large-v3-turbo-q4", help="HuggingFace model repo.")
-@click.option("--silence-timeout", default=0.7, type=float, help="Seconds of silence before auto-stop.")
+@click.option("--silence-timeout", default=None, type=click.FloatRange(0, 30), help="Override configured silence timeout (0 = manual stop).")
 @click.option("--no-menubar", is_flag=True, help="Run without menu bar icon.")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> None:
@@ -240,9 +241,10 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     event_queue: queue.Queue[Event] = queue.Queue()
 
     logger.info("Initializing components...")
-    recorder = AudioRecorder(event_queue, silence_timeout=silence_timeout, device=device)
+    effective_silence = settings.dictation_silence if silence_timeout is None else silence_timeout
+    recorder = AudioRecorder(event_queue, silence_timeout=effective_silence, device=device)
     hotkey = HotkeyListener(event_queue)
-    daemon = Daemon(event_queue, recorder, model=model, settings=settings)
+    daemon = Daemon(event_queue, recorder, model=model, settings=settings, silence_timeout=silence_timeout)
 
     audio_system.install_topology_listener()
     supervisor.start()
@@ -260,7 +262,9 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
         supervisor.suspend(f"signal {signal.Signals(sig).name}")
         meeting_active = bool(
             menubar_delegate is not None
-            and getattr(menubar_delegate, "_meeting_active", False)
+            and (getattr(menubar_delegate, "_meeting_phase", "idle") != "idle"
+                 or (getattr(menubar_delegate, "_meeting_thread", None) is not None
+                     and menubar_delegate._meeting_thread.is_alive()))
         )
         # Long timeout while a meeting save may be running; exit code 0 so
         # launchd treats this as a requested stop and does not restart.
@@ -278,7 +282,7 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
 
     click.echo(f"whisper-daemon running — press Cmd+Shift+Space to record")
     click.echo(f"Model: {model}")
-    click.echo(f"Silence timeout: {silence_timeout}s")
+    click.echo(f"Silence timeout: {effective_silence}s")
     click.echo("Press Ctrl+C to quit")
 
     if no_menubar:
@@ -411,6 +415,7 @@ def transcribe(
     click.echo(f"Model: {model}")
     click.echo(f"Files: {len(files)}")
     click.echo(f"Formats: {', '.join(format_list)}")
+    diarize = _speaker_model_ready(diarize)
     if diarize:
         click.echo("Diarization: enabled")
     click.echo()
@@ -426,12 +431,8 @@ def transcribe(
             continue
 
         if diarize:
-            from whisper_daemon.diarizer import diarize_file as run_diarization
-            from whisper_daemon.diarize_merge import merge_speakers_with_transcript
-
             click.echo("  Diarizing speakers...")
-            speaker_segments = run_diarization(str(file_path), num_speakers=num_speakers)
-            result = merge_speakers_with_transcript(speaker_segments, result)
+            result = _with_optional_speakers(result, str(file_path), num_speakers)
             speaker_count = len(result.get("speakers", []))
             click.echo(f"  Found {speaker_count} speaker(s)")
 
@@ -455,7 +456,7 @@ def transcribe(
 @click.option("--language", default=None, help="Force language code (e.g. pl, en). Default: auto-detect.")
 @click.option("--chunk-silence", default=1.0, type=float, help="Seconds of silence to split chunks.")
 @click.option("--diarize", is_flag=True, help="Enable speaker diarization (requires HF_TOKEN).")
-@click.option("--diarize-mode", type=click.Choice(["batch", "realtime", "hybrid"]), default="hybrid", help="Diarization approach.")
+@click.option("--diarize-mode", type=click.Choice(["batch", "realtime", "hybrid"]), default="batch", help="Diarization approach.")
 @click.option("--num-speakers", type=int, default=None, help="Expected number of speakers (improves diarization).")
 @click.option("-v", "--verbose", is_flag=True, help="Enable debug logging.")
 def record(
@@ -479,7 +480,7 @@ def record(
     Examples:
       whisper-daemon record                                   # → recording.txt
       whisper-daemon record meeting.txt --format txt,srt
-      whisper-daemon record meeting.txt --diarize             # hybrid (default)
+      whisper-daemon record meeting.txt --diarize             # batch (default)
       whisper-daemon record meeting.txt --diarize --diarize-mode realtime
       whisper-daemon record meeting.txt --device "BlackHole 2ch"
       whisper-daemon record meeting.txt --device 3            # by device index
@@ -489,7 +490,7 @@ def record(
 
     from whisper_daemon.formats import FORMATTERS
     from whisper_daemon.meeting_recorder import AudioChunk, MeetingRecorder
-    from whisper_daemon.transcriber import preload_model, transcribe as transcribe_audio
+    from whisper_daemon.transcriber import preload_model, transcribe_full as transcribe_audio
 
     _setup_logging(verbose)
 
@@ -520,6 +521,7 @@ def record(
         click.echo(f"Diarization: {diarize_mode}")
     click.echo()
 
+    diarize = _speaker_model_ready(diarize)
     preload_model(model)
 
     # Set up realtime speaker tracker if needed
@@ -528,11 +530,20 @@ def record(
         from whisper_daemon.diarizer import SpeakerTracker
         speaker_tracker = SpeakerTracker()
 
-    chunk_queue: queue_mod.Queue[AudioChunk | None] = queue_mod.Queue()
-    recorder = MeetingRecorder(chunk_queue, device=resolved_device, chunk_silence=chunk_silence)
+    from whisper_daemon.recording_store import RecordingStore, DiskChunkQueue
+    import uuid
+    import time
+    capture_dir = output_dir / f"{output_stem}_audio_{uuid.uuid4().hex[:8]}"
+    store = RecordingStore(capture_dir)
+    chunk_queue = DiskChunkQueue(capture_dir)
+    recorder = MeetingRecorder(chunk_queue, device=resolved_device, chunk_silence=chunk_silence,
+                               raw_sink=lambda audio: store.append("mic", audio))
+    def transcribe_job(chunk):
+        result = transcribe_audio(chunk.audio, model, language)
+        chunk_queue.ack(chunk, result)
+        return result
 
     all_results: list[tuple[float, dict]] = []  # (start_time, result)
-    all_audio_chunks: list[tuple[float, np.ndarray]] = []  # for batch diarization
     chunk_count = 0
 
     click.echo("Recording... press Ctrl+C to stop.\n")
@@ -543,6 +554,11 @@ def record(
 
     try:
         while True:
+            if recorder.error: raise RuntimeError(str(recorder.error))
+            if futures:
+                _collect_results(futures, all_results)
+                time.sleep(.05)
+                continue
             try:
                 chunk = chunk_queue.get(timeout=0.5)
             except queue_mod.Empty:
@@ -555,15 +571,17 @@ def record(
             chunk_count += 1
             click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
 
-            if diarize:
-                all_audio_chunks.append((chunk.start_time, chunk.audio.copy()))
 
             if speaker_tracker is not None:
-                rt_segments = speaker_tracker.identify(chunk.audio, chunk.start_time)
-                if rt_segments:
-                    click.echo(f"    → Speaker {rt_segments[0].speaker + 1}")
+                try:
+                    rt_segments = speaker_tracker.identify(chunk.audio, chunk.start_time)
+                    if rt_segments: click.echo(f"    → Speaker {rt_segments[0].speaker + 1}")
+                except Exception as exc:
+                    click.echo(f"Live speaker recognition unavailable: {exc}. Using final batch labels.")
+                    speaker_tracker = None
+                    diarize_mode = 'batch'
 
-            future = pool.submit(transcribe_audio, chunk.audio, model)
+            future = pool.submit(transcribe_job, chunk)
             futures[future] = chunk.start_time
 
             _collect_results(futures, all_results)
@@ -571,6 +589,7 @@ def record(
     except KeyboardInterrupt:
         click.echo("\n\nStopping recording...")
         recorder.stop()
+        store.finish(duration=time.monotonic() - store.started_at)
 
         # Wait for in-flight transcription FIRST (avoid concurrent GPU access)
         _collect_results(futures, all_results, wait=True)
@@ -585,15 +604,19 @@ def record(
                 break
             chunk_count += 1
             click.echo(f"  Chunk {chunk_count}: {chunk.duration:.1f}s (at {chunk.start_time:.1f}s)")
-            if diarize:
-                all_audio_chunks.append((chunk.start_time, chunk.audio.copy()))
             if speaker_tracker is not None:
-                speaker_tracker.identify(chunk.audio, chunk.start_time)
-            result_text = transcribe_audio(chunk.audio, model)
-            if result_text:
-                all_results.append((chunk.start_time, {"text": result_text, "segments": [], "language": ""}))
+                try: speaker_tracker.identify(chunk.audio, chunk.start_time)
+                except Exception:
+                    speaker_tracker = None
+                    diarize_mode = 'batch'
+            result = transcribe_job(chunk)
+            if result.get("text"):
+                all_results.append((chunk.start_time, result))
     finally:
+        recorder.abort()
+        if store.files: store.finish(state="interrupted")
         pool.shutdown(wait=False)
+        click.echo(f"Continuous audio: {capture_dir}")
 
     if not all_results:
         click.echo("No audio transcribed.")
@@ -605,12 +628,8 @@ def record(
         from whisper_daemon.diarize_merge import merge_speakers_with_transcript
 
         if diarize_mode in ("batch", "hybrid"):
-            from whisper_daemon.diarizer import diarize_batch
-
-            full_audio = _concatenate_audio_chunks(all_audio_chunks)
-            click.echo(f"\nDiarizing {len(full_audio) / 16000:.1f}s of audio (batch correction)...")
-            batch_segments = diarize_batch(full_audio, num_speakers=num_speakers)
-            final_result = merge_speakers_with_transcript(batch_segments, merged)
+            click.echo("\nDiarizing continuous audio...")
+            final_result = _with_optional_speakers(merged, str(capture_dir / "recording.wav"), num_speakers)
             speaker_count = len(final_result.get("speakers", []))
             click.echo(f"Found {speaker_count} speaker(s)")
 
@@ -642,6 +661,110 @@ def record(
 
 
 
+@cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option("--transcribe", "redo_transcript", is_flag=True, help="Rebuild transcript from the recovered continuous audio.")
+@click.option("--language", default=None)
+def recover(directory, redo_transcript, language):
+    """Recover source WAVs after a crash; never changes original raw samples."""
+    from whisper_daemon.recording_store import RecordingStore, atomic_json
+    path = Path(directory)
+    metadata = RecordingStore.recover(path)
+    click.echo(f"Recovered {metadata['duration']:.2f} seconds in {path}")
+    if redo_transcript:
+        from whisper_daemon.transcriber import transcribe_file
+        from whisper_daemon.formats import FORMATTERS
+        result = transcribe_file(str(path / "recording.wav"), language=language)
+        atomic_json(path / "transcript_recovered.json", result)
+        for fmt in ("txt", "srt"):
+            (path / f"transcript_recovered.{fmt}").write_text(FORMATTERS[fmt](result), encoding="utf-8")
+
+
+@cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option('--port', type=click.IntRange(0, 65535), default=0)
+@click.option('--no-open', is_flag=True)
+def review(directory, port, no_open):
+    """Open a local meeting: search, play, name speakers and save notes/tasks."""
+    import webbrowser
+    from whisper_daemon.meeting_review import ReviewServer
+    server = ReviewServer(directory, port)
+    click.echo(server.url)
+    if not no_open: webbrowser.open(server.url)
+    try: server.serve_forever()
+    except KeyboardInterrupt: pass
+    finally: server.server_close()
+
+
+@cli.command()
+@click.argument("extension_id")
+def pair(extension_id):
+    """Authorize one extension ID; paste the printed key into its popup."""
+    from whisper_daemon.pairing import pair as make_pair
+    try:
+        pairing = make_pair(extension_id)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo("Paste this key into the extension popup (keep it private):")
+    click.echo(pairing['secret'])
+
+
+@cli.group()
+def models():
+    """Check offline readiness or explicitly download model dependencies."""
+
+
+@models.command('check')
+def check_models():
+    from whisper_daemon.model_policy import local_model, diarization_status
+    from whisper_daemon.transcriber import DEFAULT_MODEL
+    from whisper_daemon.vad import SileroVAD
+    try:
+        SileroVAD()
+        click.echo('Silero VAD: cached locally and loadable')
+    except Exception as exc:
+        click.echo(str(exc))
+    try:
+        local_model(DEFAULT_MODEL)
+        click.echo('Whisper: cached locally')
+    except RuntimeError as exc:
+        click.echo(str(exc))
+    status = diarization_status()
+    click.echo(status['message'])
+    click.echo('Inference offline; pyannote/HF telemetry disabled')
+
+
+@models.command('prepare')
+@click.option('--diarization', is_flag=True)
+def prepare_models(diarization):
+    """Download models. Diarization needs authorized Hugging Face access."""
+    env = dict(os.environ, WHISPER_PREPARE_MODELS='1', HF_HUB_OFFLINE='0', TRANSFORMERS_OFFLINE='0')
+    code = ('from whisper_daemon.diarizer import _get_pipeline; _get_pipeline()' if diarization else
+            'from whisper_daemon.vad import SileroVAD; SileroVAD(); from whisper_daemon.transcriber import preload_model; preload_model()')
+    result = subprocess.run([sys.executable, '-c', code], env=env)
+    if result.returncode:
+        raise click.ClickException('Model preparation failed. For gated models, grant access on Hugging Face and sign in with hf auth login, then retry.')
+    click.echo('Model prepared. Normal recording remains offline.')
+
+
+def _speaker_model_ready(requested: bool) -> bool:
+    if not requested: return False
+    from whisper_daemon.model_policy import diarization_status
+    status = diarization_status()
+    click.echo(status['message'])
+    return status['available']
+
+
+def _with_optional_speakers(result: dict, audio_path: str, num_speakers: int | None) -> dict:
+    try:
+        from whisper_daemon.diarizer import diarize_file
+        from whisper_daemon.diarize_merge import merge_speakers_with_transcript
+        return merge_speakers_with_transcript(diarize_file(audio_path, num_speakers=num_speakers), result)
+    except Exception as exc:
+        click.echo(f'Speaker recognition unavailable: {exc}. Full transcript preserved without automatic labels.')
+        return result
+
+
 def _collect_results(
     futures: dict,
     all_results: list[tuple[float, dict]],
@@ -657,9 +780,9 @@ def _collect_results(
     for future in done:
         start_time = futures.pop(future)
         try:
-            text = future.result()
-            if text:
-                all_results.append((start_time, {"text": text, "segments": [], "language": ""}))
+            result = future.result()
+            if result.get("text"):
+                all_results.append((start_time, result))
         except Exception as exc:
             logging.getLogger(__name__).error("Chunk transcription failed: %s", exc)
 

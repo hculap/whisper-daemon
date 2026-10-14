@@ -16,13 +16,15 @@ from collections.abc import Callable
 import websockets
 import websockets.asyncio.server
 
-from .bridge_protocol import is_allowed_origin
+from .bridge_protocol import is_allowed_origin, parse_client_message, validate_client_message, AudioSequence
+from .pairing import load_pairing
+import secrets
 
 logger = logging.getLogger(__name__)
 
 # Control message types routed to the on_control callback instead of the
 # start/stop/ping audio-session handlers.
-_CONTROL_TYPES = frozenset({"get_settings", "set_settings", "stop_meeting"})
+_CONTROL_TYPES = frozenset({"get_settings", "set_settings", "stop_meeting", "pause_meeting"})
 
 
 class BrowserAudioBridge:
@@ -32,11 +34,18 @@ class BrowserAudioBridge:
         self,
         host: str,
         port: int,
-        on_connect: Callable[[str, str], None],
-        on_audio: Callable[[bytes], None],
-        on_disconnect: Callable[[], None],
+        on_connect: Callable[[str, str, str, float], bool | None],
+        on_audio: Callable[[bytes, int], None],
+        on_disconnect: Callable[[str], None],
         on_control: Callable[[dict], None] | None = None,
+        pairing_path=None,
     ) -> None:
+        if host not in {"127.0.0.1", "localhost", "::1"}:
+            raise ValueError("The audio bridge must bind to loopback")
+        self._pairing_path = pairing_path
+        self._session_id = None
+        self._audio_sequence = AudioSequence()
+        self._closed_sessions = set()
         self._host = host
         self._port = port
         self._on_connect = on_connect
@@ -76,6 +85,10 @@ class BrowserAudioBridge:
     @property
     def connected(self) -> bool:
         return self._ws is not None
+
+    @property
+    def session_id(self):
+        return self._session_id
 
     def _schedule_send(self, msg: str) -> None:
         """Schedule a send on the bridge loop without ever raising.
@@ -149,6 +162,9 @@ class BrowserAudioBridge:
             self._host,
             self._port,
             process_request=self._process_request,
+            max_size=65552,
+            max_queue=16,
+            compression=None,
             ping_interval=10,
             ping_timeout=15,
             close_timeout=5,
@@ -164,7 +180,7 @@ class BrowserAudioBridge:
         The in-handler _origin_allowed check remains as defense in depth.
         """
         origin = request.headers.get("Origin")
-        if is_allowed_origin(origin):
+        if is_allowed_origin(origin, load_pairing(self._pairing_path).get("extension_id")):
             return None
         logger.warning("Rejecting handshake from disallowed origin: %r", origin)
         return connection.respond(http.HTTPStatus.FORBIDDEN, "forbidden origin\n")
@@ -182,7 +198,7 @@ class BrowserAudioBridge:
             logger.debug("Could not read Origin header", exc_info=True)
             origin = None
 
-        if is_allowed_origin(origin):
+        if is_allowed_origin(origin, load_pairing(self._pairing_path).get("extension_id")):
             return True
 
         logger.warning("Rejecting connection from disallowed origin: %r", origin)
@@ -192,73 +208,110 @@ class BrowserAudioBridge:
             logger.debug("Error closing rejected connection", exc_info=True)
         return False
 
-    async def _handler(self, ws: websockets.asyncio.server.ServerConnection) -> None:
-        # Reject any non-extension origin (websites, missing header) BEFORE
-        # registering this socket as the active connection, so a malicious web
-        # page cannot drive the daemon. The real extension's Origin is
-        # chrome-extension://<id> and passes.
-        if not await self._origin_allowed(ws):
+    @staticmethod
+    async def _reply(ws, payload: dict) -> None:
+        """Answer the client without letting its close abort the receive loop.
+
+        A client may send its last packets and 'stop' and close at once. Those
+        frames are already queued; a reply failing because the peer is gone
+        must not skip them, or a final stop is lost and recording continues.
+        """
+        try:
+            await ws.send(json.dumps(payload))
+        except websockets.exceptions.ConnectionClosed:
+            pass
+
+    def end_session(self):
+        """Called when native controls finish a meeting, preventing reconnect restart."""
+        if self._session_id:
+            self._closed_sessions.add(self._session_id)
+            if len(self._closed_sessions) > 100: self._closed_sessions.pop()
+        self._session_id = None
+
+    async def _handler(self, ws) -> None:
+        if not await self._origin_allowed(ws): return
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=5)
+            auth = parse_client_message(raw) if isinstance(raw, str) else None
+            pairing = load_pairing(self._pairing_path)
+            if (not auth or auth.get("type") != "auth" or not isinstance(auth.get("secret"), str)
+                    or not pairing.get("secret")
+                    or not secrets.compare_digest(auth["secret"], pairing["secret"])):
+                await ws.close(1008, "Pair this extension using whisper-daemon pair")
+                return
+        except (TimeoutError, websockets.exceptions.ConnectionClosed):
+            await ws.close(1008, "Authentication required")
             return
-
         old = self._ws
-        if old is not None:
-            # Take over: the previous connection is likely a zombie (MV3
-            # service worker died, network blip) — a live extension only
-            # opens a new socket when the old one is gone. Rejecting the
-            # newcomer would lock the extension out until ping timeout.
-            logger.warning("New browser connection — closing previous one")
-            self._ws = None
-            try:
-                await old.close()
-            except Exception:
-                logger.debug("Error closing previous connection", exc_info=True)
-
         self._ws = ws
-        logger.info("Browser extension connected")
-
+        if old is not None: await old.close()
+        await ws.send(json.dumps({"type": "authenticated"}))
+        attached_session = None
+        error_code, error_session = 'invalid_message', None
         try:
             async for message in ws:
                 if isinstance(message, bytes):
-                    self._on_audio(message)
+                    if not attached_session or attached_session != self._session_id:
+                        raise ValueError("Audio outside an active session")
+                    accepted = self._audio_sequence.accept(message)
+                    if accepted:
+                        audio, gap = accepted
+                        position = self._audio_sequence.frames - len(audio) // 4
+                        if gap:
+                            if self._on_control:
+                                self._on_control({"type": "audio_gap", "samples": gap,
+                                                  "end": (self._audio_sequence.frames - len(audio) // 4) / 16000})
+                        # Preserve capture position all the way to disk. The
+                        # source store inserts/marks gaps without transcribing
+                        # fabricated silence or using reconnect arrival time.
+                        self._on_audio(audio, position)
+                    await self._reply(ws, {"type": "audio_ack", "session_id": self._session_id,
+                                           "sequence": self._audio_sequence.sequence})
                     continue
-
-                try:
-                    data = json.loads(message)
-                except json.JSONDecodeError:
-                    continue
-
-                msg_type = data.get("type")
-
-                if msg_type == "start":
-                    self._on_connect(
-                        data.get("meeting_title", ""),
-                        data.get("meeting_url", ""),
-                    )
-
-                elif msg_type == "stop":
-                    self._on_disconnect()
-
-                elif msg_type == "ping":
-                    await ws.send(json.dumps({"type": "pong"}))
-
-                elif msg_type in _CONTROL_TYPES:
-                    if self._on_control is not None:
-                        try:
-                            self._on_control(data)
-                        except Exception:
-                            logger.exception("on_control handler failed")
-
+                if len(message) > 16384: raise ValueError("Control frame too large")
+                data = validate_client_message(parse_client_message(message))
+                kind = data['type']
+                if kind == 'start':
+                    session = data['session_id']
+                    if session in self._closed_sessions:
+                        error_code, error_session = 'session_ended', session
+                        raise ValueError("This meeting has ended; start a new capture")
+                    if self._session_id and self._session_id != session:
+                        raise ValueError("Another meeting owns the audio bridge")
+                    if self._session_id is None:
+                        self._session_id = session
+                        accepted = self._on_connect(data.get('meeting_title', ''), data.get('meeting_url', ''),
+                            session, time.monotonic() - data.get('audio_elapsed', 0))
+                        if accepted is False:
+                            # Another meeting is still being saved. This session was
+                            # never owned: it is not closed, and the socket stays open
+                            # so the client hears the terminal idle and starts again.
+                            self._session_id = None
+                            await self._reply(ws, {'type': 'error', 'code': 'busy', 'session_id': session,
+                                                   'message': 'Previous recording is still being saved'})
+                            continue
+                        self._audio_sequence = AudioSequence()
+                    attached_session = session
+                    await self._reply(ws, {'type': 'started', 'session_id': session})
+                elif kind == 'stop':
+                    if data['session_id'] == self._session_id:
+                        self.end_session()
+                        self._on_disconnect(data['session_id'])
+                elif kind == 'ping':
+                    await self._reply(ws, {'type': 'pong'})
+                elif kind in _CONTROL_TYPES and self._on_control:
+                    self._on_control(data)
+        except ValueError as exc:
+            await ws.send(json.dumps({'type': 'error', 'message': str(exc), 'code': error_code, 'session_id': error_session}))
+            await ws.close(1008, str(exc)[:100])
         except websockets.exceptions.ConnectionClosed:
-            logger.info("Browser extension disconnected")
+            pass
         except Exception:
-            logger.exception("Browser bridge handler error")
+            logger.exception('Browser audio failed')
         finally:
-            # If another connection already took over, this socket's death
-            # is not a session end — don't clobber the new connection or
-            # stop the meeting it continues.
             if self._ws is ws:
                 self._ws = None
-                self._on_disconnect()
-                logger.info("Browser extension connection closed")
-            else:
-                logger.info("Superseded browser connection closed")
+                # Keep the recording and sample sequence alive on transport
+                # loss. A reconnect resumes the same session; native Stop
+                # remains available. Never start a second meeting implicitly.
+                logger.info('Browser disconnected; microphone recording continues')

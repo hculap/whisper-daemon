@@ -294,14 +294,8 @@
       ${coldNote("screenshot_displays")}
       ${toggleRow("cc", "Napisy na żywo", "live_captions", s.live_captions, false)}
       ${toggleRow("diar", "Diaryzacja (kto mówi)", "diarize", s.diarize, true)}
-      <div class="wd-row"><span class="wd-sub-label">Tryb</span>
-        <select class="wd-sel wd-sel-inline" data-key="diarize_mode">
-          <option value="hybrid" ${s.diarize_mode === "hybrid" ? "selected" : ""}>hybrid</option>
-          <option value="batch" ${s.diarize_mode === "batch" ? "selected" : ""}>batch</option>
-          <option value="realtime" ${s.diarize_mode === "realtime" ? "selected" : ""}>realtime</option>
-        </select>
-      </div>
-      ${coldNote("diarize_mode")}
+      <div class="wd-row"><span class="wd-sub-label">Rozpoznawanie po zakończeniu nagrania</span></div>
+
 
       <div class="wd-div"></div>
 
@@ -390,6 +384,25 @@
     if (popEl && currentSettings) render(currentSettings);
   }
 
+  function setHealth(sources, paused) {
+    if (!popEl) return;
+    let health = popEl.querySelector("[data-health]");
+    if (!health) {
+      health = document.createElement("div");
+      health.dataset.health = "true";
+      health.setAttribute("role", "status");
+      health.style.cssText = "padding:12px;font-size:12px";
+      popEl.appendChild(health);
+      const pause = document.createElement("button");
+      pause.textContent = "Pauza / wznów";
+      pause.onclick = () => chrome.runtime.sendMessage({type:"WD_PAUSE_MEETING"});
+      popEl.appendChild(pause);
+    }
+    health.textContent = Object.entries(sources).map(([source, value]) =>
+      `${source === "mic" ? "Mikrofon" : "Uczestnicy"}: ${value.age > 3 ? "brak sygnału" : value.rms > .005 ? "mowa" : "cisza"}`
+    ).join(" · ") + (paused ? " · PAUZA" : "");
+  }
+
   WD.panel = {
     init(callbacks) {
       callbacks = callbacks || {};
@@ -403,6 +416,7 @@
     hide,
     toggle,
     setRecording,
+    setHealth,
     teardown,
   };
 })();

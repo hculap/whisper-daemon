@@ -99,10 +99,23 @@
     <h1>Whisper Daemon</h1>
   </div>
 
+  <details><summary>Pair with this computer</summary>
+    <p id="pairCommand" style="margin:8px 0;overflow-wrap:anywhere"></p>
+    <label>Pairing key <input id="pairSecret" type="password" autocomplete="off"></label>
+    <button id="savePair">Save key</button><p id="pairStatus" role="status"></p>
+  </details>
+  <div id="sourceHealth" role="status"></div>
+  <button id="pauseBtn" class="btn">Pause / Resume meeting</button>
+  <div id="capabilityStatus" role="status"></div>
   <div id="meetingInfo" class="meeting-info"></div>
   <div id="timer" class="timer">00:00</div>
 
   <button id="actionBtn" class="btn btn-record">Record This Tab</button>
+  <div id="recovery" hidden>
+    <p>Niedostarczona końcówka audio pozostaje w pamięci rozszerzenia. Pobierz ją przed zamknięciem Chrome. Nazwa pliku zawiera jej czas w spotkaniu.</p>
+    <button id="exportRecovery" class="btn">Pobierz końcówkę WAV</button>
+    <button id="clearRecovery" class="btn" disabled>Plik sprawdzony — usuń kopię z bufora</button>
+  </div>
 
   <div id="transcript" class="transcript"></div>
 

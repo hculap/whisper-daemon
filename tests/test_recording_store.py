@@ -160,6 +160,15 @@ def test_one_sample_tail_finishes_and_trailing_loss_is_reported(tmp_path, monkey
                                     'end':21., 'reason':'missing audio'}
 
 
+def test_delivery_latency_at_the_end_is_not_reported_as_missing_audio(tmp_path):
+    store = RecordingStore(tmp_path, clock=lambda: 0, sources=('mic', 'browser'))
+    store.append('mic', np.zeros(160000, dtype=np.float32), at=0)
+    store.append('browser', np.zeros(159000, dtype=np.float32), at=0)
+    store.finish(duration=10.06)  # wall-clock stop lands after the last packets
+    assert store.meta['gaps'] == []
+    assert store.meta['duration'] == 10.06
+
+
 def test_callback_liveness_detects_dead_mic_even_when_paused(monkeypatch, tmp_path):
     store = RecordingStore(tmp_path, clock=lambda: 0)
     recorder, _ = browser_recorder(store, monkeypatch)

@@ -154,6 +154,11 @@ python scripts/verify_110_minutes.py
 python scripts/verify_speech_e2e.py  # macOS voices + cached Whisper/Silero, offline
 ```
 
+The Node suite includes `daemon-e2e.test.js`: the real background and offscreen
+scripts over real WebSockets against `tests/daemon_harness.py`, which runs the real
+bridge and meeting pipeline headless (devices, VAD and Whisper stubbed). It needs
+the project `.venv` (or `WD_E2E_PYTHON`).
+
 The 110-minute test feeds both real recorder/storage pipelines at accelerated speed
 and checks exact sample counts, silent intervals, WAV lengths and bounded memory.
 It is separate from a 110-minute wall-clock microphone/Meet soak test.

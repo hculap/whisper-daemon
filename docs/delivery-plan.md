@@ -103,3 +103,30 @@ Packaging: offline wheel build includes all three local review assets. The
 production daemon and installed Chrome extension were not restarted or upgraded.
 No actual 110-minute call, installed-extension tabCapture, permission-dialog flow,
 or authorized diarization inference was claimed by these checks.
+
+### M7 review corrections and end-to-end harness
+
+`tests/daemon_harness.py` runs the real bridge (thread, loop, pairing, origin
+check) and the real menubar connect/stage/stop/status/meeting-worker/store code;
+only AppKit UI, devices, VAD and Whisper are stubbed, with configurable main-thread
+latency, transcription and finalization time. `extension/test/daemon-e2e.test.js`
+loads the real `background.js` + `offscreen.js` on a Chrome-like message bus and
+drives them over real WebSockets against it, including daemon kill/restart and
+refused connections. Every row below failed before its fix.
+
+| Finding | Resolution / evidence |
+| --- | --- |
+| Settings snapshot or saved recording released the joined Meet tab; leaving the call then kept the socket open | Joined tab survives idle statuses; snapshots never override a start; native recordings use a flag. e2e: socket closes and `WD_MEET_LEFT` arrives after both |
+| Start after a retained tail was refused for 10 s; a busy refusal closed the session and socket | Daemon answers `busy` without closing the session or socket; extension keeps buffering and re-sends `start` on idle/retry, keeping audio if it must give up. e2e: second meeting saved with all buffered audio |
+| Restarted daemon dropped a recovered tail (stop handled before the main thread started it) | Stopped-before-start session with staged audio is saved browser-only, no devices; later starts are `busy` while one is pending. e2e with 200 ms main-thread latency + pytest |
+| Unexported tail counted against the live buffer | Live budget covers live audio only. e2e: 1.9 s tail, 2 s budget, next recording unaffected |
+| Background stuck in "saving" | No local refusal; closed control socket and any idle release it. e2e: daemon killed while saving |
+| Late status cancelled `stopCapture` teardown; superseded popup start left STARTING | Generation bumps only for live sessions; every start settles background. Deterministic VM reproductions |
+| Stop during reconnect gave up after one shared attempt | Joining another caller's attempt costs one try. e2e: leaving during a refused reconnect delivers the tail |
+| Final `stop` lost when the client closed immediately (reply raised on the closed peer) | Replies tolerate a closed peer; queued frames are still handled. e2e failed 4/5 before, 0/5 after; pytest |
+| Phantom trailing gaps on healthy recordings | Trailing shortfall up to 0.25 s is latency, not missing audio. e2e: 1.5 s real-time recording, `gaps == []` |
+
+Script conventions (shebang, logging, type hints) were corrected. Final run: 158
+Python and 53 Node tests (8 e2e scenarios plus the mid-recording leave) pass three
+consecutive times; `verify_110_minutes.py` 6,600 s per source, no gaps, 19,431,424-byte
+RSS growth, 60.9 s; `verify_speech_e2e.py` preserves both "42" sentences in 10.6 s.

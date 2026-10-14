@@ -62,3 +62,26 @@ def test_review_http_range_access_and_persisted_edit(tmp_path):
         else: raise AssertionError('Cross-origin mutation accepted')
     finally:
         server.shutdown(); server.server_close()
+
+
+def test_review_edit_of_a_ready_meeting_publishes_the_next_revision(tmp_path):
+    import hashlib
+    from whisper_daemon.meeting_manifest import begin_meeting, finalize_meeting
+    make_transcript(tmp_path)
+    prepare_review(tmp_path)
+    first = finalize_meeting(tmp_path, begin_meeting(tmp_path, 'CRM'), None, [])
+    edit = {'names': {'1': 'Anna'}}
+    save_review(tmp_path, edit)
+    second = json.loads((tmp_path / 'meeting.ready.json').read_text())
+    assert second['revision'] == 2 and second['meeting_id'] == first['meeting_id']
+    assert 'transcript_original.json' in {f['path'] for f in second['files']}
+    for entry in second['files']:
+        assert entry['sha256'] == hashlib.sha256((tmp_path / entry['path']).read_bytes()).hexdigest()
+    save_review(tmp_path, edit)  # nothing changed: no new revision
+    assert json.loads((tmp_path / 'meeting.ready.json').read_text())['revision'] == 2
+
+
+def test_review_edit_never_marks_an_unfinished_meeting_ready(tmp_path):
+    make_transcript(tmp_path)
+    save_review(tmp_path, {'names': {'1': 'Anna'}})
+    assert not (tmp_path / 'meeting.ready.json').exists()

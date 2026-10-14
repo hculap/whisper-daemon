@@ -159,7 +159,9 @@ file. Raw `*.f32` sources and `chunks/` are local recovery material and are not
 listed. An empty transcript, a failed chunk or a failed recording writes
 `meeting.failed.json` instead; a killed process leaves only
 `meeting.in-progress.json`. Neither ever gets the ready marker. A published
-revision is never rewritten; each recording uses a new folder.
+revision is never rewritten; each recording uses a new folder. Saving edits in
+the meeting review changes published files, so it publishes the next revision
+with fresh hashes, which Orbit ingests and analyzes again.
 
 Orbit reads `<synced root>/*/meeting.ready.json`, so every meeting must be a direct
 child of the synced folder: point the menu-bar recording directory at it. CLI

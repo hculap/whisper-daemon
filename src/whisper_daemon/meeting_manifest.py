@@ -45,10 +45,10 @@ def local_timezone():
     return 'UTC'
 
 
-# Never published: lifecycle markers, the live partial, and the recovery-only
+# Never published: the markers themselves, the live partial, and the recovery-only
 # internals of RecordingStore/DiskChunkQueue (raw float32 sources and the chunk
 # spool). The aligned WAV exports are the published audio.
-UNPUBLISHED_NAMES = ('meeting.in-progress.json', 'meeting.failed.json', 'transcript_live.txt')
+UNPUBLISHED_NAMES = ('meeting.ready.json', 'meeting.in-progress.json', 'meeting.failed.json', 'transcript_live.txt')
 UNPUBLISHED_SUFFIXES = ('.tmp', '.f32')
 UNPUBLISHED_DIRS = ('chunks',)
 
@@ -95,6 +95,24 @@ def finalize_meeting(folder: Path, identity, result, errors):
     atomic_json(folder / 'meeting.ready.json', manifest)  # last published file
     (folder / 'meeting.in-progress.json').unlink(missing_ok=True)
     (folder / 'meeting.failed.json').unlink(missing_ok=True)
+    return manifest
+
+
+def publish_revision(folder: Path):
+    """Republish a ready meeting whose files changed (review edits) as the next revision.
+
+    A published revision is immutable, so a changed file needs a new one. A no-op
+    for meetings that were never ready and for saves that changed nothing.
+    """
+    marker = folder / 'meeting.ready.json'
+    if not marker.exists():
+        return None
+    current = json.loads(marker.read_text(encoding='utf-8'))
+    files = _published_files(folder)
+    if files == current['files']:
+        return current
+    manifest = dict(current, revision=current['revision'] + 1, files=files)
+    atomic_json(marker, manifest)
     return manifest
 
 

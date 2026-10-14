@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from whisper_daemon.formats import FORMATTERS
+from whisper_daemon.meeting_manifest import publish_revision
 from whisper_daemon.recording_store import atomic_json
 
 
@@ -90,6 +91,7 @@ def save_review(directory, changes):
     (path / 'notes.txt').write_text(summary + '\n\n' + '\n'.join(
         f"[{'x' if t['done'] else ' '}] {t['text']} | {t['owner']} | {t['due']} | {t['start']:.1f}s"
         for t in clean_tasks), encoding='utf-8')
+    publish_revision(path)  # edits changed published files: Orbit needs a new revision
     return prepare_review(path)
 
 

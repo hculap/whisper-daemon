@@ -208,6 +208,19 @@ class BrowserAudioBridge:
             logger.debug("Error closing rejected connection", exc_info=True)
         return False
 
+    @staticmethod
+    async def _reply(ws, payload: dict) -> None:
+        """Answer the client without letting its close abort the receive loop.
+
+        A client may send its last packets and 'stop' and close at once. Those
+        frames are already queued; a reply failing because the peer is gone
+        must not skip them, or a final stop is lost and recording continues.
+        """
+        try:
+            await ws.send(json.dumps(payload))
+        except websockets.exceptions.ConnectionClosed:
+            pass
+
     def end_session(self):
         """Called when native controls finish a meeting, preventing reconnect restart."""
         if self._session_id:
@@ -252,8 +265,8 @@ class BrowserAudioBridge:
                         # source store inserts/marks gaps without transcribing
                         # fabricated silence or using reconnect arrival time.
                         self._on_audio(audio, position)
-                    await ws.send(json.dumps({"type": "audio_ack", "session_id": self._session_id,
-                                               "sequence": self._audio_sequence.sequence}))
+                    await self._reply(ws, {"type": "audio_ack", "session_id": self._session_id,
+                                           "sequence": self._audio_sequence.sequence})
                     continue
                 if len(message) > 16384: raise ValueError("Control frame too large")
                 data = validate_client_message(parse_client_message(message))
@@ -270,17 +283,22 @@ class BrowserAudioBridge:
                         accepted = self._on_connect(data.get('meeting_title', ''), data.get('meeting_url', ''),
                             session, time.monotonic() - data.get('audio_elapsed', 0))
                         if accepted is False:
-                            self.end_session()
-                            raise ValueError("Meeting is still being finalized")
+                            # Another meeting is still being saved. This session was
+                            # never owned: it is not closed, and the socket stays open
+                            # so the client hears the terminal idle and starts again.
+                            self._session_id = None
+                            await self._reply(ws, {'type': 'error', 'code': 'busy', 'session_id': session,
+                                                   'message': 'Previous recording is still being saved'})
+                            continue
                         self._audio_sequence = AudioSequence()
                     attached_session = session
-                    await ws.send(json.dumps({'type': 'started', 'session_id': session}))
+                    await self._reply(ws, {'type': 'started', 'session_id': session})
                 elif kind == 'stop':
                     if data['session_id'] == self._session_id:
                         self.end_session()
                         self._on_disconnect(data['session_id'])
                 elif kind == 'ping':
-                    await ws.send(json.dumps({'type': 'pong'}))
+                    await self._reply(ws, {'type': 'pong'})
                 elif kind in _CONTROL_TYPES and self._on_control:
                     self._on_control(data)
         except ValueError as exc:

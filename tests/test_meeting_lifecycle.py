@@ -48,13 +48,32 @@ def test_cancel_before_cocoa_dispatch_cannot_start_microphone():
     queue, starts = [], []
     bridge=SimpleNamespace(session_id='session-12345678')
     obj=SimpleNamespace(_meeting_phase='idle',_meeting_thread=None,_browser_bridge=bridge,
-        _browser_audio_lock=threading.RLock(),
+        _browser_audio_lock=threading.RLock(),_browser_start_pending=None,
         _start_meeting=lambda *args:starts.append(args))
     helper=SimpleNamespace(callAfter=lambda fn,*args:queue.append(lambda:fn(*args)))
     method('_on_browser_connect',AppHelper=helper)(obj,'test','',bridge.session_id,100.)
     bridge.session_id=None
     for callback in queue: callback()
     assert not starts
+
+
+def test_stop_before_cocoa_dispatch_saves_staged_audio_without_devices():
+    import threading
+    queue, calls = [], []
+    bridge=SimpleNamespace(session_id='session-12345678')
+    obj=SimpleNamespace(_meeting_phase='idle',_meeting_thread=None,_browser_bridge=bridge,
+        _browser_audio_lock=threading.RLock(),_browser_start_pending=None,
+        _start_meeting=lambda *args,**kwargs:calls.append(('start',args,kwargs)),
+        _stop_meeting=lambda:calls.append(('stop',)))
+    helper=SimpleNamespace(callAfter=lambda fn,*args:queue.append(lambda:fn(*args)))
+    connect=method('_on_browser_connect',AppHelper=helper)
+    connect(obj,'test','',bridge.session_id,100.)
+    obj._browser_prebuffer=[(b'tail',0)]  # a recovered tail: start, PCM, stop
+    bridge.session_id=None
+    assert connect(obj,'next','','session-87654321',101.) is False  # the tail owns the staging
+    for callback in queue: callback()
+    assert calls == [('start',(True,'test',100.,'session-12345678'),{'browser_only':True}),('stop',)]
+    assert obj._browser_start_pending is None
 
 
 def test_stop_during_worker_startup_preserves_acknowledged_pcm():

@@ -722,6 +722,24 @@ def review(directory, port, no_open):
 
 
 @cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option("--num-speakers", type=int, default=None, help="Expected number of speakers (improves diarization).")
+@click.option("--force", is_flag=True, help="Replace speaker labels the transcript already has.")
+def speakers(directory, num_speakers, force):
+    """Add speaker labels to a saved meeting and republish it for Orbit."""
+    if not _speaker_model_ready(True):
+        raise click.ClickException("Prepare the model first: whisper-daemon models prepare --diarization")
+    from whisper_daemon.meeting_speakers import add_speakers
+    try:
+        result = add_speakers(Path(directory), num_speakers=num_speakers, force=force)
+    except (ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    revision = result["revision"]
+    published = f"; published revision {revision}" if revision else ""
+    click.echo(f"Labelled {result['speakers']} speakers{published}.")
+
+
+@cli.command()
 @click.argument("extension_id")
 def pair(extension_id):
     """Authorize one extension ID; paste the printed key into its popup."""

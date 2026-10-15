@@ -1062,9 +1062,11 @@ class MenuBarDelegate(NSObject):
             self._attach_recording_store(store)
             jobs = DiskChunkQueue(rec_dir)
             if use_mic and self._meeting_active:
+                # Positions come from the device's sample count on the store's
+                # clock, so pause and gaps work exactly as for the browser.
                 mic = MeetingRecorder(jobs, device=settings.recording_device or None,
-                    raw_sink=lambda audio: store.append("mic", audio),
-                    paused=lambda: self._meeting_paused)
+                    raw_sink=lambda audio, position: store.append("mic", audio, at=position),
+                    sample_filter=store.unpaused_audio, started_at=self._meeting_start)
                 try:
                     mic.start()
                     recorders.append(mic)

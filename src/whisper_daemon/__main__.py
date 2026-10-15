@@ -548,7 +548,8 @@ def record(
     identity = begin_meeting(capture_dir, output_path.stem) if orbit_ready else None
     chunk_queue = DiskChunkQueue(capture_dir)
     recorder = MeetingRecorder(chunk_queue, device=resolved_device, chunk_silence=chunk_silence,
-                               raw_sink=lambda audio: store.append("mic", audio))
+                               raw_sink=lambda audio, position: store.append("mic", audio, at=position),
+                               started_at=store.started_at)
     def transcribe_job(chunk):
         result = transcribe_audio(chunk.audio, model, language)
         chunk_queue.ack(chunk, result)

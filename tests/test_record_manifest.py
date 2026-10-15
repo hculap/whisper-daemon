@@ -99,3 +99,24 @@ class RecordIntegrationTests(unittest.TestCase):
             self.assertFalse((folder/'meeting.ready.json').exists())
             failed = json.loads((folder/'meeting.failed.json').read_text())
             self.assertEqual(failed['transcription_errors'], ['RuntimeError: disk full'])
+
+
+class RecoverManifestTests(unittest.TestCase):
+    def test_recover_on_a_ready_meeting_publishes_a_new_revision(self):
+        from whisper_daemon import __main__ as main
+        from whisper_daemon.meeting_manifest import begin_meeting, finalize_meeting
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            np.zeros(16000, dtype=np.float32).tofile(root / 'mic.f32')
+            runner = CliRunner()
+            self.assertEqual(runner.invoke(main.cli, ['recover', str(root)]).exit_code, 0)
+            identity = begin_meeting(root, 'CRM')
+            finalize_meeting(root, identity, {'text': 'Oferta', 'segments': [{'start': 0, 'end': 1, 'text': 'Oferta'}]}, [])
+            with (root / 'mic.f32').open('ab') as raw:  # the crash left more audio than was exported
+                np.ones(16000, dtype=np.float32).tofile(raw)
+            result = runner.invoke(main.cli, ['recover', str(root)])
+            self.assertEqual(result.exit_code, 0, result.output + str(result.exception))
+            manifest = json.loads((root / 'meeting.ready.json').read_text())
+            self.assertEqual(manifest['revision'], 2)
+            for file in manifest['files']:
+                self.assertEqual(file['size'], (root / file['path']).stat().st_size)

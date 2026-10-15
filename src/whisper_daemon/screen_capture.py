@@ -8,6 +8,7 @@ CLI, which can return empty desktop images on some macOS versions.
 """
 
 import logging
+import os
 import threading
 import time
 from pathlib import Path
@@ -37,6 +38,7 @@ CHANGE_THRESHOLD = 0.12  # hamming distance — ignores cursor/clock, catches sl
 # Stop capturing after this many consecutive failures (deleted output dir,
 # full disk) instead of logging a traceback every interval for hours.
 MAX_CONSECUTIVE_FAILURES = 5
+STOP_TIMEOUT_S = 10.0
 
 
 class ScreenCapture:
@@ -62,6 +64,7 @@ class ScreenCapture:
         self._paused = paused or (lambda: False)
         self._running = False
         self._stop_event = threading.Event()
+        self._abandoned = False  # a stop() gave up on a hung capture thread
         self._thread: threading.Thread | None = None
         self._start_time: float = 0.0
         self._last_hashes: dict[int, np.ndarray] = {}  # display_id → last hash
@@ -77,6 +80,7 @@ class ScreenCapture:
         self._output_dir.mkdir(parents=True, exist_ok=True)
         self._running = True
         self._stop_event.clear()
+        self._abandoned = False
         self._start_time = time.monotonic()
         self._last_hashes = {}
         self._saved_count = 0
@@ -92,11 +96,19 @@ class ScreenCapture:
     def stop(self) -> None:
         self._running = False
         self._stop_event.set()
+        # Bounded: a hung Quartz call must not keep the meeting from being finalised.
+        # That is safe because a capture finishing after this point writes nothing
+        # and every screenshot appears atomically (see _capture_display).
         if self._thread is not None:
-            self._thread.join()
+            self._thread.join(timeout=STOP_TIMEOUT_S)
+            if self._thread.is_alive():
+                logger.warning("Screen capture did not stop within %.0fs; continuing without it", STOP_TIMEOUT_S)
+                self._abandoned = True
             self._thread = None
-        with self._capture_lock:
-            pass  # wait for an external capture_now writer too
+        # An abandoned thread still holds the lock: waiting for it again (here or in
+        # a second stop()) would only stretch the bound, never change the outcome.
+        if not self._abandoned and self._capture_lock.acquire(timeout=STOP_TIMEOUT_S):
+            self._capture_lock.release()
         logger.info("Screen capture stopped — %d screenshots saved", self._saved_count)
 
     def capture_now(self) -> None:
@@ -158,8 +170,13 @@ class ScreenCapture:
             if distance < self._threshold:
                 return
 
+        if not self._running:
+            return  # stopped mid-capture: the meeting may already be published
         final_path = self._output_dir / f"{timestamp_sec:06d}_display{display_num}.png"
-        img.save(str(final_path), "PNG")
+        # Hidden temp + rename: a published meeting never lists a half-written PNG.
+        partial = final_path.with_name(f".{final_path.name}.tmp")
+        img.save(str(partial), "PNG")
+        os.replace(partial, final_path)
         self._last_hashes[display_num] = current_hash
         self._saved_count += 1
         logger.debug("Screenshot saved: %s", final_path.name)

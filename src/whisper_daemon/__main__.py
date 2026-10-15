@@ -703,6 +703,12 @@ def recover(directory, redo_transcript, language):
         atomic_json(path / "transcript_recovered.json", result)
         for fmt in ("txt", "srt"):
             (path / f"transcript_recovered.{fmt}").write_text(FORMATTERS[fmt](result), encoding="utf-8")
+    # Re-exported WAVs (and recovered transcripts) change files a ready meeting
+    # already published: Orbit needs them as a new revision, not stale hashes.
+    from whisper_daemon.meeting_manifest import publish_revision
+    manifest = publish_revision(path)
+    if manifest:
+        click.echo(f"Orbit: meeting.ready.json revision {manifest['revision']}")
 
 
 @cli.command()

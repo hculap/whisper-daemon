@@ -2,6 +2,7 @@
 
 import logging
 import queue
+import threading
 import time
 from dataclasses import dataclass
 
@@ -23,7 +24,7 @@ DEFAULT_CHUNK_SILENCE = 1.0
 MAX_CHUNK_SEC = 20
 OVERLAP_SEC = 2.0  # seconds of audio overlap between chunks
 # Dead-stream detection: an input stream that keeps delivering exact-zero
-# samples for this many consecutive callback blocks is assumed broken.
+# samples for this many consecutive blocks is assumed broken.
 # 900 blocks × 512 samples ÷ 16 kHz ≈ 29 s.
 DEAD_STREAM_BLOCKS = 900
 # Warn on the menubar every N consecutive silent chunks dropped.
@@ -33,6 +34,16 @@ SILENT_CHUNK_WARN_EVERY = 3
 # the zero-block detector can't see a stale device that still delivers a
 # low noise floor. Triggers a stream reopen on a fresh device list.
 SILENT_CHUNK_RECOVERY_STREAK = 6
+# The microphone is read in PortAudio's blocking mode by a reader thread, never
+# by a callback: Python on CoreAudio's real-time thread loses audio whenever it
+# waits ~30 ms for the GIL or the store's lock. PortAudio's buffer (sized by
+# this latency) holds the audio while the reader is busy.
+READ_LATENCY = 1.0
+READ_POLL_SEC = 0.01
+READER_JOIN_SEC = 2.0
+# Falling this far behind the wall clock means device audio was lost: move the
+# track forward so the loss becomes a gap instead of shifting later audio.
+REANCHOR_SAMPLES = SAMPLE_RATE // 4
 
 
 @dataclass(frozen=True)
@@ -63,6 +74,8 @@ class MeetingRecorder:
         raw_sink=None,
         paused=None,
         sample_filter=None,
+        started_at: float | None = None,
+        clock=time.monotonic,
     ) -> None:
         self._chunk_queue = chunk_queue
         self._device = device
@@ -73,7 +86,14 @@ class MeetingRecorder:
         self._sample_filter = sample_filter
         self._vad_position = None
         self.error = None
-        self._capture_lock = __import__("threading").RLock()
+        self._capture_lock = threading.RLock()
+        # Session clock origin for device positions (the store's started_at).
+        self._started_at = started_at
+        self._clock = clock
+        self._next_position: int | None = None
+        self._overflows = 0
+        self._reader: threading.Thread | None = None
+        self._reader_stop: threading.Event | None = None
 
         self._vad = SileroVAD()
         self._channels = self._detect_channels()
@@ -113,8 +133,10 @@ class MeetingRecorder:
         self._consecutive_silent_chunks = 0
         self._zero_block_count = 0
         self._silent_recovery_done = False
+        self._next_position = None
+        self._overflows = 0
         # Seed to "now" so the health check doesn't fire before the first
-        # callback has had a chance to arrive.
+        # block has had a chance to arrive.
         self._last_audio_at = time.monotonic()
         self._vad.reset_states()
 
@@ -124,12 +146,11 @@ class MeetingRecorder:
 
     @property
     def last_audio_at(self) -> float:
-        """monotonic() of the last callback that delivered any samples.
+        """monotonic() of the last block that delivered any samples.
 
         Distinct from "last voice chunk": this advances even during
         silence, so the meeting loop can tell a genuinely dead stream (no
-        callbacks at all) from a live mic in a quiet room. 0.0 until the
-        first callback.
+        blocks at all) from a live mic in a quiet room. Seeded at start.
         """
         return self._last_audio_at
 
@@ -138,16 +159,16 @@ class MeetingRecorder:
         return self._fell_back_to_default
 
     def request_recovery(self) -> None:
-        """Signal from outside the audio callback that the stream should be reopened.
+        """Signal from outside the reader that the stream should be reopened.
 
         Used by the meeting loop when it detects no chunks are arriving —
-        that case never trips a PortAudio status flag, so the callback
-        itself never arms recovery.
+        that case never raises in read(), so the reader itself never arms
+        recovery.
         """
         self._needs_recovery = True
 
     def check_liveness(self, now: float, timeout: float = 10) -> bool:
-        """Detect missing device callbacks even while paused or transcribing."""
+        """Detect a device that stopped delivering audio, even while paused or transcribing."""
         if self._source_label == 'mic' and not self._needs_recovery and now - self._last_audio_at > timeout:
             self.request_recovery()
             return True
@@ -163,8 +184,8 @@ class MeetingRecorder:
         """
         self._recovery_attempts += 1
 
-        # Stop the old stream — set _recording=False first to prevent
-        # the callback from racing on _frames during _emit_chunk.
+        # Stop the old stream — set _recording=False first so no block lands
+        # in _frames during _emit_chunk (closing also joins the reader).
         self._recording = False
         self._close_stream()
 
@@ -187,6 +208,7 @@ class MeetingRecorder:
                 self._recording = True
                 self._stream.start()
                 audio_system.register_stream(self._stream)
+                self._start_reader()
             self._needs_recovery = False
             self._last_audio_at = time.monotonic()
             logger.info(
@@ -218,12 +240,15 @@ class MeetingRecorder:
             device, channels = self._open_stream()
             self._stream.start()
             audio_system.register_stream(self._stream)
+            self._start_reader()
         logger.info(
             "Meeting recording started (device: %s, channels: %d)",
             device or "system default", channels,
         )
 
     def _close_stream(self) -> None:
+        # The reader goes first: it must never touch a stream being closed.
+        self._stop_reader()
         if self._stream is None:
             return
         audio_system.unregister_stream(self._stream)
@@ -281,7 +306,7 @@ class MeetingRecorder:
             channels=self._channels,
             dtype=DTYPE,
             blocksize=BLOCK_SIZE,
-            callback=self._callback,
+            latency=READ_LATENCY,
         )
         return device, self._channels
 
@@ -298,6 +323,9 @@ class MeetingRecorder:
         self._recording = False
 
         self._close_stream()
+        if self._overflows:
+            logger.warning("Input buffer overflowed %d time(s); lost audio is marked as gaps [%s]",
+                           self._overflows, self._source_label)
 
         self._finalize()
 
@@ -354,46 +382,66 @@ class MeetingRecorder:
                     self._process_block(block, self._vad_position)
                     if self._vad_position is not None: self._vad_position += BLOCK_SIZE
 
-    def _callback(
-        self,
-        indata: np.ndarray,
-        frames: int,
-        time_info: object,
-        status: sd.CallbackFlags,
-    ) -> None:
-        if status:
-            logger.warning("Audio status: %s", status)
-            if status.priming:
-                return
-            # Input overflow is normal under load, but input underflow or
-            # other flags may indicate the device was lost.
-            if not status.input_overflow:
-                self._device_error_count += 1
-                if self._device_error_count >= 10:
-                    logger.error("Too many device errors, requesting recovery")
-                    self._needs_recovery = True
+    # --- Device reader (blocking mode) ---
+
+    def _start_reader(self) -> None:
+        stop = threading.Event()
+        self._reader_stop = stop
+        self._reader = threading.Thread(target=self._read_loop, args=(self._stream, stop),
+                                        name=f"{self._source_label}-reader", daemon=True)
+        self._reader.start()
+
+    def _stop_reader(self) -> None:
+        """Stop and join the reader; idempotent and bounded."""
+        reader, stop = self._reader, self._reader_stop
+        self._reader = self._reader_stop = None
+        if stop is not None:
+            stop.set()
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(READER_JOIN_SEC)
+            if reader.is_alive():
+                logger.warning("Audio reader did not stop within %.0fs", READER_JOIN_SEC)
+
+    def _read_loop(self, stream: sd.InputStream, stop: threading.Event) -> None:
+        """Drain the device until stopped; a broken stream arms recovery.
+
+        Never blocks inside PortAudio: it reads only whole blocks that are
+        already buffered, so closing or recovering the stream cannot hang it.
+        The meeting loop, not this thread, reopens the device.
+        """
+        while not stop.is_set():
+            try:
+                if not self.drain(stream):
+                    stop.wait(READ_POLL_SEC)
+            except Exception:
+                if stop.is_set():
                     return
-            else:
-                self._device_error_count = 0
+                logger.error("Audio input failed — requesting recovery", exc_info=True)
+                self._needs_recovery = True
+                return
 
-        if not self._recording:
-            return
+    def drain(self, stream: sd.InputStream) -> int:
+        """Read every whole block the device has buffered; returns the block count."""
+        blocks = 0
+        while stream.read_available >= BLOCK_SIZE:
+            data, overflowed = stream.read(BLOCK_SIZE)
+            self._handle_block(data, overflowed, stream.read_available)
+            blocks += 1
+        return blocks
 
-        self._last_audio_at = time.monotonic()
-
-        if indata.shape[1] > 1:
-            mono = indata.mean(axis=1, keepdims=True)
-        else:
-            mono = indata
-
-        samples = mono[:, 0].copy()
+    def _handle_block(self, indata: np.ndarray, overflowed: bool, buffered: int) -> None:
+        if overflowed:
+            self._overflows += 1
+            logger.warning("Audio input overflowed — device audio lost [%s]", self._source_label)
+        samples = (indata.mean(axis=1) if indata.shape[1] > 1 else indata[:, 0]).astype(np.float32)
+        position = self._block_position(len(samples), buffered, overflowed)
 
         # Dead-stream detection: a live PortAudio stream that keeps
         # delivering exact-zero samples indicates the OS has muted the
         # device, revoked mic privacy, or re-routed the input behind our
-        # back. None of those cases trip a PortAudio status flag, so the
-        # error-count path would never catch them. A quiet room always
-        # produces ~1e-6 noise, so strict zero is a reliable signal.
+        # back. None of those cases raise in read(), so recovery would never
+        # trigger. A quiet room always produces ~1e-6 noise, so strict zero
+        # is a reliable signal.
         if np.all(samples == 0.0):
             self._zero_block_count += 1
             if self._zero_block_count >= DEAD_STREAM_BLOCKS:
@@ -406,7 +454,26 @@ class MeetingRecorder:
         else:
             self._zero_block_count = 0
 
-        self._process_block(samples)
+        self.feed_audio(samples, position=position)
+
+    def _block_position(self, frames: int, buffered: int, overflowed: bool) -> int:
+        """Session sample position of a block just read from the device.
+
+        Blocks follow the device's own sample count. The wall clock (minus what
+        is still buffered) only anchors the first block of a stream and moves
+        the track forward when audio was lost — an overflow, or falling behind
+        — so the loss becomes a recorded gap. Never moves backwards, also not
+        across a reopened stream: the store rejects overlapping audio.
+        """
+        origin = self._started_at if self._started_at is not None else self._recording_start
+        wall = max(0, round((self._clock() - origin) * SAMPLE_RATE) - buffered - frames)
+        expected = self._next_position
+        if expected is None or overflowed or wall > expected + REANCHOR_SAMPLES:
+            position = max(wall, expected or 0)
+        else:
+            position = expected
+        self._next_position = position + frames
+        return position
 
     def _process_block(self, samples: np.ndarray, position=None) -> None:
         """Process a single block of mono audio through VAD and chunk splitting."""

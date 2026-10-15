@@ -5,9 +5,11 @@ const assert = require("node:assert/strict");
 
 const {
   captionsReducer,
+  controlView,
   diffSettings,
   formatElapsed,
   isColdSetting,
+  sourceView,
 } = require("../wd-logic.js");
 
 test("captionsReducer appends first text as a single line", () => {
@@ -66,12 +68,13 @@ test("captionsReducer does not mutate the input array", () => {
   assert.notEqual(out, input);
 });
 
-test("formatElapsed formats seconds as MM:SS", () => {
+test("formatElapsed formats seconds as MM:SS, and H:MM:SS from one hour", () => {
   assert.equal(formatElapsed(0), "00:00");
   assert.equal(formatElapsed(5), "00:05");
   assert.equal(formatElapsed(65), "01:05");
   assert.equal(formatElapsed(600), "10:00");
-  assert.equal(formatElapsed(3661), "61:01");
+  assert.equal(formatElapsed(3599), "59:59");
+  assert.equal(formatElapsed(3661), "1:01:01");
 });
 
 test("formatElapsed floors fractional seconds", () => {
@@ -138,4 +141,53 @@ test("diffSettings treats missing current key as changed", () => {
   const current = {};
   const next = { live_captions: true };
   assert.deepEqual(diffSettings(current, next), { live_captions: true });
+});
+
+test("sourceView reports a stale source as no signal with resting bars", () => {
+  assert.deepEqual(sourceView({ rms: 0.3, age: 4 }), { status: "silent", label: "brak sygnału", bars: [4, 4, 4, 4, 4], level: 0 });
+  assert.equal(sourceView(undefined).status, "silent");
+});
+
+test("sourceView separates speech from quiet at the daemon floor", () => {
+  assert.equal(sourceView({ rms: 0.004, age: 0 }).label, "cisza");
+  assert.equal(sourceView({ rms: 0.006, age: 0 }).label, "mowa");
+  assert.deepEqual(sourceView({ rms: 0, age: 0 }).bars, [4, 4, 4, 4, 4]);
+});
+
+test("sourceView lights more bars for louder audio, all five near full scale", () => {
+  const lit = (rms) => sourceView({ rms, age: 0 }).bars.filter((h) => h > 4).length;
+  assert.ok(lit(0.006) < lit(0.05));
+  assert.ok(lit(0.05) < lit(0.2));
+  assert.equal(lit(0.5), 5);
+  assert.equal(sourceView({ rms: 0.5, age: 0 }).level, 1);
+});
+
+test("controlView follows the daemon phase and shows the elapsed time", () => {
+  assert.equal(controlView().mode, "idle");
+  const rec = controlView({ daemonState: "recording", elapsed: 1458 });
+  assert.equal(rec.mode, "recording");
+  assert.equal(rec.time, "24:18");
+  assert.match(rec.label, /Zatrzymaj nagrywanie, 24:18/);
+  assert.equal(controlView({ daemonState: "transcribing" }).mode, "saving");
+});
+
+test("controlView puts pause and the participant warning over plain recording", () => {
+  assert.equal(controlView({ daemonState: "recording", paused: true, warning: true }).mode, "paused");
+  assert.equal(controlView({ daemonState: "recording", warning: true }).mode, "warning");
+});
+
+test("controlView shows connecting only before the daemon reports a phase", () => {
+  assert.equal(controlView({ starting: true }).mode, "starting");
+  assert.equal(controlView({ starting: true, daemonState: "recording" }).mode, "recording");
+});
+
+test("controlView tells an offline daemon from an unpaired extension", () => {
+  assert.match(controlView({ connection: "offline" }).tooltip, /Daemon nie odpowiada/);
+  assert.match(controlView({ connection: "unpaired" }).tooltip, /Sparuj/);
+  assert.equal(controlView({ connection: "rejected" }).mode, "offline");
+  assert.equal(controlView({ connection: "offline", daemonState: "recording" }).mode, "recording");
+});
+
+test("controlView names the shortcut it is given", () => {
+  assert.match(controlView({ shortcut: "Ctrl+Shift+M" }).tooltip, /Ctrl\+Shift\+M/);
 });

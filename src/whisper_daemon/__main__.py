@@ -763,7 +763,10 @@ def check_models():
 @click.option('--diarization', is_flag=True)
 def prepare_models(diarization):
     """Download models. Diarization needs authorized Hugging Face access."""
-    env = dict(os.environ, WHISPER_PREPARE_MODELS='1', HF_HUB_OFFLINE='0', TRANSFORMERS_OFFLINE='0')
+    from whisper_daemon.env_file import PROJECT_ENV_FILE, read_env_file
+    # HF_TOKEN may live in the project's .env; the process environment wins.
+    env = {**read_env_file(PROJECT_ENV_FILE), **os.environ,
+           'WHISPER_PREPARE_MODELS': '1', 'HF_HUB_OFFLINE': '0', 'TRANSFORMERS_OFFLINE': '0'}
     code = ('from whisper_daemon.diarizer import _get_pipeline; _get_pipeline()' if diarization else
             'from whisper_daemon.vad import SileroVAD; SileroVAD(); from whisper_daemon.transcriber import preload_model; preload_model()')
     result = subprocess.run([sys.executable, '-c', code], env=env)

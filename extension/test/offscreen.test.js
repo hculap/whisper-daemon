@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 
-function fixture({autoStart = true} = {}) {
+function fixture({autoStart = true, secret = 'test-secret', acceptKey = true} = {}) {
   const sockets = [], messages = [];
   let receive;
   class Socket {
@@ -16,7 +16,7 @@ function fixture({autoStart = true} = {}) {
       this.sent.push(value);
       if (typeof value === 'string') {
         const data = JSON.parse(value);
-        if (data.type === 'auth') queueMicrotask(() => this.onmessage({data: JSON.stringify({type:'authenticated'})}));
+        if (data.type === 'auth' && acceptKey) queueMicrotask(() => this.onmessage({data: JSON.stringify({type:'authenticated'})}));
         if (data.type === 'start' && autoStart) queueMicrotask(() => this.onmessage({data: JSON.stringify({type:'started', session_id:data.session_id})}));
       }
     }
@@ -27,7 +27,7 @@ function fixture({autoStart = true} = {}) {
       onMessage: { addListener(fn) { receive = fn; } },
       sendMessage(msg) {
         // The service worker answers pairing reads for this document.
-        if (msg.type === 'GET_PAIRING_SECRET') return Promise.resolve({ secret: 'test-secret' });
+        if (msg.type === 'GET_PAIRING_SECRET') return Promise.resolve({ secret });
         messages.push(msg); return Promise.resolve();
       },
     } }, WebSocket: Socket, Float32Array, Array, Date,
@@ -212,4 +212,51 @@ test('a retained recovery tail does not count against the live audio budget', as
   f.receive({type:'WD_PCM',target:'offscreen',samples:[.1,.2],position:0});
   assert.equal(f.run('capturing'),true);
   assert.equal(f.messages.some(m=>m.type==='CAPTURE_ERROR'),false);
+});
+
+const connectionStates = f => f.messages.filter(m => m.type === 'CONNECTION').map(m => m.state);
+
+test('a settings read without a pairing key reports unpaired, not a capture error', async () => {
+  const f = fixture({secret: null});
+  await f.run('sendControl({type: "get_settings"})');
+  assert.deepEqual(connectionStates(f), ['unpaired']);
+  assert.equal(f.sockets.length, 0);
+  assert.equal(f.messages.some(m => m.type === 'CAPTURE_ERROR'), false);
+});
+
+test('an unreachable daemon reports offline, not a capture error', async () => {
+  const f = fixture();
+  const pending = f.run('sendControl({type: "get_settings"})');
+  await new Promise(setImmediate);
+  f.sockets[0].onerror(new Error('refused'));
+  f.sockets[0].onclose();
+  await pending;
+  assert.deepEqual(connectionStates(f), ['offline']);
+  assert.equal(f.messages.some(m => m.type === 'CAPTURE_ERROR'), false);
+});
+
+test('a daemon that closes the socket during auth reports a rejected key', async () => {
+  const f = fixture({acceptKey: false});
+  const pending = f.run('sendControl({type: "get_settings"})');
+  await f.open();
+  f.sockets[0].onclose();
+  await pending;
+  assert.deepEqual(connectionStates(f), ['rejected']);
+});
+
+test('an authenticated control connection reports connected', async () => {
+  const f = fixture();
+  const pending = f.run('sendControl({type: "get_settings"})');
+  await f.open();
+  await pending;
+  assert.deepEqual(connectionStates(f), ['connected']);
+  assert.ok(f.sockets[0].sent.some(x => typeof x === 'string' && JSON.parse(x).type === 'get_settings'));
+});
+
+test('a start without a pairing key asks to pair instead of restarting the daemon', async () => {
+  const f = fixture({secret: null});
+  await f.run('startExternal()');
+  const errors = f.messages.filter(m => m.type === 'CAPTURE_ERROR');
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /Sparuj rozszerzenie/);
 });

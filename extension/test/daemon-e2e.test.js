@@ -61,7 +61,7 @@ test('#1 #8 a saved recording keeps the joined tab and has no phantom trailing g
   assert.equal(done.recordings.length, 1);
   assert.equal(done.recordings[0].frames.browser, samples);
   assert.deepEqual(done.recordings[0].gaps, []);
-  assert.deepEqual(await state(ext), {state: 'detected', meetTabId: 1, meetTitle: MEETING.title, meetUrl: MEETING.url});
+  assert.deepEqual(await state(ext), {state: 'detected', meetTabId: 1, meetTitle: MEETING.title, meetUrl: MEETING.url, connection: 'connected'});
 
   await tab.send({type: 'MEET_LEFT'});
   await waitFor(async () => !(await daemon.state()).connected, {message: 'socket closed after leaving'});
@@ -144,7 +144,7 @@ test('#3 an unexported recovery tail does not block the next recording', {skip, 
   await tab.send({type: 'WD_STOP'});
   const done = await settled(daemon);
 
-  assert.ok(!ext.sent('CAPTURE_ERROR').some(m => /buffer is full/.test(m.message)), JSON.stringify(ext.sent('CAPTURE_ERROR')));
+  assert.ok(!ext.sent('CAPTURE_ERROR').some(m => /Bufor połączenia audio jest pełny/.test(m.message)), JSON.stringify(ext.sent('CAPTURE_ERROR')));
   assert.equal(done.recordings.at(-1).frames.browser, samples);
   assert.equal((await recovery(ext)).count, 1);
 });

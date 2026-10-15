@@ -20,6 +20,11 @@ let meetTabId = null;
 let nativeRecording = false;
 let meetTitle = "";
 let meetUrl = "";
+// The popup's own tab capture (START_WITH_STREAM). Every other recording is
+// stopped through the tab or daemon that owns it.
+let popupCapture = false;
+// Daemon link as last reported: unknown | connected | offline | unpaired | rejected.
+let connection = "unknown";
 
 // --- State machine ---
 
@@ -44,6 +49,7 @@ function updateBadge() {
 // No recording in progress: back to the joined call, if any.
 function settleIdle() {
   nativeRecording = false;
+  popupCapture = false;
   transitionTo(meetTabId ? State.DETECTED : State.IDLE);
 }
 
@@ -74,8 +80,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.notifications.create("meet-detected", {
         type: "basic",
         iconUrl: "icons/icon128.png",
-        title: "Meeting Detected",
-        message: `${meetTitle || "Google Meet"} — Click to start capture`,
+        title: "Wykryto spotkanie",
+        message: `${meetTitle || "Google Meet"} — kliknij, aby nagrać`,
         priority: 2,
         requireInteraction: true,
       });
@@ -101,6 +107,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       chrome.tabs.sendMessage(leftTabId, { type: "WD_MEET_LEFT" }).catch(() => {});
     }
     meetTabId = null;
+    popupCapture = false;
     transitionTo(State.IDLE);
     sendResponse({ ok: true });
 
@@ -124,20 +131,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     // The daemon went away: a "saving" or native-recording state can no longer
     // be confirmed or ended by a status. The daemon decides on the next start.
     if (state === State.TRANSCRIBING || nativeRecording) settleIdle();
+    setConnection("unknown");
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "CONNECTION") {
+    setConnection(msg.state);
     sendResponse({ ok: true });
 
   } else if (msg.type === 'RECOVERY_AVAILABLE') {
     chrome.notifications.create('audio-recovery', {type:'basic',iconUrl:'icons/icon128.png',
-      title:'Audio recovery',message:msg.message});
+      title:'Końcówka nagrania do pobrania',message:msg.message});
     sendResponse({ok:true});
   } else if (msg.type === "CAPTURE_ERROR") {
     chrome.notifications.create("capture-error", {
       type: "basic",
       iconUrl: "icons/icon128.png",
-      title: "Capture Error",
-      message: msg.message || "Failed to capture audio",
+      title: "Błąd nagrywania",
+      message: msg.message || "Nie udało się nagrać dźwięku",
     });
     relayWD("WD_ERROR", { message: msg.message });
+    popupCapture = false;
     transitionTo(State.IDLE);
     sendResponse({ ok: true });
 
@@ -150,6 +163,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "STATUS") {
+    setConnection("connected");
     // Daemon status push (from offscreen) drives the in-bar button/timer.
     relayWD("WD_STATUS", {
       state: msg.state,
@@ -170,19 +184,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "HEALTH") {
+    setConnection("connected");
     relayWD("WD_HEALTH", {sources: msg.sources, paused: msg.paused});
     sendResponse({ok: true});
   } else if (msg.type === "CAPABILITIES") {
     relayWD("WD_CAPABILITIES", {diarization: msg.diarization});
     sendResponse({ok: true});
   } else if (msg.type === "SETTINGS") {
+    setConnection("connected");
     // Global read-only snapshot: initialize every content surface without
     // granting any of them ownership of a recording.
-    chrome.tabs.query({url:'https://meet.google.com/*'}).then(tabs => {
-      for (const tab of tabs) chrome.tabs.sendMessage(tab.id, {
-        type:'WD_SETTINGS', settings:msg.settings, devices:msg.devices,
-      }).catch(() => {});
-    }).catch(() => {});
+    broadcastMeet({ type: "WD_SETTINGS", settings: msg.settings, devices: msg.devices });
     sendResponse({ ok: true });
 
   } else if (msg.type === "WD_START") {
@@ -244,19 +256,44 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true });
 
   } else if (msg.type === "GET_STATE") {
-    sendResponse({ state, meetTabId, meetTitle, meetUrl });
+    sendResponse({ state, meetTabId, meetTitle, meetUrl, connection });
+
+  } else if (msg.type === "OPEN_POPUP") {
+    // The Meet menu's "pair" link. openPopup is unavailable on older Chrome.
+    Promise.resolve().then(() => chrome.action.openPopup()).catch(() => {});
+    sendResponse({ ok: true });
+
+  } else if (msg.type === "FOCUS_MEET") {
+    // Popup "change in Meet": bring the call forward with its menu open.
+    resolveMeetTab().then((tabId) => {
+      if (!tabId) return;
+      chrome.tabs.update(tabId, { active: true })
+        .then((tab) => tab && chrome.windows?.update(tab.windowId, { focused: true }))
+        .catch(() => {});
+      chrome.tabs.sendMessage(tabId, { type: "WD_OPEN_MENU" }).catch(() => {});
+    });
+    sendResponse({ ok: true });
 
   } else if (msg.type === "START_WITH_STREAM") {
     // Popup obtained streamId (has user gesture for tabCapture)
     if (state !== State.CAPTURING) {
       meetTabId = msg.tabId || meetTabId;
+      popupCapture = true;
       transitionTo(State.STARTING);
       startCaptureWithStream(msg.streamId);
     }
     sendResponse({ ok: true });
 
   } else if (msg.type === "STOP_RECORDING") {
-    if (state === State.CAPTURING || state === State.STARTING) {
+    // Popup Stop. A Meet-started session is stopped by its tab, which tears
+    // down its own audio and keeps the socket for the final status; a full
+    // teardown here would strand that tab on "recording".
+    if (!popupCapture && meetTabId) {
+      // The tab acknowledges; an unreachable tab falls back to a full teardown.
+      chrome.tabs.sendMessage(meetTabId, { type: "WD_REQUEST_STOP" }).catch(() => stopCapture());
+    } else if (!popupCapture && nativeRecording) {
+      forwardToOffscreen({ type: "WD_STOP_MEETING" });
+    } else if (state === State.CAPTURING || state === State.STARTING) {
       stopCapture();
     }
     sendResponse({ ok: true });
@@ -347,6 +384,19 @@ async function ensureOffscreenDocument() {
   offscreenReady = true;
 }
 
+function setConnection(next) {
+  if (!next || next === connection) return;
+  connection = next;
+  broadcastMeet({ type: "WD_CONNECTION", state: connection });
+}
+
+// Daemon-wide facts (settings, connection) reach every open Meet tab.
+function broadcastMeet(message) {
+  chrome.tabs.query({ url: "https://meet.google.com/*" }).then((tabs) => {
+    for (const tab of tabs) chrome.tabs.sendMessage(tab.id, message).catch(() => {});
+  }).catch(() => {});
+}
+
 // Relay a WD_* message to the Meet tab's content orchestrator.
 //
 // meetTabId lives in the service worker's memory, which MV3 wipes on eviction.
@@ -404,6 +454,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     // Tab gone — close the persistent offscreen socket unconditionally.
     stopCapture();
     meetTabId = null;
+    popupCapture = false;
     transitionTo(State.IDLE);
   }
 });

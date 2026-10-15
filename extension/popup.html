@@ -1,124 +1,136 @@
 <!DOCTYPE html>
-<html>
+<html lang="pl">
 <head>
   <meta charset="utf-8">
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      width: 320px;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-      font-size: 13px;
-      color: #222;
-      padding: 16px;
-    }
-    .header {
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      margin-bottom: 12px;
-    }
-    .header h1 {
-      font-size: 14px;
-      font-weight: 600;
-    }
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      flex-shrink: 0;
-    }
-    .status-dot.idle { background: #9E9E9E; }
-    .status-dot.detected { background: #FF9800; }
-    .status-dot.capturing { background: #F44336; animation: pulse 1.5s infinite; }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.4; }
-    }
-    .meeting-info {
-      background: #F5F5F5;
-      border-radius: 6px;
-      padding: 8px 10px;
-      margin-bottom: 12px;
-      font-size: 12px;
-      color: #555;
-      display: none;
-    }
-    .meeting-info.visible { display: block; }
-    .btn {
-      width: 100%;
-      padding: 10px;
-      border: none;
-      border-radius: 6px;
-      font-size: 13px;
-      font-weight: 500;
-      cursor: pointer;
-      transition: background 0.15s;
-    }
-    .btn-record {
-      background: #F44336;
-      color: white;
-    }
-    .btn-record:hover { background: #D32F2F; }
-    .btn-stop {
-      background: #424242;
-      color: white;
-    }
-    .btn-stop:hover { background: #212121; }
-    .btn:disabled {
-      background: #BDBDBD;
-      cursor: not-allowed;
-    }
-    .transcript {
-      margin-top: 12px;
-      max-height: 200px;
-      overflow-y: auto;
-      font-size: 12px;
-      color: #444;
-      line-height: 1.5;
-      display: none;
-    }
-    .transcript.visible { display: block; }
-    .transcript-chunk {
-      padding: 4px 0;
-      border-bottom: 1px solid #EEE;
-    }
-    .timer {
-      text-align: center;
-      font-size: 20px;
-      font-weight: 300;
-      color: #F44336;
-      margin-bottom: 12px;
-      display: none;
-    }
-    .timer.visible { display: block; }
-  </style>
+  <title>Whisper</title>
+  <link rel="stylesheet" href="popup.css">
 </head>
 <body>
-  <div class="header">
-    <span id="statusDot" class="status-dot idle"></span>
-    <h1>Whisper Daemon</h1>
-  </div>
+<main class="popup">
+  <header class="head">
+    <span class="logo" data-icon="rec" data-size="18" data-stroke="2.2"></span>
+    <span class="brand">Whisper</span>
+    <button id="linkPill" class="pill" type="button" aria-controls="pairView" aria-expanded="false">
+      <span id="linkLed" class="led"></span><span id="linkText">Sprawdzam…</span>
+    </button>
+  </header>
 
-  <details><summary>Pair with this computer</summary>
-    <p id="pairCommand" style="margin:8px 0;overflow-wrap:anywhere"></p>
-    <label>Pairing key <input id="pairSecret" type="password" autocomplete="off"></label>
-    <button id="savePair">Save key</button><p id="pairStatus" role="status"></p>
-  </details>
-  <div id="sourceHealth" role="status"></div>
-  <button id="pauseBtn" class="btn">Pause / Resume meeting</button>
-  <div id="capabilityStatus" role="status"></div>
-  <div id="meetingInfo" class="meeting-info"></div>
-  <div id="timer" class="timer">00:00</div>
+  <section id="recovery" class="view" hidden>
+    <div class="alert" role="alert">
+      <span data-icon="warning" data-size="20"></span>
+      <div class="alert-body">
+        <span class="alert-title">Końcówka nagrania czeka w Chrome</span>
+        <span class="alert-text">Ostatni fragment audio nie dotarł do daemona i jest tylko w pamięci
+          rozszerzenia. Pobierz go przed zamknięciem Chrome — nazwa pliku zawiera jego czas w spotkaniu.</span>
+      </div>
+    </div>
+    <div class="steps">
+      <button id="exportRecovery" class="btn btn-primary" type="button">
+        <span data-icon="download" data-size="18" data-stroke="2.2"></span>Pobierz końcówkę (WAV)
+      </button>
+      <button id="clearRecovery" class="btn btn-outline" type="button" disabled aria-describedby="clearHint">
+        <span data-icon="trash" data-size="18"></span>Usuń kopię z bufora
+      </button>
+      <p id="clearHint" class="small muted status-line">Aktywne po pobraniu i sprawdzeniu pliku.</p>
+    </div>
+  </section>
 
-  <button id="actionBtn" class="btn btn-record">Record This Tab</button>
-  <div id="recovery" hidden>
-    <p>Niedostarczona końcówka audio pozostaje w pamięci rozszerzenia. Pobierz ją przed zamknięciem Chrome. Nazwa pliku zawiera jej czas w spotkaniu.</p>
-    <button id="exportRecovery" class="btn">Pobierz końcówkę WAV</button>
-    <button id="clearRecovery" class="btn" disabled>Plik sprawdzony — usuń kopię z bufora</button>
-  </div>
+  <section id="pairView" class="view" hidden>
+    <div class="intro">
+      <h1>Połącz z tym komputerem</h1>
+      <p class="muted">Rozszerzenie rozmawia tylko z lokalnym daemonem. Sparuj je raz — potem nagrywasz jednym kliknięciem.</p>
+    </div>
+    <div class="steps">
+      <div class="card step">
+        <div class="step-head"><span class="step-num" aria-hidden="true">1</span>Uruchom w Terminalu</div>
+        <div class="code">
+          <code id="pairCommand"></code>
+          <button id="copyPair" class="icon-btn" type="button" aria-label="Kopiuj polecenie" data-icon="copy" data-size="16"></button>
+        </div>
+      </div>
+      <div class="card step">
+        <div class="step-head"><span class="step-num" aria-hidden="true">2</span><label for="pairSecret">Wklej klucz parowania</label></div>
+        <p class="small muted step-note">Polecenie skopiowało go do schowka.</p>
+        <input id="pairSecret" class="field" type="password" autocomplete="off" spellcheck="false" placeholder="Klucz z Terminala">
+      </div>
+    </div>
+    <button id="savePair" class="btn btn-primary" type="button">Połącz</button>
+    <p id="pairStatus" class="small muted status-line" role="status"></p>
+    <p class="small muted footnote"><span data-icon="lock" data-size="14"></span>Klucz zostaje w Chrome, połączenie tylko z localhost.</p>
+  </section>
 
-  <div id="transcript" class="transcript"></div>
+  <section id="offline" class="view" hidden>
+    <div class="card step">
+      <div class="step-head"><span data-icon="info" data-size="18"></span>Daemon nie odpowiada</div>
+      <div class="code">
+        <code>whisper-daemon restart</code>
+        <button id="copyRestart" class="icon-btn" type="button" aria-label="Kopiuj polecenie" data-icon="copy" data-size="16"></button>
+      </div>
+    </div>
+  </section>
 
-  <script src="popup.js"></script>
+  <section id="readyView" class="view" hidden>
+    <div class="card meeting">
+      <span class="meeting-icon" data-icon="camera" data-size="20"></span>
+      <span class="meeting-text">
+        <span id="targetTitle" class="meeting-title">Google Meet</span>
+        <span id="targetSub" class="small muted">Google Meet · ta karta</span>
+      </span>
+    </div>
+    <button id="recordBtn" class="btn btn-record" type="button">
+      <span id="recordGlyph" data-icon="rec" data-size="22" data-stroke="2"></span>
+      <span id="recordLabel" class="label">Nagraj spotkanie</span>
+      <span id="recordKbd" class="kbd" hidden></span>
+    </button>
+    <div id="summary" class="card-list" hidden>
+      <div class="card-head">
+        <span>Nagram</span>
+        <button id="openMeet" class="link" type="button" hidden>Zmień w Meet<span data-icon="chevRight" data-size="14" data-stroke="2"></span></button>
+      </div>
+      <div class="row"><span data-icon="me" data-size="18"></span><span class="row-label">Ty</span><span id="sumMic" class="row-value"></span></div>
+      <div class="row"><span data-icon="people" data-size="18"></span><span class="row-label">Uczestnicy</span><span id="sumTab" class="row-value"></span></div>
+      <div class="row"><span data-icon="lang" data-size="18"></span><span class="row-label">Język</span><span id="sumLang" class="row-value"></span></div>
+      <div class="row"><span data-icon="doc" data-size="18"></span><span class="row-label">Zapis</span><span id="sumSave" class="row-value"></span></div>
+    </div>
+  </section>
+
+  <section id="liveView" class="view" hidden>
+    <div class="live-head">
+      <span id="liveChip" class="chip"><span id="liveLed" class="led led-rec"></span><span id="liveState">Nagrywanie</span></span>
+      <span id="liveTitle" class="live-title small muted"></span>
+    </div>
+    <div id="timer" class="timer" role="timer">00:00</div>
+    <div class="card sources">
+      <div class="source" data-src="mic">
+        <span data-icon="me" data-size="20"></span>
+        <span class="source-text"><span class="source-name">Ty</span>
+          <span class="small muted">Mikrofon · <span class="source-status">…</span></span></span>
+        <span class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      </div>
+      <div class="source" data-src="browser">
+        <span data-icon="people" data-size="20"></span>
+        <span class="source-text"><span class="source-name">Uczestnicy</span>
+          <span class="small muted">Dźwięk z Meet · <span class="source-status">…</span></span></span>
+        <span class="meter" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+      </div>
+    </div>
+    <div class="pair-btns">
+      <button id="pauseBtn" class="btn btn-tonal" type="button"><span id="pauseGlyph" data-icon="pause" data-size="18" data-stroke="2.6"></span><span id="pauseLabel">Pauza</span></button>
+      <button id="stopBtn" class="btn btn-stop" type="button"><span data-icon="stop" data-size="16"></span>Zakończ i zapisz</button>
+    </div>
+    <div class="card">
+      <div class="card-head"><span>Transkrypcja na żywo</span></div>
+      <div id="transcript" class="transcript" aria-live="polite">
+        <p id="transcriptEmpty" class="muted">Tekst pojawi się po pierwszym fragmencie.</p>
+      </div>
+    </div>
+    <p id="diarNote" class="small muted note" hidden><span data-icon="diar" data-size="16"></span><span id="diarText"></span></p>
+  </section>
+
+  <p id="error" class="error" role="alert" hidden></p>
+</main>
+<script src="wd-logic.js"></script>
+<script src="wd-icons.js"></script>
+<script src="popup.js"></script>
 </body>
 </html>

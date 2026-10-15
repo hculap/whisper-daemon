@@ -1,6 +1,8 @@
 /**
- * wd-injector.js — injects a native-styled Whisper control into Google Meet's
- * bottom toolbar, sized and coloured to match Meet's own round buttons.
+ * wd-injector.js — injects the Whisper control into Google Meet's bottom
+ * toolbar: one pill grouping the settings chevron (left, like Meet's mic and
+ * camera splits) and the record button, which grows into a live timer while
+ * recording.
  *
  * Placement: inline in the main control row, right before the "present / share
  * screen" button (between camera and share). Meet's official
@@ -10,7 +12,9 @@
  * can't be located.
  *
  * A single MutationObserver re-inserts the control across Meet's SPA re-renders.
- * Classic content script sharing the isolated-world scope; exposes window.WD.injector.
+ * The hover tooltip is fixed-positioned outside the toolbar so it cannot be
+ * clipped. Classic content script sharing the isolated-world scope; exposes
+ * window.WD.injector.
  */
 
 "use strict";
@@ -20,8 +24,10 @@
 
   const CONTROL_ID = "wd-control";
   const STYLE_ID = "wd-control-style";
+  const TOOLTIP_ID = "wd-tooltip";
   // Fallback official slot (rightmost, after "leave") if the row isn't found.
   const FALLBACK_SLOT_ID = "browser-extension-end-buttons";
+  const CHEVRON_TIP = "Ustawienia nagrywania";
 
   // Buttons that bracket our insertion point. Meet localises aria-labels, so
   // match a few languages loosely.
@@ -32,56 +38,87 @@
   const CAMERA_SELECTOR =
     'button[aria-label*="kamer" i],button[aria-label*="camera" i]';
 
-  // Meet dark toolbar tokens (from --gm3-icon-button-filled-*): 3rem square,
-  // 1.5rem corner → 48px circle. Colours picked to sit on the ~#1f1f1f bar.
+  const icon = (...args) => (WD.icons ? WD.icons.icon(...args) : "");
+  const FONT = WD.icons ? WD.icons.FONT : "Roboto, Arial, sans-serif";
+
+  // Sized to Meet's 48px toolbar buttons; colours sit on its ~#1f1f1f bar.
+  const C = `#${CONTROL_ID}`;
   const STYLES = `
-    #${CONTROL_ID} {
-      display: inline-flex;
-      align-items: center;
-      gap: 2px;
-      margin: 0 4px;
-      vertical-align: middle;
-      font-family: "Google Sans", "Roboto", Arial, sans-serif;
+    ${C} { display: inline-flex; align-items: center; flex: none; height: 48px;
+      margin: 0 4px; vertical-align: middle; border-radius: 24px; background: #2B2C2F;
+      font-family: ${FONT}; }
+    ${C} button { -webkit-appearance: none; appearance: none; border: none; margin: 0;
+      font: inherit; cursor: pointer; display: inline-flex; align-items: center;
+      justify-content: center; box-sizing: border-box; }
+    ${C} button:focus-visible { outline: 2px solid #A8C7FA; outline-offset: 2px; }
+    ${C} .wd-chev { width: 36px; height: 48px; padding: 0 0 0 4px; border-radius: 24px 0 0 24px;
+      background: transparent; color: #C4C7C5; transition: background .15s, color .15s; }
+    ${C} .wd-chev:hover { background: rgba(255,255,255,.08); }
+    ${C} .wd-chev .wd-ic { transition: transform .2s ease; }
+    ${C}[data-menu="open"] .wd-chev { background: #44464A; color: #A8C7FA; }
+    ${C}[data-menu="open"] .wd-chev .wd-ic { transform: rotate(180deg); }
+
+    ${C} .wd-main { position: relative; height: 48px; min-width: 48px; padding: 0;
+      border-radius: 24px; gap: 10px; background: #3C3D40; color: #E3E3E3;
+      font-size: 15px; font-weight: 500; font-variant-numeric: tabular-nums;
+      white-space: nowrap; transition: background .15s, color .15s; }
+    ${C} .wd-main:hover { background: #46484B; }
+    ${C} .wd-label { font-size: 14px; }
+
+    ${C}[data-mode="starting"] .wd-main, ${C}[data-mode="saving"] .wd-main {
+      padding: 0 18px 0 14px; cursor: default; }
+    ${C}[data-mode="starting"] .wd-spin { color: #A8C7FA; }
+    ${C}[data-mode="saving"] .wd-spin { color: #FCC934; }
+    ${C}[data-mode="recording"] .wd-main, ${C}[data-mode="warning"] .wd-main {
+      padding: 0 18px; background: #CC3A2F; color: #FFFFFF; }
+    ${C}[data-mode="recording"] .wd-main:hover, ${C}[data-mode="warning"] .wd-main:hover { background: #D7473C; }
+    ${C}[data-mode="paused"] .wd-main { padding: 0 18px 0 14px; gap: 8px; color: #FCC934;
+      box-shadow: inset 0 0 0 2px #FCC934; }
+    ${C}[data-mode="offline"] .wd-main { background: #333537; color: #A8ACB0; }
+
+    ${C} .wd-dot { width: 10px; height: 10px; border-radius: 5px; background: #FFFFFF;
+      box-shadow: 0 0 0 4px rgba(255,255,255,.24); animation: wd-pulse 1.6s ease-in-out infinite; }
+    ${C} .wd-bars { display: inline-flex; align-items: center; gap: 2px; height: 16px; }
+    ${C} .wd-bars i { display: block; width: 3px; height: 4px; border-radius: 2px;
+      background: rgba(255,255,255,.85); transition: height .25s ease; }
+    ${C} .wd-badge { position: absolute; top: 0; right: 0; width: 18px; height: 18px;
+      border-radius: 9px; background: #FCC934; color: #241A00; font-size: 12px; font-weight: 700;
+      display: flex; align-items: center; justify-content: center; box-shadow: 0 0 0 2px #1F1F1F; }
+    ${C} .wd-spin { animation: wd-spin .9s linear infinite; }
+
+    #${TOOLTIP_ID} { position: fixed; z-index: 2147483646; max-width: 240px; padding: 6px 10px;
+      border-radius: 6px; background: #E3E3E3; color: #1F1F1F; font: 500 12px/16px ${FONT};
+      text-align: center; pointer-events: none; opacity: 0; transition: opacity .12s ease; }
+    #${TOOLTIP_ID}.wd-in { opacity: 1; }
+
+    @keyframes wd-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .45; } }
+    @keyframes wd-spin { to { transform: rotate(360deg); } }
+    @media (prefers-reduced-motion: reduce) {
+      ${C} .wd-dot, ${C} .wd-spin { animation: none; }
+      ${C} .wd-chev .wd-ic, ${C} .wd-bars i { transition: none; }
     }
-    #${CONTROL_ID} .wd-btn {
-      position: relative;
-      height: 48px;
-      border: none;
-      padding: 0;
-      cursor: pointer;
-      background: #333537;
-      color: #e3e3e3;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      border-radius: 24px;
-      transition: background .15s ease;
-      -webkit-appearance: none;
-      appearance: none;
-    }
-    #${CONTROL_ID} .wd-main { width: 48px; }
-    /* Chevron on the LEFT, darker like Meet's camera "video settings" split. */
-    #${CONTROL_ID} .wd-chevron { width: 30px; background: #282a2c; }
-    /* Material state layer: subtle white overlay on hover, matching Meet. */
-    #${CONTROL_ID} .wd-main:hover { background: #3c3e41; }
-    #${CONTROL_ID} .wd-chevron:hover { background: #313336; }
-    #${CONTROL_ID} .wd-btn:active { background: #43454a; }
-    #${CONTROL_ID} .wd-dot {
-      width: 14px; height: 14px; border-radius: 50%;
-      background: currentColor; display: block;
-    }
-    #${CONTROL_ID} .wd-main.wd-recording {
-      background: #d93025; color: #fff;
-    }
-    #${CONTROL_ID} .wd-main.wd-recording:hover { background: #e2483d; }
-    #${CONTROL_ID} .wd-main.wd-recording .wd-dot { animation: wd-pulse 1.6s ease-in-out infinite; }
-    #${CONTROL_ID} .wd-main.wd-transcribing { background: #f9ab00; color: #202124; }
-    #${CONTROL_ID} .wd-chevron svg { width: 20px; height: 20px; fill: currentColor; }
-    @keyframes wd-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
   `;
 
-  const CHEVRON_SVG =
-    '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 8.29 6.29 14l1.42 1.41L12 11.12l4.29 4.29L17.71 14z"/></svg>';
+  // Main-button content per mode; time and level are filled in place.
+  const CONTENT = {
+    idle: () => icon("rec", 24),
+    offline: () => icon("recOff", 24),
+    starting: () => `${icon("spinner", 20, { stroke: 2.6, cls: "wd-spin" })}<span class="wd-label">Łączenie…</span>`,
+    saving: () => `${icon("spinner", 20, { stroke: 2.6, cls: "wd-spin" })}<span class="wd-label">Zapisywanie…</span>`,
+    recording: () => '<span class="wd-dot"></span><span class="wd-time"></span>' +
+      '<span class="wd-bars" aria-hidden="true"><i></i><i></i><i></i></span>',
+    warning: () => '<span class="wd-dot"></span><span class="wd-time"></span>' +
+      '<span class="wd-bars" aria-hidden="true"><i></i><i></i><i></i></span>' +
+      '<span class="wd-badge" aria-hidden="true">!</span>',
+    paused: () => `${icon("pause", 20, { stroke: 2.6 })}<span class="wd-time"></span>`,
+  };
+  const BAR_PEAKS = [7, 15, 10];
+
+  let view = { mode: "idle", time: "00:00", label: "Rozpocznij nagrywanie", tooltip: "" };
+  let menuOpen = false;
+  let level = 0;
+  let tooltipEl = null;
+  let tooltipFor = null;
 
   function ensureStyle() {
     if (document.getElementById(STYLE_ID)) return;
@@ -115,23 +152,61 @@
     return { parent, before: cell };
   }
 
+  // --- Tooltip ---
+
+  function tooltipText(button) {
+    return button.classList.contains("wd-chev") ? CHEVRON_TIP : view.tooltip;
+  }
+
+  function showTooltip(button) {
+    if (menuOpen) return;
+    const text = tooltipText(button);
+    if (!text) return;
+    if (!tooltipEl) {
+      tooltipEl = document.createElement("div");
+      tooltipEl.id = TOOLTIP_ID;
+      tooltipEl.setAttribute("aria-hidden", "true");
+      document.body.appendChild(tooltipEl);
+    }
+    tooltipFor = button;
+    tooltipEl.textContent = text;
+    const rect = button.getBoundingClientRect();
+    const tip = tooltipEl.getBoundingClientRect();
+    const left = Math.max(8, Math.min(rect.left + rect.width / 2 - tip.width / 2, window.innerWidth - tip.width - 8));
+    tooltipEl.style.left = `${left}px`;
+    tooltipEl.style.top = `${Math.max(8, rect.top - tip.height - 10)}px`;
+    tooltipEl.classList.add("wd-in");
+  }
+
+  function hideTooltip() {
+    tooltipFor = null;
+    if (tooltipEl) tooltipEl.classList.remove("wd-in");
+  }
+
+  function wireTooltip(button) {
+    button.addEventListener("mouseenter", () => showTooltip(button));
+    button.addEventListener("focus", () => showTooltip(button));
+    button.addEventListener("mouseleave", hideTooltip);
+    button.addEventListener("blur", hideTooltip);
+    button.addEventListener("pointerdown", hideTooltip);
+  }
+
+  // --- Control ---
+
   function buildControl(onToggle, onChevron) {
     const control = document.createElement("div");
     control.id = CONTROL_ID;
 
-    const main = document.createElement("button");
-    main.type = "button";
-    main.className = "wd-btn wd-main";
-    main.title = "Whisper — nagrywaj / zatrzymaj";
-    main.setAttribute("aria-label", "Whisper toggle recording");
-    main.innerHTML = '<span class="wd-dot"></span>';
-
     const chevron = document.createElement("button");
     chevron.type = "button";
-    chevron.className = "wd-btn wd-chevron";
-    chevron.title = "Ustawienia Whisper";
-    chevron.setAttribute("aria-label", "Whisper settings");
-    chevron.innerHTML = CHEVRON_SVG;
+    chevron.className = "wd-chev";
+    chevron.setAttribute("aria-label", CHEVRON_TIP);
+    chevron.setAttribute("aria-haspopup", "dialog");
+    chevron.innerHTML = icon("chevUp", 20, { stroke: 2 });
+
+    const main = document.createElement("button");
+    main.type = "button";
+    main.className = "wd-main";
 
     main.addEventListener("click", (e) => {
       e.preventDefault();
@@ -143,11 +218,37 @@
       e.stopPropagation();
       if (typeof onChevron === "function") onChevron();
     });
+    wireTooltip(chevron);
+    wireTooltip(main);
 
     // Chevron LEFT, record button RIGHT — mirrors Meet's camera + settings split.
     control.appendChild(chevron);
     control.appendChild(main);
     return control;
+  }
+
+  function paint(control) {
+    const main = control.querySelector(".wd-main");
+    const chevron = control.querySelector(".wd-chev");
+    if (!main || !chevron) return;
+    if (control.dataset.mode !== view.mode) {
+      control.dataset.mode = view.mode;
+      main.innerHTML = (CONTENT[view.mode] || CONTENT.idle)();
+    }
+    const time = main.querySelector(".wd-time");
+    if (time) time.textContent = view.time;
+    main.setAttribute("aria-label", view.label);
+    main.setAttribute("aria-busy", String(view.mode === "starting" || view.mode === "saving"));
+    control.dataset.menu = menuOpen ? "open" : "closed";
+    chevron.setAttribute("aria-expanded", String(menuOpen));
+    paintLevel(main);
+    if (tooltipFor === main) showTooltip(main);
+  }
+
+  function paintLevel(main) {
+    main.querySelectorAll(".wd-bars i").forEach((bar, i) => {
+      bar.style.height = `${Math.round(4 + (BAR_PEAKS[i] - 4) * level)}px`;
+    });
   }
 
   /**
@@ -163,17 +264,15 @@
       const control = buildControl(onToggle, onChevron);
 
       const spot = findRowInsertion();
-      if (spot) {
-        spot.parent.insertBefore(control, spot.before);
-        return control;
-      }
-      // Fallback: the official end slot (still inside the toolbar region).
-      const slot = document.getElementById(FALLBACK_SLOT_ID);
-      if (slot) {
+      if (spot) spot.parent.insertBefore(control, spot.before);
+      else {
+        // Fallback: the official end slot (still inside the toolbar region).
+        const slot = document.getElementById(FALLBACK_SLOT_ID);
+        if (!slot) return null;
         slot.appendChild(control);
-        return control;
       }
-      return null;
+      paint(control);
+      return control;
     } catch (err) {
       console.error("wd: injectControl failed", err);
       return null;
@@ -204,30 +303,28 @@
     return observer;
   }
 
-  /**
-   * Reflect daemon state on the main button.
-   * @param {"idle"|"recording"|"transcribing"} state
-   * @param {number} [elapsed] seconds — shown as the button tooltip.
-   */
-  function setButtonState(state, elapsed) {
+  function repaint() {
     const control = document.getElementById(CONTROL_ID);
-    if (!control) return;
-    const main = control.querySelector(".wd-main");
-    if (!main) return;
-    main.classList.remove("wd-recording", "wd-transcribing");
-    if (state === "recording") main.classList.add("wd-recording");
-    else if (state === "transcribing") main.classList.add("wd-transcribing");
+    if (control) paint(control);
+  }
 
-    let title = "Whisper — nagrywaj / zatrzymaj";
-    if (state === "recording") {
-      const t = typeof elapsed === "number" && WD.logic
-        ? WD.logic.formatElapsed(elapsed) : "";
-      title = t ? `Whisper — nagrywanie ${t} (kliknij aby zatrzymać)`
-                : "Whisper — nagrywanie (kliknij aby zatrzymać)";
-    } else if (state === "transcribing") {
-      title = "Whisper — transkrypcja…";
-    }
-    main.title = title;
+  /** @param {{mode: string, time: string, label: string, tooltip: string}} next from WD.logic.controlView */
+  function setView(next) {
+    view = { ...view, ...next };
+    repaint();
+  }
+
+  function setMenuOpen(open) {
+    menuOpen = !!open;
+    if (menuOpen) hideTooltip();
+    repaint();
+  }
+
+  /** @param {number} next 0..1 — the louder source's meter level. */
+  function setLevel(next) {
+    level = Math.max(0, Math.min(1, Number(next) || 0));
+    const main = document.querySelector(`${C} .wd-main`);
+    if (main) paintLevel(main);
   }
 
   function teardown() {
@@ -240,9 +337,13 @@
     try {
       const control = document.getElementById(CONTROL_ID);
       if (control) control.remove();
+      if (tooltipEl) tooltipEl.remove();
     } catch (err) {
       console.warn("wd: control remove failed", err);
     }
+    tooltipEl = null;
+    tooltipFor = null;
+    menuOpen = false;
   }
 
   WD.injector = {
@@ -250,7 +351,9 @@
     SLOT_ID: FALLBACK_SLOT_ID,
     injectControl,
     startObserver,
-    setButtonState,
+    setView,
+    setMenuOpen,
+    setLevel,
     teardown,
   };
 })();

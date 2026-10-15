@@ -1142,14 +1142,18 @@ class MenuBarDelegate(NSObject):
                 time.sleep(.05)
             merged = merge_chunk_results(jobs.results())
             merged['duration'] = store.meta['duration']
-            if diarize_ready:
-                try:
-                    from whisper_daemon.diarizer import diarize_file
-                    from whisper_daemon.diarize_merge import merge_speakers_with_transcript
-                    merged = merge_speakers_with_transcript(diarize_file(str(rec_dir / "recording.wav")), merged)
-                except Exception as exc:
-                    store.meta['errors'].append(f"Speaker recognition unavailable: {exc}")
-                    _notify("whisper-daemon", "Speaker recognition unavailable", "Audio and transcript saved without automatic speaker labels.")
+            # The microphone is always the user; only the participants' track is
+            # diarized (the whole recording when there is no participants' track).
+            from whisper_daemon.meeting_speakers import label_meeting
+            try:
+                diarize = None
+                if diarize_ready:
+                    from whisper_daemon.diarizer import diarize_file as diarize
+                merged = label_meeting(rec_dir, merged, diarize)
+            except Exception as exc:
+                store.meta['errors'].append(f"Speaker recognition unavailable: {exc}")
+                _notify("whisper-daemon", "Speaker recognition unavailable", "Audio and transcript saved without automatic speaker labels.")
+                merged = label_meeting(rec_dir, merged, None)
             atomic_json(rec_dir / "transcript.json", merged)
             for fmt in settings.recording_formats:
                 if fmt in FORMATTERS:

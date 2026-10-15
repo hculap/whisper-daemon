@@ -6,7 +6,12 @@ so the user can benchmark quality vs speed and choose.
 
 import logging
 import threading
+import warnings
 from functools import wraps
+
+# Audio reaches pyannote in memory, decoded by the ffmpeg executable, so its
+# warning about torchcodec's shared-library decoder is noise.
+warnings.filterwarnings("ignore", message=r"\s*torchcodec is not installed correctly", category=UserWarning)
 
 _DIARIZE_LOCK = threading.RLock()
 

@@ -15,8 +15,9 @@
   const panel = WD.panel;
   const captions = WD.captions;
   const logic = WD.logic;
+  const toaster = WD.toast;
 
-  if (!injector || !panel || !captions || !logic) {
+  if (!injector || !panel || !captions || !logic || !toaster) {
     console.error("wd: modules missing — content orchestrator aborting");
     return;
   }
@@ -43,6 +44,20 @@
   let captureGeneration = 0;
   let sessionOwned = false; // true once WE issued WD_START (tab OR mic-only)
 
+  // --- What the bar and menu show (daemonState still decides what a click does) ---
+  let paused = false; // from WD_HEALTH
+  let health = null; // {mic, browser} levels from WD_HEALTH
+  let connection = "unknown"; // unknown | connected | offline | unpaired | rejected
+  let diarization = null; // {available, message} from WD_CAPABILITIES
+  let connecting = false; // WD_START sent, the daemon has not reported the phase yet
+  let connectingTimer = null;
+  // Stop sent, the daemon's status has not caught up. Bounded, so a stop that
+  // never lands cannot hide a running recording.
+  let optimisticUntil = 0;
+  const OPTIMISTIC_STOP_MS = 5000;
+  const CONNECTING_MAX_MS = 30000;
+  const SHORTCUT = /Mac|iPhone|iPad/i.test(navigator.platform) ? "⌘⇧M" : "Ctrl+Shift+M";
+
   // --- RTC tap (MAIN-world rtc-tap.js) state ---
   // The primary capture_tab path taps Meet's WebRTC remote audio directly (no
   // getDisplayMedia, no picker, no output-device dependency). The MAIN-world
@@ -57,33 +72,11 @@
     url: location.href,
   });
 
-  // --- Toast (tiny transient message, shadow-free is fine, short-lived) ---
-  function toast(text) {
-    try {
-      const el = document.createElement("div");
-      el.textContent = text;
-      Object.assign(el.style, {
-        position: "fixed",
-        bottom: "80px",
-        left: "50%",
-        transform: "translateX(-50%)",
-        zIndex: "2147483647",
-        background: "rgba(32,33,36,0.95)",
-        color: "#fff",
-        padding: "10px 16px",
-        borderRadius: "8px",
-        fontFamily: "Roboto, Arial, sans-serif",
-        fontSize: "13px",
-        boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
-      });
-      document.body.appendChild(el);
-      setTimeout(() => el.remove(), 3500);
-    } catch (err) {
-      console.warn("wd: toast failed", err);
-    }
+  function toast(text, tone) {
+    toaster.show(text, { tone });
   }
 
-  // --- "No participant audio" banner (persistent, unlike toast) ---
+  // --- "No participant audio" warning (in the menu, badge on the button) ---
   // The shared-tab audio can be dead silence if the user shared the wrong
   // surface or didn't tick "Share tab audio" — otherwise participants are
   // dropped and the transcript fills with hallucinated gibberish. Watch the
@@ -103,40 +96,48 @@
   let tabSilenceSince = 0;
   let tabAudioFrames = 0; // consecutive frames at/above the floor
   let tabAudioEverHeard = false; // set only after sustained energy — then quiet is just quiet
-  let bannerEl = null;
+  let warning = null; // one of WARNINGS while shown
+  const dismissedWarnings = new Set(); // "Ignore" holds for the rest of the session
 
-  function showBanner(text, onClick) {
-    if (!bannerEl) {
-      bannerEl = document.createElement("div");
-      Object.assign(bannerEl.style, {
-        position: "fixed", bottom: "96px", left: "50%",
-        transform: "translateX(-50%)", zIndex: "2147483647",
-        // Amber advisory, not an alarming red stop-now banner: capture may well
-        // be healthy (pre-speech silence is indistinguishable from a dead tab by
-        // RMS alone), so this nudges the user to verify rather than to react.
-        background: "rgba(249,171,0,0.96)", color: "#202124",
-        padding: "10px 16px", borderRadius: "8px", maxWidth: "90vw",
-        textAlign: "center", fontFamily: "Roboto, Arial, sans-serif",
-        fontSize: "13px", boxShadow: "0 4px 16px rgba(0,0,0,0.4)",
-      });
-      document.body.appendChild(bannerEl);
-    }
-    bannerEl.textContent = text;
-    // A click handler makes the banner an actionable fallback trigger (the
-    // getDisplayMedia fallback needs a user gesture — a banner click qualifies).
-    bannerEl.style.cursor = onClick ? "pointer" : "default";
-    bannerEl.onclick = onClick || null;
+  // Amber advisories, not alarms: capture may well be healthy (pre-speech
+  // silence is indistinguishable from a dead tab by RMS alone), so they nudge
+  // the user to verify. The no-tracks action hands off to tab sharing — the
+  // menu button click is the user gesture getDisplayMedia needs.
+  const WARNINGS = {
+    silence: {
+      id: "silence",
+      title: "Nie słyszę uczestników",
+      body: "Ustaw głośnik w Meet na „Domyślny” — przy innym urządzeniu Chrome " +
+        "nagrywa ciszę. Jeśli wszyscy milczą, zignoruj.",
+    },
+    "no-tracks": {
+      id: "no-tracks",
+      title: "Nie widzę dźwięku uczestników",
+      body: "Meet mógł się zmienić. Udostępnij tę kartę z dźwiękiem, aby nagrywać uczestników.",
+      action: "Udostępnij kartę",
+    },
+  };
+
+  function showWarning(id) {
+    if (dismissedWarnings.has(id) || (warning && warning.id === id)) return;
+    const first = !warning;
+    warning = WARNINGS[id];
+    if (first) toast(`${warning.title} — szczegóły w menu Whisper`, "warn");
+    refreshUi();
   }
-  function clearBanner() {
+  function clearWarning() {
     tabSilenceSince = 0;
     if (rtcFallbackTimer) { clearTimeout(rtcFallbackTimer); rtcFallbackTimer = null; }
-    if (bannerEl) { bannerEl.onclick = null; bannerEl.remove(); bannerEl = null; }
+    if (!warning) return;
+    warning = null;
+    refreshUi();
   }
 
   function resetSilenceWatch() {
     tabAudioEverHeard = false;
     tabAudioFrames = 0;
-    clearBanner();
+    dismissedWarnings.clear();
+    clearWarning();
   }
 
   function checkTabSilence(f32) {
@@ -152,7 +153,7 @@
       // chime/blip can't latch the watch off while chunks are still dropped.
       if (++tabAudioFrames >= TAB_AUDIO_MIN_FRAMES) {
         tabAudioEverHeard = true;
-        clearBanner();
+        clearWarning();
       }
       return;
     }
@@ -160,14 +161,7 @@
     tabAudioFrames = 0;
     const now = Date.now();
     if (!tabSilenceSince) tabSilenceSince = now;
-    else if (now - tabSilenceSince > TAB_SILENCE_MS) {
-      showBanner(
-        "🔇 Nie słychać uczestników. Najczęstsza przyczyna: w Meet głośnik jest " +
-        "ustawiony na słuchawki/urządzenie inne niż „Domyślny” — Chrome nie nagrywa " +
-        "wtedy dźwięku karty. Ustaw głośnik Meet na „Domyślny”. Sprawdź też " +
-        "„Udostępnij dźwięk karty”. Jeśli dźwięk działa, zignoruj."
-      );
-    }
+    else if (now - tabSilenceSince > TAB_SILENCE_MS) showWarning("silence");
   }
 
   // --- Capture (page gesture required, runs in content script) ---
@@ -201,6 +195,7 @@
         const { title, url } = meetingMeta();
         sessionOwned = true;
         wdSend({ type: "WD_START", title, url });
+        setConnecting(true);
         return;
       }
 
@@ -220,6 +215,7 @@
       // so AudioContext.resume() is allowed to un-suspend.
       window.postMessage({ source: "wd", type: "WD_RTC_START" }, location.origin);
       wdSend({ type: "WD_START", title, url });
+      setConnecting(true);
     } finally {
       starting = false;
     }
@@ -324,12 +320,13 @@
         const { title, url } = meetingMeta();
         sessionOwned = true;
         wdSend({ type: "WD_START", title, url });
+        setConnecting(true);
       }
     } catch (err) {
       console.error("wd: startDisplayMediaCapture failed", err);
       try { stream.getTracks().forEach((t) => t.stop()); } catch {}
-      toast("Nie udało się rozpocząć nagrywania");
-      if (!resumeSession) injector.setButtonState("idle");
+      toast("Nie udało się rozpocząć nagrywania", "warn");
+      if (!resumeSession) setConnecting(false);
     }
   }
 
@@ -341,7 +338,7 @@
     if (!localCapture || localCapture.mode !== "rtc") return;
     try { window.postMessage({ source: "wd", type: "WD_RTC_STOP" }, location.origin); } catch {}
     localCapture = null; // release RTC ownership before opening the picker
-    clearBanner();
+    clearWarning();
     await startDisplayMediaCapture({ resumeSession: true });
     // If the picker was cancelled / had no audio, localCapture stays null while
     // the daemon session keeps running on nothing — restore the RTC tap so the
@@ -364,25 +361,21 @@
         rtcFallbackTimer = setTimeout(() => {
           rtcFallbackTimer = null;
           if (localCapture && localCapture.mode === "rtc" && remoteTrackCount === 0) {
-            showBanner(
-              "🔇 Nie wykryto ścieżek audio uczestników — Meet mógł się zmienić. " +
-              "Kliknij tutaj, aby użyć „Udostępnij kartę”.",
-              startDisplayMediaFallback
-            );
+            showWarning("no-tracks");
           }
         }, RTC_NO_TRACKS_MS);
       }
     } else if (typeof remoteTrackCount === "number" && remoteTrackCount > 0) {
       if (rtcFallbackTimer) { clearTimeout(rtcFallbackTimer); rtcFallbackTimer = null; }
-      // Tracks appeared — drop the no-tracks banner (the RMS silence watch keeps
+      // Tracks appeared — drop the no-tracks warning (the RMS silence watch keeps
       // its own separate diagnosis running).
-      if (bannerEl && bannerEl.onclick === startDisplayMediaFallback) clearBanner();
+      if (warning && warning.id === "no-tracks") clearWarning();
     }
   }
 
   function teardownLocalCapture() {
     captureGeneration++;
-    clearBanner();
+    clearWarning();
     if (!localCapture) return;
     const cap = localCapture;
     localCapture = null;
@@ -414,14 +407,42 @@
     }
     // Optimistic instant feedback: the socket stays open, so the daemon's real
     // transcribing→idle status will correct this shortly.
-    injector.setButtonState("transcribing");
-    panel.setRecording(true);
+    optimisticUntil = Date.now() + OPTIMISTIC_STOP_MS;
+    refreshUi();
   }
 
-  // --- Main toggle (button + panel action share this) ---
+  // --- Main toggle (button, menu and shortcut share this) ---
   function onToggle() {
-    if (daemonState === "idle") startCapture();
+    // A paused meeting resumes first; stopping it is the menu's explicit action.
+    if (daemonState === "recording" && paused) wdSend({ type: "WD_PAUSE_MEETING" });
+    else if (daemonState === "idle") startCapture();
     else stopCapture();
+  }
+
+  // --- Bar + menu presentation ---
+  function setConnecting(on) {
+    clearTimeout(connectingTimer);
+    connecting = on;
+    if (on) connectingTimer = setTimeout(() => setConnecting(false), CONNECTING_MAX_MS);
+    refreshUi();
+  }
+
+  function refreshUi() {
+    const stopping = daemonState === "recording" && Date.now() < optimisticUntil;
+    const shownState = stopping ? "transcribing" : daemonState;
+    injector.setView(logic.controlView({
+      daemonState: shownState, starting: connecting, paused, warning: !!warning,
+      connection, elapsed: lastElapsed, shortcut: SHORTCUT,
+    }));
+    panel.update({
+      daemonState: shownState, starting: connecting, paused, elapsed: lastElapsed, health,
+      warning, connection, diarization, title: meetingMeta().title, shortcut: SHORTCUT,
+    });
+  }
+
+  function loudestLevel(sources) {
+    if (!sources) return 0;
+    return Math.max(0, ...Object.values(sources).map((source) => logic.sourceView(source).level));
   }
 
   // --- Settings patch flow ---
@@ -458,19 +479,35 @@
   }
 
   // --- Incoming SW messages ---
-  chrome.runtime.onMessage.addListener((msg) => {
+  chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (!msg || typeof msg !== "object") return;
 
     if (msg.type === "WD_HEALTH") {
-      panel.setHealth(msg.sources, msg.paused);
+      health = msg.sources || null;
+      paused = !!msg.paused;
+      connection = "connected";
+      injector.setLevel(loudestLevel(health));
+      refreshUi();
     } else if (msg.type === "WD_CAPABILITIES") {
-      if (!msg.diarization.available) toast(msg.diarization.message);
+      diarization = msg.diarization || null;
+      if (diarization && !diarization.available) toast(diarization.message, "warn");
+      refreshUi();
+    } else if (msg.type === "WD_CONNECTION") {
+      connection = msg.state || "unknown";
+      refreshUi();
     } else if (msg.type === "WD_STATUS") {
       daemonState = msg.state || "idle";
       lastElapsed = typeof msg.elapsed === "number" ? msg.elapsed : lastElapsed;
-      injector.setButtonState(daemonState, msg.elapsed);
-      panel.setRecording(daemonState !== "idle");
+      connection = "connected";
+      if (daemonState !== "idle") {
+        clearTimeout(connectingTimer);
+        connecting = false;
+      }
       if (daemonState !== "recording") {
+        optimisticUntil = 0;
+        paused = false;
+        health = null;
+        injector.setLevel(0);
         // Daemon says we are no longer recording (idle from a menu-bar/remote
         // stop, or transcribing after the audio stream closed). Release any
         // local getDisplayMedia capture so the tab-audio share indicator goes
@@ -482,13 +519,16 @@
           sessionOwned = false; // meeting fully finished
         }
       }
+      refreshUi();
       applyCaptionsVisibility();
     } else if (msg.type === "WD_SETTINGS") {
       currentSettings = msg.settings || currentSettings;
       if (currentSettings && "live_captions" in currentSettings) {
         liveCaptionsOn = !!currentSettings.live_captions;
       }
+      connection = "connected";
       panel.render(currentSettings, msg.devices);
+      refreshUi();
       applyCaptionsVisibility();
     } else if (msg.type === "WD_CHUNK") {
       captionLines = logic.captionsReducer(captionLines, msg.text || "");
@@ -505,14 +545,24 @@
       daemonState = "idle";
       sessionOwned = false;
       captionLines = [];
-      toast(msg.message || "Błąd nagrywania");
-      injector.setButtonState("idle");
-      panel.setRecording(false);
+      clearTimeout(connectingTimer);
+      connecting = false;
+      optimisticUntil = 0;
+      paused = false;
+      toast(msg.message || "Błąd nagrywania", "warn");
+      refreshUi();
       applyCaptionsVisibility();
     } else if (msg.type === "WD_COMMAND_TOGGLE") {
       // Keyboard shortcut. Note: starting needs a page gesture, so a
       // command-triggered START may be blocked by the browser — stop always works.
       onToggle();
+    } else if (msg.type === "WD_REQUEST_STOP") {
+      // Popup Stop for a session this tab started (or a menu-bar one). The
+      // reply tells background not to fall back to its own teardown.
+      if (daemonState !== "idle") stopCapture();
+      sendResponse({ ok: true });
+    } else if (msg.type === "WD_OPEN_MENU") {
+      panel.show();
     } else if (msg.type === "WD_MEET_LEFT") {
       onMeetLeft();
     } else if (msg.type === "WD_MEET_JOINED") {
@@ -545,11 +595,10 @@
 
   // --- Boot / lifecycle ---
   function reinject() {
+    // Meet re-rendered the toolbar slot. The injector repaints the fresh control
+    // with the last view, so an active recording keeps its red pill and timer
+    // instead of flashing idle until the next status push.
     injector.injectControl(onToggle, () => panel.toggle());
-    // Meet re-rendered the toolbar slot — a fresh idle button was built. Repaint
-    // it with the last known daemon state so an active recording keeps its red
-    // pulse/timer instead of flashing idle until the next status push.
-    injector.setButtonState(daemonState, lastElapsed);
   }
 
   // Meet is an SPA: leaving a call does not reload the content scripts. Stop any
@@ -560,16 +609,48 @@
     // Background also fully tears down the offscreen socket on MEET_LEFT; clear
     // ownership so a later re-join starts clean.
     sessionOwned = false;
+    clearTimeout(connectingTimer);
+    connecting = false;
     injector.teardown();
     panel.teardown();
     captions.teardown();
+    toaster.teardown();
   }
 
   // Build the control, observer, and panel wiring, then hydrate settings. Also
   // opens the control connection so the daemon pushes status — lighting the
   // in-bar button for a menu-bar-started meeting.
   function initUi() {
-    panel.init({ onPatch: sendPatch, onAction: onToggle, onReset });
+    panel.init({
+      onPatch: sendPatch,
+      onAction: onToggle,
+      onReset,
+      onPause: () => wdSend({ type: "WD_PAUSE_MEETING" }),
+      onReconnect: () => {
+        connection = "unknown";
+        refreshUi();
+        wdSend({ type: "WD_GET_SETTINGS" });
+      },
+      onPair: () => wdSend({ type: "OPEN_POPUP" }),
+      onWarningAction: () => {
+        if (warning && warning.id === "no-tracks") {
+          panel.hide();
+          startDisplayMediaFallback();
+        }
+      },
+      onWarningDismiss: () => {
+        if (!warning) return;
+        dismissedWarnings.add(warning.id);
+        warning = null;
+        refreshUi();
+      },
+      onOpenChange: (open) => {
+        injector.setMenuOpen(open);
+        // Opening the menu refreshes settings and retries a lost daemon link.
+        if (open) wdSend({ type: "WD_GET_SETTINGS" });
+      },
+    });
+    refreshUi();
     reinject();
     injector.startObserver(reinject);
     wdSend({ type: "WD_GET_SETTINGS" });

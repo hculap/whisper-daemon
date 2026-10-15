@@ -21,6 +21,16 @@ const COLD_SETTINGS = Object.freeze([
   "capture_tab",
 ]);
 
+// Curated subset of Whisper languages; "auto" detects per chunk (unreliable on
+// short audio — forcing a language stops the wrong-language captions).
+const LANGUAGES = Object.freeze([
+  ["auto", "Wykryj automatycznie"], ["pl", "Polski"], ["en", "English"],
+  ["de", "Deutsch"], ["es", "Español"], ["fr", "Français"], ["it", "Italiano"],
+  ["nl", "Nederlands"], ["uk", "Українська"], ["ru", "Русский"],
+  ["cs", "Čeština"], ["sk", "Slovenčina"], ["sv", "Svenska"],
+  ["no", "Norsk"], ["da", "Dansk"], ["fi", "Suomi"],
+]);
+
 // Split on whitespace that follows a sentence terminator.
 const SENTENCE_SPLIT = /(?<=[.!?…])\s+/;
 
@@ -108,7 +118,8 @@ function diffSettings(current, next) {
 }
 
 /**
- * Format elapsed seconds as "MM:SS". Invalid/negative input clamps to "00:00".
+ * Format elapsed seconds as "MM:SS", or "H:MM:SS" from one hour on.
+ * Invalid/negative input clamps to "00:00".
  *
  * @param {number} seconds
  * @returns {string}
@@ -118,9 +129,88 @@ function formatElapsed(seconds) {
     typeof seconds === "number" && Number.isFinite(seconds) && seconds > 0
       ? Math.floor(seconds)
       : 0;
-  const mm = String(Math.floor(total / 60)).padStart(2, "0");
+  const hours = Math.floor(total / 3600);
+  const mm = String(Math.floor((total % 3600) / 60)).padStart(2, "0");
   const ss = String(total % 60).padStart(2, "0");
-  return `${mm}:${ss}`;
+  return hours ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
+// A source with no audio for this long has no signal; above this RMS it carries
+// speech (the daemon's silence floor).
+const SOURCE_STALE_SECONDS = 3;
+const SPEECH_RMS = 0.005;
+const METER_PEAKS = Object.freeze([8, 14, 19, 11, 6]);
+const METER_REST = 4;
+
+/**
+ * Level meter + status word for one daemon health source ({rms, age}).
+ *
+ * @param {{rms?: number, age?: number}} source
+ * @returns {{status: "speaking"|"quiet"|"silent", label: string, bars: number[], level: number}}
+ *   level is the lit share of the meter, 0..1.
+ */
+function sourceView(source) {
+  const rms = Number.isFinite(source?.rms) ? source.rms : 0;
+  const age = Number.isFinite(source?.age) ? source.age : Infinity;
+  if (age > SOURCE_STALE_SECONDS) {
+    return { status: "silent", label: "brak sygnału", bars: METER_PEAKS.map(() => METER_REST), level: 0 };
+  }
+  // The speech floor (~-46 dBFS) lights one bar, ~-14 dBFS lights all five.
+  const db = 20 * Math.log10(Math.max(rms, 1e-6));
+  const lit = Math.max(0, Math.min(METER_PEAKS.length, Math.round((db + 54) / 8)));
+  const speaking = rms > SPEECH_RMS;
+  return {
+    status: speaking ? "speaking" : "quiet",
+    label: speaking ? "mowa" : "cisza",
+    bars: METER_PEAKS.map((peak, i) => (i < lit ? peak : METER_REST)),
+    level: lit / METER_PEAKS.length,
+  };
+}
+
+/**
+ * What the Meet bar button shows. Visual only: daemonState stays the single
+ * source of truth for what a click does.
+ *
+ * @param {{daemonState?: string, starting?: boolean, paused?: boolean,
+ *   warning?: boolean, connection?: string, elapsed?: number, shortcut?: string}} input
+ * @returns {{mode: string, time: string, label: string, tooltip: string}}
+ */
+function controlView({
+  daemonState = "idle",
+  starting = false,
+  paused = false,
+  warning = false,
+  connection = "unknown",
+  elapsed = 0,
+  shortcut = "⌘⇧M",
+} = {}) {
+  const time = formatElapsed(elapsed);
+  if (daemonState === "recording") {
+    if (paused) {
+      return { mode: "paused", time, label: `Wznów nagrywanie, wstrzymane na ${time}`, tooltip: "Wznów nagrywanie" };
+    }
+    if (warning) {
+      return {
+        mode: "warning", time,
+        label: `Zatrzymaj nagrywanie, ${time}. Nie słychać uczestników`,
+        tooltip: "Nie słyszę uczestników — szczegóły w menu",
+      };
+    }
+    return { mode: "recording", time, label: `Zatrzymaj nagrywanie, ${time}`, tooltip: `Zatrzymaj i zapisz · ${shortcut}` };
+  }
+  if (daemonState === "transcribing") {
+    return { mode: "saving", time, label: "Zapisywanie transkrypcji", tooltip: "Zapisuję transkrypcję…" };
+  }
+  if (starting) {
+    return { mode: "starting", time, label: "Łączenie z daemonem", tooltip: "Łączenie z daemonem…" };
+  }
+  if (connection === "offline") {
+    return { mode: "offline", time, label: "Daemon niedostępny", tooltip: "Daemon nie odpowiada — uruchom whisper-daemon" };
+  }
+  if (connection === "unpaired" || connection === "rejected") {
+    return { mode: "offline", time, label: "Rozszerzenie niesparowane", tooltip: "Sparuj rozszerzenie — kliknij ikonę Whisper w Chrome" };
+  }
+  return { mode: "idle", time, label: `Rozpocznij nagrywanie (${shortcut})`, tooltip: `Nagrywaj spotkanie · ${shortcut}` };
 }
 
 /**
@@ -134,10 +224,13 @@ function isColdSetting(key) {
 if (typeof module !== "undefined" && module.exports) {
   module.exports = {
     COLD_SETTINGS,
+    LANGUAGES,
     captionsReducer,
+    controlView,
     diffSettings,
     formatElapsed,
     isColdSetting,
+    sourceView,
   };
 } else if (typeof window !== "undefined") {
   // Content-script context: publish on the shared WD namespace so the other
@@ -145,9 +238,12 @@ if (typeof module !== "undefined" && module.exports) {
   window.WD = window.WD || {};
   window.WD.logic = {
     COLD_SETTINGS,
+    LANGUAGES,
     captionsReducer,
+    controlView,
     diffSettings,
     formatElapsed,
     isColdSetting,
+    sourceView,
   };
 }

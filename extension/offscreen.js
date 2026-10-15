@@ -241,7 +241,7 @@ function failStart(gen, err) {
   // The daemon never owned this session; keep what was captured meanwhile.
   if (err.code === "busy" && pcmBuffer.length) {
     recoveryTails.push({id: sessionId, packets: pcmBuffer, position: pcmPosition});
-    message += " Audio captured meanwhile is kept for export in the extension popup.";
+    message += " Dźwięk nagrany w międzyczasie czeka na pobranie w popupie rozszerzenia.";
   }
   cleanup();
   chrome.runtime.sendMessage({ type: "CAPTURE_ERROR", message });
@@ -270,7 +270,9 @@ async function beginSession(gen) {
     cleanup();
     chrome.runtime.sendMessage({
       type: "CAPTURE_ERROR",
-      message: "Cannot connect to whisper-daemon. Is it running? Try: whisper-daemon restart",
+      message: connectionFailure === "offline"
+        ? "Brak połączenia z whisper-daemon. Uruchom go: whisper-daemon restart"
+        : "Sparuj rozszerzenie: otwórz jego popup i wklej klucz z Terminala.",
     });
     return false;
   }
@@ -367,7 +369,7 @@ function bufferPcm(packet) {
       return false;
     }
     stopForwarding();
-    chrome.runtime.sendMessage({type: "CAPTURE_ERROR", message: "Audio connection buffer is full. Recording stopped; already delivered audio is saved."});
+    chrome.runtime.sendMessage({type: "CAPTURE_ERROR", message: "Bufor połączenia audio jest pełny. Nagrywanie zatrzymane; dostarczony dźwięk jest zapisany."});
     return false;
   }
   pcmBuffer.push(packet);
@@ -520,14 +522,8 @@ async function waitForReconnect(timeoutMs = RECONNECT_INTERVAL_MS * 3) {
 
 async function sendControl(obj) {
   try {
-    const ok = await ensureControlConnection();
-    if (!ok) {
-      chrome.runtime.sendMessage({
-        type: "CAPTURE_ERROR",
-        message: "whisper-daemon unreachable for settings.",
-      });
-      return;
-    }
+    // A failed connect already reported CONNECTION; it is not a capture error.
+    if (!await ensureControlConnection()) return;
     ws.send(JSON.stringify(obj));
   } catch (err) {
     console.warn("Control message failed:", err);
@@ -562,6 +558,7 @@ async function openSharedSocket(attempts, gen) {
 
 async function connectWebSocket(attempts, gen) {
   const connectionGen = socketGen;
+  let failure = "offline";
   for (let attempt = 0; attempt < attempts; attempt++) {
     try {
       const socket = await openWebSocket(WS_URL);
@@ -572,14 +569,30 @@ async function connectWebSocket(attempts, gen) {
       ws = socket;
       ws.onmessage = handleServerMessage;
       ws.onclose = handleUnexpectedClose;
+      reportConnection("connected");
       return true;
-    } catch {
+    } catch (err) {
+      failure = err?.code || "offline";
+      // A missing or rejected key does not fix itself between attempts.
+      if (failure !== "offline") break;
       if (attempt < attempts - 1 && connectionGen === socketGen) {
         await sleep(CONNECT_DELAY_MS);
       }
     }
   }
+  if (connectionGen === socketGen) {
+    connectionFailure = failure;
+    reportConnection(failure);
+  }
   return false;
+}
+
+// Why the last connect failed, so a refused start names the right fix.
+let connectionFailure = "offline";
+
+// connected | offline | unpaired | rejected — drives the popup and Meet UI.
+function reportConnection(state) {
+  chrome.runtime.sendMessage({ type: "CONNECTION", state });
 }
 
 function handleServerMessage(event) {
@@ -690,7 +703,7 @@ async function reconnectLoop(gen) {
     cleanup();
     chrome.runtime.sendMessage({
       type: "CAPTURE_ERROR",
-      message: "Lost connection to whisper-daemon and could not reconnect.",
+      message: "Utracono połączenie z whisper-daemon i nie udało się go przywrócić.",
     });
   }
 }
@@ -702,21 +715,31 @@ async function readPairingSecret() {
   return reply?.secret || null;
 }
 
+function connectionError(message, code) {
+  return Object.assign(new Error(message), { code });
+}
+
 async function openWebSocket(url) {
   const secret = await readPairingSecret();
-  if (!secret) throw new Error("Pair this extension in its popup first");
+  if (!secret) throw connectionError("Pair this extension in its popup first", "unpaired");
   return new Promise((resolve, reject) => {
     const socket = new WebSocket(url);
-    const timer = setTimeout(() => { socket.close(); reject(new Error("Authentication timeout")); }, 6000);
+    let opened = false;
+    const timer = setTimeout(() => { socket.close(); reject(connectionError("Authentication timeout", "offline")); }, 6000);
     socket.binaryType = "arraybuffer";
-    socket.onopen = () => socket.send(JSON.stringify({type: "auth", secret}));
+    socket.onopen = () => { opened = true; socket.send(JSON.stringify({type: "auth", secret})); };
     socket.onmessage = event => {
       let data;
       try { data = JSON.parse(event.data); } catch { return; }
       if (data.type === "authenticated") { clearTimeout(timer); resolve(socket); }
     };
-    socket.onclose = () => { clearTimeout(timer); reject(new Error("Pairing rejected by daemon")); };
-    socket.onerror = err => { clearTimeout(timer); reject(err); };
+    // Closed after opening but before authenticating: the daemon refused the key.
+    socket.onclose = () => {
+      clearTimeout(timer);
+      reject(opened ? connectionError("Pairing rejected by daemon", "rejected")
+                    : connectionError("Daemon unreachable", "offline"));
+    };
+    socket.onerror = () => { clearTimeout(timer); reject(connectionError("Daemon unreachable", "offline")); };
   });
 }
 

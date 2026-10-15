@@ -20,7 +20,10 @@
       "js": [
         "content.js",
         "wd-logic.js",
+        "wd-icons.js",
+        "wd-toast.js",
         "wd-injector.js",
+        "wd-panel-view.js",
         "wd-panel.js",
         "wd-captions.js",
         "wd-content.js"

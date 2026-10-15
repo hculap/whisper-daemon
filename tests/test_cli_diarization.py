@@ -54,7 +54,7 @@ def test_cli_realtime_embedding_failure_falls_back_to_batch(tmp_path, monkeypatc
 
         def start(self):
             audio = np.full(32000, 0.1, dtype=np.float32)
-            self.raw_sink(audio)
+            self.raw_sink(audio, 0)  # device audio carries its session position
             self.jobs.put(meeting_recorder.AudioChunk(audio, 0, 2))
 
         def stop(self):

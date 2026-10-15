@@ -1,7 +1,11 @@
 /**
- * wd-panel.js — settings menu rendered in a Shadow DOM, styled to match Google
- * Meet's native "more options" menu (dark surface, left-icon rows, dividers,
- * Material switches, Google Sans). Anchored above the Whisper control.
+ * wd-panel.js — the Whisper menu above the Meet toolbar, rendered in a Shadow
+ * DOM and anchored to the in-bar control. Markup and styles live in
+ * wd-panel-view.js; this file owns the host, input handling and live updates.
+ *
+ * The daemon pushes status and health once a second. Those ticks only patch the
+ * timer and level meters in place; the menu is rebuilt only when something
+ * structural changes, and never while a field in it is being edited.
  *
  * Classic content script sharing the isolated-world scope. Exposes WD.panel.
  */
@@ -12,129 +16,49 @@
   const WD = (window.WD = window.WD || {});
 
   const HOST_ID = "wd-panel-host";
-  const FORMATS = ["txt", "srt", "vtt", "json"];
-  // Curated subset of Whisper languages; "auto" detects per chunk (unreliable on
-  // short audio — forcing a language stops the wrong-language captions).
-  const LANGUAGES = [
-    ["auto", "Wykryj automatycznie"], ["pl", "Polski"], ["en", "English"],
-    ["de", "Deutsch"], ["es", "Español"], ["fr", "Français"], ["it", "Italiano"],
-    ["nl", "Nederlands"], ["uk", "Українська"], ["ru", "Русский"],
-    ["cs", "Čeština"], ["sk", "Slovenčina"], ["sv", "Svenska"],
-    ["no", "Norsk"], ["da", "Dansk"], ["fi", "Suomi"],
-  ];
-
-  // Outline icons (Google-Symbols-like) drawn with currentColor strokes; the
-  // record glyph is a filled dot. Kept inline so nothing loads over the network.
-  const ICONS = {
-    rec: '<circle cx="12" cy="12" r="6" fill="currentColor" stroke="none"/>',
-    mic: '<rect x="9" y="3" width="6" height="11" rx="3"/><path d="M6 11a6 6 0 0 0 12 0"/><path d="M12 17v4"/>',
-    me: '<circle cx="12" cy="8" r="3.4"/><path d="M5 20a7 7 0 0 1 14 0"/>',
-    people: '<circle cx="9" cy="8.5" r="3"/><path d="M3.2 19a5.8 5.8 0 0 1 11.6 0"/><path d="M15.5 6.2a3 3 0 0 1 0 5.6"/><path d="M17 13.4a5.8 5.8 0 0 1 3.8 5.6"/>',
-    shot: '<rect x="3" y="6" width="18" height="13" rx="2.5"/><circle cx="12" cy="12.5" r="3.4"/>',
-    cc: '<rect x="3" y="5" width="18" height="14" rx="2.5"/><path d="M7.5 13h3"/><path d="M13.5 13h3.5"/>',
-    diar: '<circle cx="9" cy="9" r="3.2"/><path d="M3.5 20a5.5 5.5 0 0 1 11 0"/><path d="M16 8a3.6 3.6 0 0 1 0 8"/><path d="M18.4 6a6.8 6.8 0 0 1 0 12"/>',
-    lang: '<circle cx="12" cy="12" r="9"/><path d="M3 12h18"/><path d="M12 3c2.5 2.4 3.8 5.6 3.8 9s-1.3 6.6-3.8 9c-2.5-2.4-3.8-5.6-3.8-9S9.5 5.4 12 3z"/>',
-    folder: '<path d="M3.5 7a2 2 0 0 1 2-2h3.2l2 2H18.5a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/>',
-    doc: '<path d="M7 3.5h7l4 4V19a1.5 1.5 0 0 1-1.5 1.5h-9A1.5 1.5 0 0 1 6 19V5A1.5 1.5 0 0 1 7 3.5z"/><path d="M13.5 3.5V8H18"/><path d="M9 13h6"/><path d="M9 16h4"/>',
-    reset: '<path d="M12 6V3L7.5 7.5 12 12V9a4.5 4.5 0 1 1-4.5 4.5"/>',
+  const MENU_WIDTH = 360;
+  const ACTIONS = {
+    toggle: "onAction",
+    pause: "onPause",
+    reset: "onReset",
+    reconnect: "onReconnect",
+    pair: "onPair",
+    "warning-action": "onWarningAction",
+    "warning-dismiss": "onWarningDismiss",
   };
-  function ic(name) {
-    return `<svg class="wd-ic" viewBox="0 0 24 24" aria-hidden="true">${ICONS[name] || ""}</svg>`;
-  }
+  // Attributes that identify a control across re-renders (focus restore).
+  const FOCUS_KEYS = ["action", "switch", "tile", "disp", "fmt", "key"];
 
-  const CSS = `
-    :host { all: initial; }
-    .wd-menu {
-      position: fixed;
-      z-index: 2147483646;
-      width: 340px;
-      max-height: 78vh;
-      overflow-y: auto;
-      background: #282a2c;
-      color: #e3e3e3;
-      border-radius: 12px;
-      box-shadow: 0 8px 28px rgba(0,0,0,.6), 0 1px 3px rgba(0,0,0,.4);
-      padding: 8px 0;
-      font-family: "Google Sans", "Roboto", Arial, sans-serif;
-      font-size: 14px;
-      display: none;
-      user-select: none;
-    }
-    .wd-menu.wd-open { display: block; }
-    .wd-menu::-webkit-scrollbar { width: 8px; }
-    .wd-menu::-webkit-scrollbar-thumb { background: #5f6368; border-radius: 4px; }
-
-    .wd-row {
-      display: flex; align-items: center; gap: 16px;
-      min-height: 44px; padding: 4px 20px; box-sizing: border-box;
-    }
-    .wd-row.wd-click { cursor: pointer; }
-    .wd-row.wd-click:hover { background: rgba(255,255,255,.08); }
-    .wd-ic { width: 22px; height: 22px; flex: none; fill: none;
-      stroke: #c4c7c5; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
-    .wd-label { flex: 1; min-width: 0; }
-    .wd-sub-label { flex: 1; padding-left: 38px; color: #c4c7c5; font-size: 13px; }
-
-    /* Primary record action — echoes Meet's top menu item. */
-    .wd-primary { width: 100%; text-align: left; background: none; border: none;
-      color: inherit; font: inherit; }
-    .wd-primary .wd-ic { fill: #e3e3e3; stroke: none; }
-    .wd-primary .wd-txt { display: flex; flex-direction: column; line-height: 1.25; }
-    .wd-primary .wd-title { font-size: 14px; }
-    .wd-primary .wd-desc { font-size: 12px; color: #9aa0a6; }
-    .wd-primary.wd-rec .wd-ic { fill: #f28b82; }
-    .wd-primary.wd-rec .wd-title { color: #f28b82; }
-
-    .wd-div { height: 1px; background: rgba(255,255,255,.12); margin: 8px 0; }
-
-    /* Material switch */
-    .wd-sw { appearance: none; -webkit-appearance: none; position: relative;
-      width: 34px; height: 20px; border-radius: 10px; background: #5f6368;
-      cursor: pointer; transition: background .15s; flex: none; margin: 0; }
-    .wd-sw::before { content: ""; position: absolute; top: 3px; left: 3px;
-      width: 14px; height: 14px; border-radius: 50%; background: #e3e3e3;
-      transition: transform .15s, background .15s; }
-    .wd-sw:checked { background: #8ab4f8; }
-    .wd-sw:checked::before { transform: translateX(14px); background: #202124; }
-
-    .wd-sel, .wd-txt-in {
-      background: #303134; color: #e3e3e3; border: 1px solid #5f6368;
-      border-radius: 8px; padding: 7px 10px; font: inherit; font-size: 13px;
-      width: 100%; box-sizing: border-box;
-    }
-    .wd-field { padding: 2px 20px 8px 58px; }
-    .wd-sel-inline { max-width: 130px; width: auto; }
-
-    .wd-radio { display: flex; align-items: center; gap: 10px; padding: 6px 20px 6px 58px;
-      cursor: pointer; }
-    .wd-radio:hover { background: rgba(255,255,255,.06); }
-    .wd-radio input { accent-color: #8ab4f8; width: 16px; height: 16px; }
-
-    .wd-chips { display: flex; gap: 8px; flex-wrap: wrap; padding: 4px 20px 8px 58px; }
-    .wd-chip { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px;
-      border: 1px solid #5f6368; border-radius: 16px; cursor: pointer; font-size: 13px;
-      color: #c4c7c5; }
-    .wd-chip.wd-on { background: #004a77; border-color: #004a77; color: #d3e3fd; }
-    .wd-chip input { display: none; }
-
-    .wd-note { padding: 0 20px 6px 58px; font-size: 12px; color: #9aa0a6; display: none; }
-    .wd-note.wd-show { display: block; }
-
-    .wd-reset .wd-ic { stroke: #8ab4f8; }
-    .wd-reset .wd-label { color: #8ab4f8; }
-  `;
+  const INITIAL_MODEL = Object.freeze({
+    settings: null,
+    devices: [],
+    daemonState: "idle",
+    starting: false,
+    paused: false,
+    elapsed: 0,
+    health: null,
+    warning: null,
+    connection: "unknown",
+    title: "",
+    diarization: null,
+    subview: "main",
+    shortcut: "⌘⇧M",
+  });
 
   let hostEl = null;
   let shadow = null;
   let popEl = null;
-  let onPatch = null;
-  let onAction = null;
-  let onReset = null;
-  let currentSettings = {};
-  let recordingActive = false;
-  let lastDevices = [];
-  let outsideClick = null;
+  let callbacks = {};
+  let model = INITIAL_MODEL;
+  let renderedKey = null;
   let renderPending = false;
+  let docListeners = null;
+
+  // Everything except the 1 Hz values (elapsed, health), which tick() patches.
+  function structuralKey(m) {
+    return JSON.stringify([m.settings, m.devices, m.daemonState, m.starting, m.paused, m.warning,
+      m.connection, m.title, m.diarization, m.subview, m.shortcut]);
+  }
 
   function buildHost() {
     if (hostEl) return;
@@ -143,41 +67,223 @@
     shadow = hostEl.attachShadow({ mode: "open" });
 
     const style = document.createElement("style");
-    style.textContent = CSS;
+    style.textContent = WD.panelView.CSS;
     shadow.appendChild(style);
 
     popEl = document.createElement("div");
     popEl.className = "wd-menu";
+    popEl.setAttribute("role", "dialog");
+    popEl.setAttribute("aria-label", "Whisper — nagrywanie");
+    popEl.style.setProperty("--wd-font", WD.icons.FONT);
+    popEl.addEventListener("click", onClick);
+    popEl.addEventListener("change", onChange);
     shadow.appendChild(popEl);
-
-    document.body.appendChild(hostEl);
-
     shadow.addEventListener("focusout", () => {
-      if (!renderPending) return;
-      setTimeout(() => {
-        if (renderPending && !isEditingInPanel()) render(currentSettings, lastDevices);
-      }, 0);
+      setTimeout(() => { if (renderPending && !isEditing()) render(); }, 0);
     });
 
-    outsideClick = (e) => {
-      if (!popEl.classList.contains("wd-open")) return;
-      if (e.composedPath().includes(hostEl)) return;
-      const control = document.getElementById(
-        WD.injector ? WD.injector.CONTROL_ID : "wd-control"
-      );
-      if (control && e.composedPath().includes(control)) return;
+    document.body.appendChild(hostEl);
+  }
+
+  function isEditing() {
+    const el = shadow && shadow.activeElement;
+    return !!el && (el.tagName === "SELECT" || el.tagName === "INPUT");
+  }
+
+  function call(name, ...args) {
+    const fn = callbacks[name];
+    if (typeof fn === "function") fn(...args);
+  }
+
+  // Optimistic: the switch flips now; the daemon's settings echo confirms it.
+  function patch(change) {
+    if (!model.settings || !change || !Object.keys(change).length) return;
+    model = { ...model, settings: { ...model.settings, ...change } };
+    render();
+    call("onPatch", change);
+  }
+
+  function onClick(event) {
+    const button = event.target.closest("button");
+    if (!button || button.disabled) return;
+    const { action, switch: key, tile, disp, fmt } = button.dataset;
+    if (action === "settings" || action === "back") {
+      model = { ...model, subview: action === "settings" ? "settings" : "main" };
+      render();
+      const first = popEl.querySelector("button");
+      if (first) first.focus({ preventScroll: true });
+    } else if (action) {
+      call(ACTIONS[action]);
+    } else if (key) {
+      patch({ [key]: button.getAttribute("aria-checked") !== "true" });
+    } else if (tile) {
+      patch({ [tile]: button.getAttribute("aria-pressed") !== "true" });
+    } else if (disp) {
+      patch({ screenshot_displays: disp });
+    } else if (fmt && model.settings) {
+      const current = Array.isArray(model.settings.recording_formats) ? model.settings.recording_formats : ["txt"];
+      const next = current.includes(fmt) ? current.filter((f) => f !== fmt) : [...current, fmt];
+      if (next.length) patch({ recording_formats: next });
+    }
+  }
+
+  function onChange(event) {
+    const el = event.target;
+    const key = el.dataset && el.dataset.key;
+    if (!key || !model.settings) return;
+    const value = el.tagName === "INPUT" ? el.value.trim() : el.value;
+    if (!value && key === "recording_dir") return;
+    if (model.settings[key] !== value) {
+      el.blur();
+      patch({ [key]: value });
+    }
+  }
+
+  function focusSelector() {
+    const el = shadow && shadow.activeElement;
+    if (!el || !el.dataset) return null;
+    const attr = FOCUS_KEYS.find((name) => el.dataset[name] !== undefined);
+    return attr ? `[data-${attr}="${CSS.escape(el.dataset[attr])}"]` : null;
+  }
+
+  function render() {
+    if (!popEl) return;
+    if (isEditing()) {
+      renderPending = true;
+      return;
+    }
+    renderPending = false;
+    renderedKey = structuralKey(model);
+    const scroll = popEl.scrollTop;
+    const focus = focusSelector();
+    popEl.innerHTML = WD.panelView.render(model);
+    popEl.scrollTop = scroll;
+    if (focus) {
+      const target = popEl.querySelector(focus);
+      if (target) target.focus({ preventScroll: true });
+    }
+    tick();
+    if (isOpen()) position();
+  }
+
+  // 1 Hz values: timer and level meters, patched in place.
+  function tick() {
+    if (!popEl) return;
+    const timer = popEl.querySelector('[data-el="timer"]');
+    if (timer) timer.textContent = WD.logic.formatElapsed(model.elapsed);
+    for (const src of WD.panelView.SOURCES) {
+      const row = popEl.querySelector(`[data-src="${src.key}"]`);
+      if (!row || !row.querySelector(".wd-meter")) continue;
+      const known = !!(model.health && model.health[src.key]);
+      const level = WD.logic.sourceView(known ? model.health[src.key] : null);
+      const status = row.querySelector('[data-el="status"]');
+      if (status) status.textContent = known ? level.label : "…";
+      row.classList.toggle("wd-speaking", level.status === "speaking");
+      row.classList.toggle("wd-silent", known && level.status === "silent");
+      row.querySelectorAll(".wd-meter i").forEach((bar, i) => {
+        bar.style.height = `${level.bars[i]}px`;
+      });
+    }
+  }
+
+  /** Merge model fields; rebuilds only on a structural change. */
+  function update(partial) {
+    const next = { ...model, ...partial };
+    // Leaving a recording returns to the main menu.
+    if (next.daemonState !== "recording") next.subview = "main";
+    model = next;
+    if (!popEl) return;
+    if (structuralKey(model) !== renderedKey) render();
+    else tick();
+  }
+
+  function renderSettings(settings, devices) {
+    update({
+      settings: settings && typeof settings === "object" ? settings : model.settings,
+      devices: Array.isArray(devices) ? devices : model.devices,
+    });
+  }
+
+  function controlEl() {
+    return document.getElementById(WD.injector ? WD.injector.CONTROL_ID : "wd-control");
+  }
+
+  function position() {
+    const control = controlEl();
+    if (!control) {
+      popEl.style.left = `${Math.max(8, window.innerWidth / 2 - MENU_WIDTH / 2)}px`;
+      popEl.style.bottom = "96px";
+      popEl.style.maxHeight = "70vh";
+      return;
+    }
+    const rect = control.getBoundingClientRect();
+    let left = rect.left + rect.width / 2 - MENU_WIDTH / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - MENU_WIDTH - 8));
+    popEl.style.left = `${left}px`;
+    popEl.style.bottom = `${Math.max(8, window.innerHeight - rect.top + 12)}px`;
+    popEl.style.maxHeight = `${Math.max(240, rect.top - 20)}px`;
+  }
+
+  function isOpen() {
+    return !!popEl && popEl.classList.contains("wd-open");
+  }
+
+  function listen() {
+    const outsideClick = (e) => {
+      const path = e.composedPath();
+      const control = controlEl();
+      if (path.includes(hostEl) || (control && path.includes(control))) return;
       hide();
     };
-    document.addEventListener("click", outsideClick);
+    const onKey = (e) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      hide();
+      const chevron = controlEl() && controlEl().querySelector(".wd-chev");
+      if (chevron) chevron.focus();
+    };
+    const onResize = () => position();
+    document.addEventListener("click", outsideClick, true);
+    document.addEventListener("keydown", onKey, true);
+    window.addEventListener("resize", onResize);
+    docListeners = { outsideClick, onKey, onResize };
+  }
+
+  function unlisten() {
+    if (!docListeners) return;
+    document.removeEventListener("click", docListeners.outsideClick, true);
+    document.removeEventListener("keydown", docListeners.onKey, true);
+    window.removeEventListener("resize", docListeners.onResize);
+    docListeners = null;
+  }
+
+  function show() {
+    buildHost();
+    if (isOpen()) return;
+    if (renderPending || renderedKey === null || structuralKey(model) !== renderedKey) render();
+    position();
+    popEl.classList.add("wd-open");
+    listen();
+    const first = popEl.querySelector("button:not(:disabled)");
+    if (first) first.focus({ preventScroll: true });
+    call("onOpenChange", true);
+  }
+
+  function hide() {
+    if (!isOpen()) return;
+    popEl.classList.remove("wd-open");
+    unlisten();
+    if (model.subview !== "main") update({ subview: "main" });
+    call("onOpenChange", false);
+  }
+
+  function toggle() {
+    if (isOpen()) hide();
+    else show();
   }
 
   function teardown() {
-    try {
-      if (outsideClick) document.removeEventListener("click", outsideClick);
-    } catch (err) {
-      console.warn("wd: panel listener remove failed", err);
-    }
-    outsideClick = null;
+    unlisten();
     try {
       if (hostEl) hostEl.remove();
     } catch (err) {
@@ -186,237 +292,22 @@
     hostEl = null;
     shadow = null;
     popEl = null;
+    renderedKey = null;
     renderPending = false;
-  }
-
-  function emitPatch(patch) {
-    if (typeof onPatch === "function" && patch && Object.keys(patch).length) {
-      onPatch(patch);
-    }
-  }
-
-  function coldNote(key) {
-    const logic = WD.logic;
-    const isCold = logic && typeof logic.isColdSetting === "function"
-      ? logic.isColdSetting(key)
-      : false;
-    return recordingActive && isCold
-      ? '<div class="wd-note wd-show">od następnego nagrania</div>'
-      : "";
-  }
-
-  function isEditingInPanel() {
-    if (!popEl || !popEl.classList.contains("wd-open") || !shadow) return false;
-    const el = shadow.activeElement;
-    if (!el) return false;
-    const tag = el.tagName;
-    return tag === "SELECT" || (tag === "INPUT" && el.type === "text");
-  }
-
-  function devicesOptions(devices, selected) {
-    const opts = ['<option value="">Domyślne systemowe</option>'];
-    for (const d of devices || []) {
-      const sel = d === selected ? " selected" : "";
-      opts.push(`<option value="${escapeAttr(d)}"${sel}>${escapeHtml(d)}</option>`);
-    }
-    return opts.join("");
-  }
-
-  function languageOptions(selected) {
-    const sel = selected || "auto";
-    return LANGUAGES.map(
-      ([code, name]) => `<option value="${code}"${code === sel ? " selected" : ""}>${name}</option>`
-    ).join("");
-  }
-
-  function escapeHtml(s) {
-    return String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
-  }
-  function escapeAttr(s) {
-    return escapeHtml(s).replace(/"/g, "&quot;");
-  }
-
-  function toggleRow(icon, label, key, checked, cold) {
-    return `
-      <label class="wd-row wd-click">
-        ${ic(icon)}<span class="wd-label">${label}</span>
-        <input type="checkbox" class="wd-sw" data-key="${key}" ${checked ? "checked" : ""}>
-      </label>
-      ${cold ? coldNote(key) : ""}`;
-  }
-
-  function render(settings, devices) {
-    buildHost();
-    if (settings && typeof settings === "object") currentSettings = settings;
-    if (Array.isArray(devices)) lastDevices = devices;
-    if (isEditingInPanel()) {
-      renderPending = true;
-      return;
-    }
-    renderPending = false;
-    devices = lastDevices;
-    const s = currentSettings || {};
-    const formats = Array.isArray(s.recording_formats) ? s.recording_formats : ["txt"];
-
-    const chips = FORMATS.map((f) => {
-      const on = formats.includes(f) ? " wd-on" : "";
-      return `<label class="wd-chip${on}"><input type="checkbox" data-fmt="${f}" ${formats.includes(f) ? "checked" : ""}>${f}</label>`;
-    }).join("");
-
-    const status = recordingActive ? "Nagrywanie w toku" : "Gotowy do nagrywania";
-
-    popEl.innerHTML = `
-      <button class="wd-row wd-click wd-primary ${recordingActive ? "wd-rec" : ""}" data-role="action">
-        ${ic("rec")}
-        <span class="wd-txt">
-          <span class="wd-title">${recordingActive ? "Zatrzymaj nagrywanie" : "Rozpocznij nagrywanie"}</span>
-          <span class="wd-desc">${status}</span>
-        </span>
-      </button>
-
-      <div class="wd-div"></div>
-
-      <div class="wd-row"><span class="wd-ic-slot">${ic("mic")}</span><span class="wd-label">Mikrofon</span></div>
-      <div class="wd-field"><select class="wd-sel" data-key="recording_device">${devicesOptions(devices, s.recording_device || "")}</select></div>
-      ${coldNote("recording_device")}
-
-      <div class="wd-row"><span class="wd-ic-slot">${ic("lang")}</span><span class="wd-label">Język transkrypcji</span></div>
-      <div class="wd-field"><select class="wd-sel" data-key="recording_language">${languageOptions(s.recording_language)}</select></div>
-      ${coldNote("recording_language")}
-      ${toggleRow("me", "Nagrywaj mnie (Ja)", "capture_mic", s.capture_mic, true)}
-      ${toggleRow("people", "Nagrywaj uczestników", "capture_tab", s.capture_tab, true)}
-
-      <div class="wd-div"></div>
-
-      ${toggleRow("shot", "Zrzuty ekranu", "capture_screenshots", s.capture_screenshots, false)}
-      <label class="wd-radio"><input type="radio" name="wd-disp" data-disp="all" ${s.screenshot_displays !== "primary" ? "checked" : ""}>Wszystkie ekrany</label>
-      <label class="wd-radio"><input type="radio" name="wd-disp" data-disp="primary" ${s.screenshot_displays === "primary" ? "checked" : ""}>Tylko główny</label>
-      ${coldNote("screenshot_displays")}
-      ${toggleRow("cc", "Napisy na żywo", "live_captions", s.live_captions, false)}
-      ${toggleRow("diar", "Diaryzacja (kto mówi)", "diarize", s.diarize, true)}
-      <div class="wd-row"><span class="wd-sub-label">Rozpoznawanie po zakończeniu nagrania</span></div>
-
-
-      <div class="wd-div"></div>
-
-      <div class="wd-row"><span class="wd-ic-slot">${ic("folder")}</span><span class="wd-label">Katalog zapisu</span></div>
-      <div class="wd-field"><input type="text" class="wd-txt-in" data-key="recording_dir" value="${escapeAttr(s.recording_dir || "~/Desktop")}"></div>
-      ${coldNote("recording_dir")}
-      <div class="wd-row"><span class="wd-ic-slot">${ic("doc")}</span><span class="wd-label">Formaty</span></div>
-      <div class="wd-chips">${chips}</div>
-      ${coldNote("recording_formats")}
-
-      <div class="wd-div"></div>
-
-      <div class="wd-row wd-click wd-reset" data-role="reset">${ic("reset")}<span class="wd-label">Przywróć domyślne</span></div>
-    `;
-
-    // The icon in label-only rows uses a slot wrapper; normalise its class.
-    popEl.querySelectorAll(".wd-ic-slot > .wd-ic").forEach((el) => el.classList.add("wd-ic"));
-    wireInputs();
-  }
-
-  function wireInputs() {
-    popEl.querySelectorAll("[data-key]").forEach((el) => {
-      el.addEventListener("change", () => {
-        const key = el.getAttribute("data-key");
-        if (el.type === "checkbox") emitPatch({ [key]: el.checked });
-        else emitPatch({ [key]: el.value });
-      });
-    });
-    popEl.querySelectorAll("[data-disp]").forEach((el) => {
-      el.addEventListener("change", () => {
-        if (el.checked) emitPatch({ screenshot_displays: el.getAttribute("data-disp") });
-      });
-    });
-    popEl.querySelectorAll("[data-fmt]").forEach((el) => {
-      el.addEventListener("change", () => {
-        const chosen = Array.from(popEl.querySelectorAll("[data-fmt]"))
-          .filter((b) => b.checked)
-          .map((b) => b.getAttribute("data-fmt"));
-        emitPatch({ recording_formats: chosen });
-      });
-    });
-    const actionBtn = popEl.querySelector('[data-role="action"]');
-    if (actionBtn) actionBtn.addEventListener("click", () => { if (typeof onAction === "function") onAction(); });
-    const resetBtn = popEl.querySelector('[data-role="reset"]');
-    if (resetBtn) resetBtn.addEventListener("click", () => { if (typeof onReset === "function") onReset(); });
-  }
-
-  function position() {
-    const control = document.getElementById(
-      WD.injector ? WD.injector.CONTROL_ID : "wd-control"
-    );
-    const width = 340;
-    if (!control) {
-      popEl.style.left = "50%";
-      popEl.style.bottom = "90px";
-      popEl.style.transform = "translateX(-50%)";
-      return;
-    }
-    const rect = control.getBoundingClientRect();
-    let left = rect.left + rect.width / 2 - width / 2;
-    left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
-    popEl.style.left = `${left}px`;
-    popEl.style.bottom = `${Math.max(8, window.innerHeight - rect.top + 10)}px`;
-    popEl.style.transform = "none";
-  }
-
-  function show() {
-    buildHost();
-    if (renderPending) render(currentSettings, lastDevices);
-    position();
-    popEl.classList.add("wd-open");
-  }
-  function hide() {
-    if (popEl) popEl.classList.remove("wd-open");
-  }
-  function toggle() {
-    buildHost();
-    if (popEl.classList.contains("wd-open")) hide();
-    else show();
-  }
-
-  function setRecording(active) {
-    const next = !!active;
-    if (next === recordingActive) return;
-    recordingActive = next;
-    if (popEl && currentSettings) render(currentSettings);
-  }
-
-  function setHealth(sources, paused) {
-    if (!popEl) return;
-    let health = popEl.querySelector("[data-health]");
-    if (!health) {
-      health = document.createElement("div");
-      health.dataset.health = "true";
-      health.setAttribute("role", "status");
-      health.style.cssText = "padding:12px;font-size:12px";
-      popEl.appendChild(health);
-      const pause = document.createElement("button");
-      pause.textContent = "Pauza / wznów";
-      pause.onclick = () => chrome.runtime.sendMessage({type:"WD_PAUSE_MEETING"});
-      popEl.appendChild(pause);
-    }
-    health.textContent = Object.entries(sources).map(([source, value]) =>
-      `${source === "mic" ? "Mikrofon" : "Uczestnicy"}: ${value.age > 3 ? "brak sygnału" : value.rms > .005 ? "mowa" : "cisza"}`
-    ).join(" · ") + (paused ? " · PAUZA" : "");
+    model = INITIAL_MODEL;
   }
 
   WD.panel = {
-    init(callbacks) {
-      callbacks = callbacks || {};
-      onPatch = callbacks.onPatch || null;
-      onAction = callbacks.onAction || null;
-      onReset = callbacks.onReset || null;
+    init(next) {
+      callbacks = next || {};
       buildHost();
     },
-    render,
+    render: renderSettings,
+    update,
     show,
     hide,
     toggle,
-    setRecording,
-    setHealth,
+    isOpen,
     teardown,
   };
 })();

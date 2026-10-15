@@ -548,7 +548,8 @@ def record(
     identity = begin_meeting(capture_dir, output_path.stem) if orbit_ready else None
     chunk_queue = DiskChunkQueue(capture_dir)
     recorder = MeetingRecorder(chunk_queue, device=resolved_device, chunk_silence=chunk_silence,
-                               raw_sink=lambda audio: store.append("mic", audio))
+                               raw_sink=lambda audio, position: store.append("mic", audio, at=position),
+                               started_at=store.started_at)
     def transcribe_job(chunk):
         result = transcribe_audio(chunk.audio, model, language)
         chunk_queue.ack(chunk, result)
@@ -728,6 +729,28 @@ def review(directory, port, no_open):
 
 
 @cli.command()
+@click.argument("directory", type=click.Path(exists=True, file_okay=False))
+@click.option("--num-speakers", type=int, default=None,
+              help="Expected participants (online meeting) or speakers (microphone-only recording).")
+@click.option("--force", is_flag=True, help="Replace speaker labels the transcript already has.")
+def speakers(directory, num_speakers, force):
+    """Add speaker labels to a saved meeting and republish it for Orbit.
+
+    The microphone is you; only the participants' track is diarized.
+    """
+    if not _speaker_model_ready(True):
+        raise click.ClickException("Prepare the model first: whisper-daemon models prepare --diarization")
+    from whisper_daemon.meeting_speakers import add_speakers
+    try:
+        result = add_speakers(Path(directory), num_speakers=num_speakers, force=force)
+    except (ValueError, RuntimeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    revision = result["revision"]
+    published = f"; published revision {revision}" if revision else ""
+    click.echo(f"Labelled {result['speakers']} speakers{published}.")
+
+
+@cli.command()
 @click.argument("extension_id")
 def pair(extension_id):
     """Authorize one extension ID; paste the printed key into its popup."""
@@ -769,7 +792,10 @@ def check_models():
 @click.option('--diarization', is_flag=True)
 def prepare_models(diarization):
     """Download models. Diarization needs authorized Hugging Face access."""
-    env = dict(os.environ, WHISPER_PREPARE_MODELS='1', HF_HUB_OFFLINE='0', TRANSFORMERS_OFFLINE='0')
+    from whisper_daemon.env_file import PROJECT_ENV_FILE, read_env_file
+    # HF_TOKEN may live in the project's .env; the process environment wins.
+    env = {**read_env_file(PROJECT_ENV_FILE), **os.environ,
+           'WHISPER_PREPARE_MODELS': '1', 'HF_HUB_OFFLINE': '0', 'TRANSFORMERS_OFFLINE': '0'}
     code = ('from whisper_daemon.diarizer import _get_pipeline; _get_pipeline()' if diarization else
             'from whisper_daemon.vad import SileroVAD; SileroVAD(); from whisper_daemon.transcriber import preload_model; preload_model()')
     result = subprocess.run([sys.executable, '-c', code], env=env)

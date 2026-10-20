@@ -113,6 +113,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
   } else if (msg.type === "CAPTURE_STARTED") {
     transitionTo(State.CAPTURING);
+    if (meetTabId !== null && !popupCapture) {
+      chrome.tabs.sendMessage(meetTabId, {
+        type: "WD_CAPTURE_STARTED",
+        elapsed: msg.elapsed,
+      }).catch(() => {});
+    }
     sendResponse({ ok: true });
 
   } else if (msg.type === "CAPTURE_RECONNECTING") {

@@ -70,6 +70,29 @@ test('daemon-side stop permits a subsequent browser start', async () => {
   assert.equal(f.sockets[0].sent.map(JSON.parse).filter(m => m.type === 'start').length, 2);
 });
 
+test('capture acknowledgement includes audio buffered before the daemon start ACK', async () => {
+  const f = fixture({autoStart:false});
+  const pending = f.run('startExternal()');
+  f.receive({type:'WD_PCM',target:'offscreen',samples:new Array(16000).fill(.1),position:0});
+  await f.open(); await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');
+  await pending;
+  assert.equal(f.messages.find(m=>m.type==='CAPTURE_STARTED').elapsed,1);
+});
+
+test('reconnect acknowledgement reports the existing capture position', async () => {
+  const f = fixture({autoStart:false});
+  const start=f.run('startExternal()'); await f.open(); await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})'); await start;
+  f.messages.length=0;
+  f.receive({type:'WD_PCM',target:'offscreen',samples:new Array(8000).fill(.1),position:0});
+  f.sockets[0].readyState=3; f.sockets[0].onclose();
+  await new Promise(setImmediate); f.sockets[1].open(); await new Promise(setImmediate);
+  f.run('handleServerMessage({data:JSON.stringify({type:"started",session_id:sessionId})})');
+  await new Promise(setImmediate);
+  assert.equal(f.messages.find(m=>m.type==='CAPTURE_STARTED').elapsed,.5);
+});
+
 test('reconnect never sends live PCM ahead of unacknowledged backlog', async () => {
   const f = fixture({autoStart:false});
   const start = f.run('startExternal()'); await f.open(); await new Promise(setImmediate);

@@ -135,6 +135,37 @@ function formatElapsed(seconds) {
   return hours ? `${hours}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
+/** Whether a visible button rectangle belongs to Meet's bottom control band. */
+function isMeetToolbarRect(rect, viewport) {
+  const width = Number(viewport?.width) || 0;
+  const height = Number(viewport?.height) || 0;
+  if (!rect || width <= 0 || height <= 0) return false;
+  return rect.width >= 24 && rect.height >= 24 &&
+    rect.left < width && rect.left + rect.width > 0 &&
+    rect.top >= height * 0.55 && rect.top < height;
+}
+
+/** Advance a daemon-confirmed elapsed value smoothly until the next status push. */
+function interpolatedElapsed(baseElapsed, anchoredAtMs, nowMs, running) {
+  const base = Number.isFinite(baseElapsed) ? Math.max(0, baseElapsed) : 0;
+  if (!running || !Number.isFinite(anchoredAtMs) || !Number.isFinite(nowMs)) return base;
+  return base + Math.max(0, nowMs - anchoredAtMs) / 1000;
+}
+
+/** Map the daemon phase plus a bounded optimistic stop to the painted phase. */
+function displayDaemonState(daemonState, optimisticUntil, nowMs) {
+  return daemonState === "recording" && nowMs < optimisticUntil
+    ? "transcribing"
+    : daemonState;
+}
+
+/** Reconcile an immediate capture ACK without rewinding an already-live timer. */
+function captureStartedElapsed(daemonState, currentElapsed, acknowledgedElapsed) {
+  const current = Number.isFinite(currentElapsed) ? Math.max(0, currentElapsed) : 0;
+  const acknowledged = Number.isFinite(acknowledgedElapsed) ? Math.max(0, acknowledgedElapsed) : 0;
+  return daemonState === "recording" ? Math.max(current, acknowledged) : acknowledged;
+}
+
 // A source with no audio for this long has no signal; above this RMS it carries
 // speech (the daemon's silence floor).
 const SOURCE_STALE_SECONDS = 3;
@@ -226,10 +257,14 @@ if (typeof module !== "undefined" && module.exports) {
     COLD_SETTINGS,
     LANGUAGES,
     captionsReducer,
+    captureStartedElapsed,
     controlView,
     diffSettings,
+    displayDaemonState,
     formatElapsed,
+    interpolatedElapsed,
     isColdSetting,
+    isMeetToolbarRect,
     sourceView,
   };
 } else if (typeof window !== "undefined") {
@@ -240,10 +275,14 @@ if (typeof module !== "undefined" && module.exports) {
     COLD_SETTINGS,
     LANGUAGES,
     captionsReducer,
+    captureStartedElapsed,
     controlView,
     diffSettings,
+    displayDaemonState,
     formatElapsed,
+    interpolatedElapsed,
     isColdSetting,
+    isMeetToolbarRect,
     sourceView,
   };
 }

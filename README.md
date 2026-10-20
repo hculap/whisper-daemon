@@ -36,9 +36,11 @@ whisper-daemon models prepare --diarization
 whisper-daemon models check
 ```
 
-The app checks that the speaker pipeline and dependencies actually load before
-capture. If unavailable, it shows a warning and saves audio/transcripts without
-automatic speaker labels. No token is included in recordings or the repository.
+`models check` verifies that the speaker pipeline and its dependencies actually
+load. Meeting capture performs a lightweight offline-cache check after opening
+the audio sources; if final speaker inference is unavailable, it shows a warning
+and preserves the audio/transcript without automatic labels. No token is included
+in recordings or the repository.
 
 ## Dictation
 

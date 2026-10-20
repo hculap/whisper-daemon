@@ -38,6 +38,12 @@ test('terminal idle releases ownership so another tab can record',async()=>{
   await f.receive({type:'STATUS',state:'idle'});
   assert.equal((await f.receive({type:'WD_START'},2)).ok,true);
 });
+test('daemon start acknowledgement reaches the owning Meet tab immediately',async()=>{
+  const f=fixture();
+  await f.receive({type:'WD_START'},1);
+  await f.receive({type:'CAPTURE_STARTED',elapsed:2.5});
+  assert.ok(f.tabs.some(x=>x.id===1&&x.msg.type==='WD_CAPTURE_STARTED'&&x.msg.elapsed===2.5));
+});
 test('a native recording remains controllable without browser tab ownership',async()=>{
   const f=fixture();
   await f.receive({type:'STATUS',state:'recording',sessionId:null});

@@ -12,6 +12,7 @@ from pathlib import Path
 from whisper_daemon.formats import FORMATTERS
 from whisper_daemon.meeting_manifest import publish_revision
 from whisper_daemon.recording_store import atomic_json
+from whisper_daemon import supervisor
 
 
 def prepare_review(directory):
@@ -40,6 +41,12 @@ def prepare_review(directory):
 
 
 def save_review(directory, changes):
+    """Persist one complete review revision without racing a forced restart."""
+    with supervisor.activity_transition():
+        return _save_review(directory, changes)
+
+
+def _save_review(directory, changes):
     if not isinstance(changes, dict): raise ValueError('Expected an object')
     path = Path(directory)
     data = prepare_review(path)

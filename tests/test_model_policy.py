@@ -36,3 +36,39 @@ def test_missing_vad_never_downloads_during_normal_startup(tmp_path, monkeypatch
     with pytest.raises(RuntimeError, match='models prepare'):
         vad._ensure_model()
     assert calls == []
+
+
+def test_diarization_status_does_not_load_the_gpu_pipeline(monkeypatch):
+    from whisper_daemon import model_policy
+
+    monkeypatch.setattr(model_policy, 'local_model', lambda model: '/cached/model')
+    monkeypatch.setitem(
+        sys.modules,
+        'whisper_daemon.diarizer',
+        type('ForbiddenDiarizer', (), {
+            '_get_pipeline': staticmethod(
+                lambda: (_ for _ in ()).throw(AssertionError('GPU pipeline loaded'))
+            )
+        }),
+    )
+
+    status = model_policy.diarization_status(validate_load=False)
+    assert status['available'] is True
+
+
+def test_strict_diarization_status_verifies_the_pipeline(monkeypatch):
+    from whisper_daemon import model_policy
+
+    calls = []
+    monkeypatch.setattr(model_policy, 'local_model', lambda model: '/cached/model')
+    monkeypatch.setitem(
+        sys.modules,
+        'whisper_daemon.diarizer',
+        type('CheckedDiarizer', (), {
+            '_get_pipeline': staticmethod(lambda: calls.append('loaded'))
+        }),
+    )
+
+    status = model_policy.diarization_status()
+    assert status['available'] is True
+    assert calls == ['loaded']

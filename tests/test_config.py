@@ -171,3 +171,24 @@ def test_dictation_settings_roundtrip(tmp_path, monkeypatch):
         cancel_hotkey='ctrl+alt+escape')
     config.save_settings(settings)
     assert config.load_settings() == settings
+
+
+def test_settings_save_is_a_restart_protected_activity(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    from whisper_daemon import supervisor
+
+    _reload_config_with_dir(tmp_path, monkeypatch)
+    events = []
+
+    @contextmanager
+    def tracked_activity():
+        events.append('enter')
+        try:
+            yield
+        finally:
+            events.append('exit')
+
+    monkeypatch.setattr(supervisor, 'activity_transition', tracked_activity)
+    config_mod.save_settings(Settings())
+
+    assert events == ['enter', 'exit']

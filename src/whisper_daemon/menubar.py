@@ -5,10 +5,12 @@ multiple phantom icons appear, and @clicked decorators silently fail.
 """
 
 import concurrent.futures
+import dataclasses
 import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import wave
@@ -536,26 +538,28 @@ class MenuBarDelegate(NSObject):
         alert.addButtonWithTitle_("Cancel")
         return str(field.stringValue()) if alert.runModal() == 1000 else None
 
-    def _update_settings(self, update: Callable[[Settings], Settings | None]) -> Settings:
-        """Mutate and persist native settings as one restart-safe transaction."""
+    def _update_settings(self, update: Callable[[Settings], Settings]) -> Settings:
+        """Replace and persist native settings as one restart-safe transaction.
+
+        ``update`` must return a new object: a running meeting worker keeps
+        the previous one as its snapshot, so cold settings apply next time.
+        """
         with supervisor.activity_transition():
             with self._settings_lock:
-                replacement = update(self._settings)
-                if replacement is not None:
-                    self._settings = replacement
+                self._settings = update(self._settings)
                 self._daemon._settings = self._settings
                 save_settings(self._settings)
                 return self._settings
 
     def onConfirmDictation_(self, sender):
         settings = self._update_settings(
-            lambda current: setattr(current, "dictation_confirm", not current.dictation_confirm)
+            lambda current: dataclasses.replace(current, dictation_confirm=not current.dictation_confirm)
         )
         sender.setState_(1 if settings.dictation_confirm else 0)
 
     def onDictationLanguage_(self, sender):
         language = ("auto", "pl", "en")[sender.tag()]
-        self._update_settings(lambda current: setattr(current, "dictation_language", language))
+        self._update_settings(lambda current: dataclasses.replace(current, dictation_language=language))
         _notify("whisper-daemon", "Dictation language", language)
 
     def onDictationSilence_(self, sender):
@@ -564,7 +568,7 @@ class MenuBarDelegate(NSObject):
         try:
             seconds = float(value)
             if not 0 <= seconds <= 30: raise ValueError()
-            self._update_settings(lambda current: setattr(current, "dictation_silence", seconds))
+            self._update_settings(lambda current: dataclasses.replace(current, dictation_silence=seconds))
         except ValueError:
             _notify("whisper-daemon", "Invalid silence duration", "Enter a number between 0 and 30.")
 
@@ -572,10 +576,9 @@ class MenuBarDelegate(NSObject):
         value = self._ask_text("Dictation vocabulary", ", ".join(self._settings.dictation_vocabulary), "Names and specialist words, separated by commas. Used as transcription hints.")
         if value is not None:
             vocabulary = [word.strip()[:100] for word in value.split(",") if word.strip()][:100]
-            self._update_settings(lambda current: setattr(current, "dictation_vocabulary", vocabulary))
+            self._update_settings(lambda current: dataclasses.replace(current, dictation_vocabulary=vocabulary))
 
     def onDictationShortcut_(self, sender):
-        import dataclasses
         from whisper_daemon.shortcuts import parse_shortcut
         action = ("record", "paste", "cancel", "accept", "speak")[sender.tag()]
         key = action + "_hotkey"
@@ -583,7 +586,7 @@ class MenuBarDelegate(NSObject):
         if value is None: return
         try:
             parse_shortcut(value)
-            def update(current):
+            def update(current: Settings) -> Settings:
                 changed = dataclasses.replace(current, **{key: value.lower()})
                 self._hotkey.configure(changed)
                 return changed
@@ -596,7 +599,7 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleSaveAudio_(self, sender):
         settings = self._update_settings(
-            lambda current: setattr(current, "save_audio", not current.save_audio)
+            lambda current: dataclasses.replace(current, save_audio=not current.save_audio)
         )
         sender.setState_(1 if settings.save_audio else 0)
         logger.info("Save audio: %s", settings.save_audio)
@@ -614,7 +617,7 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleScreenshots_(self, sender):
         settings = self._update_settings(
-            lambda current: setattr(current, "capture_screenshots", not current.capture_screenshots)
+            lambda current: dataclasses.replace(current, capture_screenshots=not current.capture_screenshots)
         )
         sender.setState_(1 if settings.capture_screenshots else 0)
         logger.info("Capture screenshots: %s", settings.capture_screenshots)
@@ -622,7 +625,7 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleDiarize_(self, sender):
         settings = self._update_settings(
-            lambda current: setattr(current, "diarize", not current.diarize)
+            lambda current: dataclasses.replace(current, diarize=not current.diarize)
         )
         sender.setState_(1 if settings.diarize else 0)
         logger.info("Speaker diarization: %s", settings.diarize)
@@ -630,7 +633,7 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleAutoRecord_(self, sender):
         settings = self._update_settings(
-            lambda current: setattr(current, "auto_record_meetings", not current.auto_record_meetings)
+            lambda current: dataclasses.replace(current, auto_record_meetings=not current.auto_record_meetings)
         )
         sender.setState_(1 if settings.auto_record_meetings else 0)
         logger.info("Auto-record meetings: %s", settings.auto_record_meetings)
@@ -641,7 +644,7 @@ class MenuBarDelegate(NSObject):
         for item in self._tts_lang_items.values():
             item.setState_(0)
         sender.setState_(1)
-        self._update_settings(lambda current: setattr(current, "tts_language", lang_code))
+        self._update_settings(lambda current: dataclasses.replace(current, tts_language=lang_code))
         logger.info("TTS language changed to: %s", lang_code)
 
     @objc.typedSelector(b"v@:@")
@@ -658,7 +661,7 @@ class MenuBarDelegate(NSObject):
             return
 
         path = str(panel.URLs()[0].path())
-        self._update_settings(lambda current: setattr(current, "recording_dir", path))
+        self._update_settings(lambda current: dataclasses.replace(current, recording_dir=path))
         self._rec_dir_item.setTitle_(
             self._format_dir_label("Recording Folder", path)
         )
@@ -666,15 +669,12 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleRecFmt_(self, sender):
         fmt = str(sender.title())
-        def update(current):
-            if fmt in current.recording_formats:
-                if len(current.recording_formats) > 1:
-                    current.recording_formats.remove(fmt)
-                    sender.setState_(0)
-            else:
-                current.recording_formats.append(fmt)
-                sender.setState_(1)
-        self._update_settings(update)
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(
+                current, recording_formats=_toggle_format(current.recording_formats, fmt)
+            )
+        )
+        sender.setState_(1 if fmt in settings.recording_formats else 0)
 
     @objc.typedSelector(b"v@:@")
     def onChangeTransDir_(self, sender):
@@ -691,7 +691,7 @@ class MenuBarDelegate(NSObject):
 
         path = str(panel.URLs()[0].path())
         self._update_settings(
-            lambda current: setattr(current, "transcription_output_dir", path)
+            lambda current: dataclasses.replace(current, transcription_output_dir=path)
         )
         self._trans_dir_item.setTitle_(
             self._format_dir_label("Transcription Output", path)
@@ -700,21 +700,18 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleTransFmt_(self, sender):
         fmt = str(sender.title())
-        def update(current):
-            if fmt in current.transcription_formats:
-                if len(current.transcription_formats) > 1:
-                    current.transcription_formats.remove(fmt)
-                    sender.setState_(0)
-            else:
-                current.transcription_formats.append(fmt)
-                sender.setState_(1)
-        self._update_settings(update)
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(
+                current, transcription_formats=_toggle_format(current.transcription_formats, fmt)
+            )
+        )
+        sender.setState_(1 if fmt in settings.transcription_formats else 0)
 
     @objc.typedSelector(b"v@:@")
     def onToggleTransDiarize_(self, sender):
         settings = self._update_settings(
-            lambda current: setattr(
-                current, "transcription_diarize", not current.transcription_diarize
+            lambda current: dataclasses.replace(
+                current, transcription_diarize=not current.transcription_diarize
             )
         )
         sender.setState_(1 if settings.transcription_diarize else 0)
@@ -764,7 +761,7 @@ class MenuBarDelegate(NSObject):
             item.setState_(0)
         sender.setState_(1)
 
-        self._update_settings(lambda current: setattr(current, "recording_device", device_name))
+        self._update_settings(lambda current: dataclasses.replace(current, recording_device=device_name))
         logger.info("Recording device changed to: %s", device_name or "system default")
 
     @staticmethod
@@ -814,6 +811,10 @@ class MenuBarDelegate(NSObject):
                 self._browser_recorder.feed_audio(np.frombuffer(data, dtype="<f4"), position=position)
                 return
             if self._meeting_phase == "transcribing": return
+            # A frame the bridge accepted just before _reset_meeting_ui ended its
+            # session has no owner left: staging it would strand bytes that
+            # only the next capture clears (and keep the memory backstop off).
+            if self._browser_bridge.session_id is None: return
             if self._browser_prebuffer_bytes + len(data) > BROWSER_PREBUFFER_MAX_BYTES:
                 self._browser_bridge.send_json_str('{"type":"error","message":"Audio startup buffer full; stop and retry"}')
                 AppHelper.callAfter(self._stop_meeting)
@@ -1288,9 +1289,12 @@ class MenuBarDelegate(NSObject):
         self._meeting_browser_triggered = False
         self._browser_bridge.end_session()
         self._meeting_phase = "idle"
-        self._browser_recorder = None
-        self._browser_prebuffer = []
-        self._browser_prebuffer_bytes = 0
+        # Under the staging lock and after end_session(): a frame racing this
+        # reset is either staged before the clear or refused for its session.
+        with self._browser_audio_lock:
+            self._browser_recorder = None
+            self._browser_prebuffer = []
+            self._browser_prebuffer_bytes = 0
 
         # Tell the extension the meeting is over so its in-bar button goes idle.
         try:
@@ -1323,6 +1327,9 @@ class MenuBarDelegate(NSObject):
         meeting_worker_alive = bool(
             self._meeting_thread is not None and self._meeting_thread.is_alive()
         )
+        # The review server lives in-process: a restart would make the page's
+        # next save fail and lose its edits.
+        review = self._review_server
         return bool(
             self._daemon._state is State.IDLE
             and self._meeting_phase == "idle"
@@ -1331,6 +1338,7 @@ class MenuBarDelegate(NSObject):
             and self._browser_prebuffer_bytes == 0
             and file_jobs == 0
             and settings_jobs == 0
+            and not (review is not None and review.has_unsaved_edits())
         )
 
     def _launch_file_transcription(self, paths: list[str]) -> None:
@@ -1446,7 +1454,7 @@ class MenuBarDelegate(NSObject):
                     # fall through and write it without speaker labels.
                     self._set_status_safe(f"Diarizing {file_path.name}...")
                     try:
-                        result = _diarize_transcript(str(file_path), result)
+                        result = _diarize_transcript(str(file_path), result, release=False)
                     except Exception as exc:
                         diarize_error = str(exc) or exc.__class__.__name__
                         logger.exception("Diarization failed for %s", file_path)
@@ -1463,6 +1471,9 @@ class MenuBarDelegate(NSObject):
             except Exception as exc:
                 last_error = str(exc) or exc.__class__.__name__
                 logger.exception("Failed to transcribe %s", file_path)
+
+        if diarize:
+            _release_diarizer()
 
         # Surface the actual reason when nothing succeeded (e.g. missing ffmpeg)
         # instead of a bare "0/N" that reads like the format is unsupported.
@@ -1483,7 +1494,24 @@ class MenuBarDelegate(NSObject):
         self._finish_file_ui()
 
 
-def _diarize_transcript(path: str, result: dict) -> dict:
+def _release_diarizer() -> None:
+    """Drop the pyannote pipeline a diarized file batch kept loaded."""
+    # Only if a diarization actually imported it: never load torch to clean up.
+    diarizer = sys.modules.get("whisper_daemon.diarizer")
+    if diarizer is not None:
+        diarizer.release_models()
+
+
+def _toggle_format(formats: list[str], fmt: str) -> list[str]:
+    """Return a new format list with ``fmt`` toggled, never emptying it."""
+    if fmt not in formats:
+        return [*formats, fmt]
+    if len(formats) == 1:
+        return list(formats)
+    return [f for f in formats if f != fmt]
+
+
+def _diarize_transcript(path: str, result: dict, *, release: bool = True) -> dict:
     """Label a transcript's segments with speakers (pyannote; needs an HF token).
 
     Imported at call time — pyannote/torch load is seconds-slow and must not be
@@ -1492,7 +1520,7 @@ def _diarize_transcript(path: str, result: dict) -> dict:
     from whisper_daemon.diarize_merge import merge_speakers_with_transcript
     from whisper_daemon.diarizer import diarize_file
 
-    speaker_segments = diarize_file(path)
+    speaker_segments = diarize_file(path, release=release)
     if not speaker_segments:
         logger.warning("No speaker segments for %s — writing plain transcript", path)
         return result

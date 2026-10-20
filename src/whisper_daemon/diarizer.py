@@ -169,8 +169,14 @@ def diarize_batch(
 def diarize_file(
     path: str,
     num_speakers: int | None = None,
+    *,
+    release: bool = True,
 ) -> list[SpeakerSegment]:
-    """Run diarization on an audio/video file (ffmpeg decodes it)."""
+    """Run diarization on an audio/video file (ffmpeg decodes it).
+
+    ``release=False`` keeps the pipeline loaded for a batch of files; the
+    caller then calls ``release_models()`` once the batch is done.
+    """
     # Decode with the known ffmpeg executable, independently of torchcodec's
     # fragile shared-library ABI. A file-backed array avoids a second full copy.
     import tempfile
@@ -187,7 +193,8 @@ def diarize_file(
     finally:
         # Batch output has already been converted to small Python dataclasses;
         # retaining the multi-GB MPS pipeline between meetings is unnecessary.
-        release_models()
+        if release:
+            release_models()
 
 
 # ---------------------------------------------------------------------------

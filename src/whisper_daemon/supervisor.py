@@ -11,6 +11,7 @@ inference — turns into an automatic restart instead of a silent outage.
 do not produce false positives.
 """
 
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 import logging
 import os
@@ -34,10 +35,14 @@ _LIMITS = {
 _beats: dict[str, float] = {}
 _beats_lock = threading.Lock()
 _watchdog_thread: threading.Thread | None = None
-_pre_exit_hooks: list = []
+_pre_exit_hooks: list[Callable[[], None]] = []
 _suspended = False
 _memory_guard: MemoryGuard | None = None
+# Held only to count transitions and across the restart commit itself, never
+# across a transition's I/O, so transitions on different threads (main, event
+# loop, browser bridge) cannot stall one another.
 _activity_gate = threading.RLock()
+_active_transitions = 0
 
 
 def beat(name: str) -> None:
@@ -60,64 +65,90 @@ def suspend(reason: str) -> None:
     logger.info("Liveness supervision suspended: %s", reason)
 
 
-def add_pre_exit_hook(hook) -> None:
+def add_pre_exit_hook(hook: Callable[[], None]) -> None:
     """Register a callable to run (best-effort) before a forced restart."""
     _pre_exit_hooks.append(hook)
 
 
 @contextmanager
-def activity_transition():
-    """Serialize new user work against the memory restart commit point."""
+def activity_transition() -> Iterator[None]:
+    """Mark new user work as starting so a memory restart cannot commit.
+
+    The transition body runs without the gate: it only blocks for the instant
+    a restart commits, after which the process exits anyway.
+    """
+    global _active_transitions
     with _activity_gate:
+        _active_transitions += 1
+    try:
         yield
+    finally:
+        with _activity_gate:
+            _active_transitions -= 1
 
 
-def request_restart_if_safe(reason: str, is_idle) -> bool:
-    """Atomically recheck idle and commit a memory-pressure restart.
+def _work_active(is_idle: Callable[[], bool], label: str) -> bool:
+    """Final busy check; the caller holds the activity gate."""
+    if _active_transitions:
+        logger.info("%s deferred because new work is starting", label)
+        return True
+    try:
+        if is_idle():
+            return False
+    except Exception:
+        logger.exception("%s safety check failed", label)
+        return True
+    logger.info("%s deferred because new work started", label)
+    return True
 
-    Every transition that begins a recording or file job uses the same gate.
-    Acquiring it must never block the only watchdog thread: a hung transition
-    is exactly when heartbeat enforcement still needs to run.  Once this
-    function has observed idle while holding the gate, no new protected work
-    can begin before ``request_restart`` exits the process.
+
+@contextmanager
+def _idle_gate(is_idle: Callable[[], bool], label: str) -> Iterator[bool]:
+    """Yield whether the daemon is idle while holding the gate.
+
+    Never blocks: the only caller is the watchdog thread, which must keep
+    enforcing heartbeats even while a transition is wedged.
     """
     if not _activity_gate.acquire(blocking=False):
-        logger.info("Memory restart deferred because protected work is active")
-        return False
+        logger.info("%s deferred because protected work is active", label)
+        yield False
+        return
     try:
-        try:
-            if not is_idle():
-                logger.info("Memory restart deferred because new work started")
-                return False
-        except Exception:
-            logger.exception("Final memory restart safety check failed")
-            return False
-        request_restart(reason)
-        return True
+        yield not _work_active(is_idle, label)
     finally:
         _activity_gate.release()
 
 
-def reclaim_if_safe(reclaim, is_idle) -> bool:
+def request_restart_if_safe(reason: str, is_idle: Callable[[], bool]) -> bool:
+    """Atomically recheck idle and commit a memory-pressure restart.
+
+    The process exits while still holding the gate, so once idle has been
+    observed here no new protected work can begin before it is gone.
+    """
+    with _idle_gate(is_idle, "Memory restart") as idle:
+        if idle:
+            request_restart(reason)
+        return idle
+
+
+def reclaim_if_safe(reclaim: Callable[[], None], is_idle: Callable[[], bool]) -> bool:
     """Reclaim caches only at an idle transition, without blocking watchdogs."""
-    if not _activity_gate.acquire(blocking=False):
-        logger.info("Memory reclamation deferred because protected work is active")
-        return False
-    try:
-        try:
-            if not is_idle():
-                logger.info("Memory reclamation deferred because new work started")
-                return False
-        except Exception:
-            logger.exception("Final memory reclamation safety check failed")
-            return False
+    with _idle_gate(is_idle, "Memory reclamation") as idle:
+        pass
+    # Outside the gate: gc and MPS synchronization can take seconds. Work that
+    # starts meanwhile is serialized against the cleanup by MLX_LOCK and the
+    # diarizer lock, and at worst reloads a model.
+    if idle:
         reclaim()
-        return True
-    finally:
-        _activity_gate.release()
+    return idle
 
 
-def configure_memory_guard(is_idle, reclaim, *, limit_bytes: int = DEFAULT_LIMIT_BYTES) -> None:
+def configure_memory_guard(
+    is_idle: Callable[[], bool],
+    reclaim: Callable[[], None],
+    *,
+    limit_bytes: int = DEFAULT_LIMIT_BYTES,
+) -> None:
     """Enable physical-footprint enforcement for this process."""
     global _memory_guard
     _memory_guard = MemoryGuard(

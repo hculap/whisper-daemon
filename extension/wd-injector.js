@@ -252,7 +252,10 @@
       main.innerHTML = (CONTENT[view.mode] || CONTENT.idle)();
     }
     const time = main.querySelector(".wd-time");
-    if (time) time.textContent = view.time;
+    // A text write replaces the text node: a childList mutation that wakes the
+    // body observer (layout read, and a reinject in the fallback slot). The
+    // timer view refreshes four times a second, so write only real changes.
+    if (time && time.textContent !== view.time) time.textContent = view.time;
     main.setAttribute("aria-label", view.label);
     main.setAttribute("aria-busy", String(view.mode === "starting" || view.mode === "saving"));
     control.dataset.menu = menuOpen ? "open" : "closed";

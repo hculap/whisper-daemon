@@ -137,3 +137,35 @@ def test_review_save_defers_memory_restart_without_blocking_watchdog(tmp_path, m
     assert supervisor.request_restart_if_safe('test pressure', is_idle)
     assert idle_probed.is_set()
     assert restarted.is_set()
+
+
+def test_open_page_with_unsaved_edits_reports_presence(tmp_path, monkeypatch):
+    import urllib.request
+    import urllib.error
+    from whisper_daemon import meeting_review
+    from whisper_daemon.meeting_review import ReviewServer
+    make_transcript(tmp_path)
+    server = ReviewServer(tmp_path)
+    url = server.start()
+    origin = f'http://127.0.0.1:{server.server_port}'
+
+    def presence(body, headers=None):
+        request = urllib.request.Request(url + 'presence', data=json.dumps(body).encode(),
+            headers=headers or {'Origin': origin, 'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(request) as response: return response.status
+        except urllib.error.HTTPError as error: return error.code
+    try:
+        assert not server.has_unsaved_edits()
+        assert presence({'dirty': True}) == 200 and server.has_unsaved_edits()
+        assert presence({'dirty': False}) == 200 and not server.has_unsaved_edits()
+        assert presence({'dirty': 'yes'}) == 400 and not server.has_unsaved_edits()
+        assert presence({'dirty': True}, {'Origin': 'https://evil.example'}) == 403
+        assert not server.has_unsaved_edits()
+        # A closed or crashed tab stops reporting: the busy state expires.
+        assert presence({'dirty': True}) == 200
+        now = meeting_review.time.monotonic()
+        monkeypatch.setattr(meeting_review.time, 'monotonic', lambda: now + meeting_review.UNSAVED_EDITS_TTL_SEC + 1)
+        assert not server.has_unsaved_edits()
+    finally:
+        server.shutdown(); server.server_close()

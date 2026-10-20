@@ -209,6 +209,7 @@ def test_restart_safety_requires_all_user_work_to_be_idle():
         _file_jobs_lock=threading.Lock(),
         _settings_jobs=0,
         _settings_lock=threading.Lock(),
+        _review_server=SimpleNamespace(has_unsaved_edits=lambda: False),
     )
     assert restart_safe(obj)
 
@@ -220,6 +221,7 @@ def test_restart_safety_requires_all_user_work_to_be_idle():
         ("browser_prebuffer_bytes", 4),
         ("file_jobs", 1),
         ("settings_jobs", 1),
+        ("review_server", SimpleNamespace(has_unsaved_edits=lambda: True)),
     ):
         changed = SimpleNamespace(**obj.__dict__)
         if field == "daemon":
@@ -272,6 +274,7 @@ def test_extension_setting_is_busy_before_worker_start_and_clears_after_persist(
         _browser_prebuffer_bytes=0,
         _file_jobs=0,
         _file_jobs_lock=threading.Lock(),
+        _review_server=None,
         _run_off_bridge=lambda fn, *args: scheduled.append((fn, args)),
         _push_settings_snapshot=lambda: None,
         _sync_menu_from_settings=lambda: None,
@@ -292,6 +295,7 @@ def test_extension_setting_is_busy_before_worker_start_and_clears_after_persist(
 
 def test_native_setting_mutation_and_persistence_share_restart_gate():
     import ast
+    import dataclasses
     import threading
     from collections.abc import Callable
     from pathlib import Path
@@ -323,9 +327,9 @@ def test_native_setting_mutation_and_persistence_share_restart_gate():
     allow_persist = threading.Event()
 
     def update(current):
-        current.capture_mic = False
         mutation_entered.set()
         assert allow_persist.wait(2)
+        return dataclasses.replace(current, capture_mic=False)
 
     worker = threading.Thread(target=scope["_update_settings"], args=(obj, update))
     worker.start()
@@ -339,6 +343,10 @@ def test_native_setting_mutation_and_persistence_share_restart_gate():
 
     assert not worker.is_alive()
     assert saved == [False]
+    # A meeting worker holding the previous object keeps its snapshot.
+    assert settings.capture_mic is True
+    assert obj._settings is obj._daemon._settings
+    assert obj._settings.capture_mic is False
 
 
 def test_file_job_is_busy_before_thread_start_and_clears_in_finally():
@@ -417,3 +425,97 @@ def test_restart_rechecks_idle_inside_the_activity_gate(monkeypatch):
 
     guard.check()
     assert actions[1][0] == "restart"
+
+
+def test_slow_transition_does_not_block_another_thread():
+    import threading
+    from whisper_daemon import supervisor
+
+    slow_entered = threading.Event()
+    release_slow = threading.Event()
+    entered = []
+
+    def slow():
+        # e.g. capture_target() on a hung app inside _handle_toggle
+        with supervisor.activity_transition():
+            slow_entered.set()
+            assert release_slow.wait(2)
+
+    def bridge():
+        with supervisor.activity_transition():
+            entered.append("bridge")
+
+    slow_thread = threading.Thread(target=slow)
+    slow_thread.start()
+    assert slow_entered.wait(2)
+    bridge_thread = threading.Thread(target=bridge)
+    bridge_thread.start()
+    try:
+        bridge_thread.join(0.5)
+        assert entered == ["bridge"]
+        assert not supervisor.request_restart_if_safe("test pressure", lambda: True)
+    finally:
+        release_slow.set()
+        slow_thread.join(2)
+        bridge_thread.join(2)
+
+
+def test_restart_commit_keeps_new_transitions_out(monkeypatch):
+    import threading
+    from whisper_daemon import supervisor
+
+    entered = threading.Event()
+    observed = []
+
+    def start_work():
+        with supervisor.activity_transition():
+            entered.set()
+
+    def fake_restart(reason):
+        # os._exit would follow: work must not begin while the commit runs.
+        worker = threading.Thread(target=start_work)
+        worker.start()
+        observed.append(entered.wait(0.3))
+        observed.append(worker)
+
+    monkeypatch.setattr(supervisor, "request_restart", fake_restart)
+    assert supervisor.request_restart_if_safe("test pressure", lambda: True)
+    worker = observed[1]
+    worker.join(2)
+    assert observed[0] is False
+    assert entered.is_set()
+
+
+def test_reclaim_runs_outside_the_gate():
+    import threading
+    from whisper_daemon import supervisor
+
+    started = []
+
+    def start_work():
+        with supervisor.activity_transition():
+            started.append("work")
+
+    def reclaim():
+        # gc + MPS sync can take seconds; a transition must not wait on it.
+        worker = threading.Thread(target=start_work)
+        worker.start()
+        worker.join(0.5)
+        assert not worker.is_alive()
+
+    assert supervisor.reclaim_if_safe(reclaim, lambda: True)
+    assert started == ["work"]
+    assert supervisor._active_transitions == 0
+
+
+def test_idle_probe_failure_defers_restart(monkeypatch):
+    from whisper_daemon import supervisor
+
+    actions = []
+    monkeypatch.setattr(supervisor, "request_restart", lambda reason: actions.append(reason))
+
+    def broken():
+        raise RuntimeError("probe failed")
+
+    assert not supervisor.request_restart_if_safe("test pressure", broken)
+    assert actions == []

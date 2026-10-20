@@ -170,7 +170,8 @@
   function tick() {
     if (!popEl) return;
     const timer = popEl.querySelector('[data-el="timer"]');
-    if (timer) timer.textContent = WD.logic.formatElapsed(model.elapsed);
+    const time = WD.logic.formatElapsed(model.elapsed);
+    if (timer && timer.textContent !== time) timer.textContent = time;
     for (const src of WD.panelView.SOURCES) {
       const row = popEl.querySelector(`[data-src="${src.key}"]`);
       if (!row || !row.querySelector(".wd-meter")) continue;

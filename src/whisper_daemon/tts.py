@@ -26,13 +26,26 @@ def _detect_language(text: str) -> str:
     return "pl" if polish_count >= 2 else "en"
 
 
+def is_speaking() -> bool:
+    """True from the moment speech is accepted until playback ends."""
+    return _speaking_lock.locked()
+
+
 def speak_text(text: str, language: str = "auto") -> None:
     """Speak text using Piper TTS in a background thread."""
     if not text.strip():
         return
-
-    thread = threading.Thread(target=_speak_worker, args=(text, language), daemon=True)
-    thread.start()
+    # Taken here rather than in the worker so is_speaking() has no gap before
+    # the thread runs; the worker releases it.
+    if not _speaking_lock.acquire(blocking=False):
+        logger.info("TTS already speaking, skipping")
+        return
+    try:
+        thread = threading.Thread(target=_speak_worker, args=(text, language), daemon=True)
+        thread.start()
+    except Exception:
+        _speaking_lock.release()
+        raise
 
 
 def stop_speaking() -> None:
@@ -41,10 +54,7 @@ def stop_speaking() -> None:
 
 
 def _speak_worker(text: str, language: str = "auto") -> None:
-    if not _speaking_lock.acquire(blocking=False):
-        logger.info("TTS already speaking, skipping")
-        return
-
+    """Synthesize and play; the caller has acquired ``_speaking_lock``."""
     _stop_event.clear()
     try:
         lang = language if language != "auto" else _detect_language(text)

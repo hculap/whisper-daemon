@@ -64,3 +64,13 @@ def test_diarize_file_releases_models_when_inference_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="diarization failed"):
         diarizer.diarize_file("example.wav")
     assert calls == ["release"]
+
+
+def test_diarize_file_can_keep_models_for_a_batch(monkeypatch):
+    _patch_file_decode(monkeypatch)
+    calls = []
+    monkeypatch.setattr(diarizer, "diarize_batch", lambda *args, **kwargs: [])
+    monkeypatch.setattr(diarizer, "release_models", lambda: calls.append("release"))
+
+    diarizer.diarize_file("example.wav", release=False)
+    assert calls == []

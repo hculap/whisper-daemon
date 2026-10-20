@@ -63,7 +63,23 @@ function fixture(slotRect, {automaticMutations = false} = {}) {
       return null;
     }
     querySelectorAll() { return []; }
-    set innerHTML(_value) {}
+    // Like the DOM, rewriting markup or text replaces child nodes: a childList
+    // mutation that the body observer sees while the element is attached.
+    set innerHTML(value) {
+      this.children = [];
+      if (String(value).includes('class="wd-time"')) {
+        const time = new Element("span");
+        time.className = "wd-time";
+        time.parentElement = this;
+        this.children.push(time);
+      }
+      if (body.contains(this)) queueMutation({target: this, addedNodes: [], removedNodes: []});
+    }
+    get textContent() { return this.text || ""; }
+    set textContent(value) {
+      this.text = String(value);
+      if (body.contains(this)) queueMutation({target: this, addedNodes: [], removedNodes: []});
+    }
   }
 
   const html = new Element("html");
@@ -179,4 +195,32 @@ test("rejecting a header fallback does not trigger an observer retry loop", () =
   assert.equal(result.drained, true, `observer still active after ${result.steps} steps`);
   assert.equal(attempts, 1);
   assert.equal(f.document.getElementById("wd-control"), null);
+});
+
+test("an unchanged timer repaint does not wake the observer", () => {
+  const f = fixture(BOTTOM, {automaticMutations: true});
+  const control = f.injector.injectControl();
+  assert.equal(control.parentElement, f.slot);
+  let attempts = 0;
+  f.injector.startObserver(() => {
+    attempts += 1;
+    f.injector.injectControl();
+  });
+  const time = () => control.querySelector(".wd-time").textContent;
+
+  f.injector.setView({mode: "recording", time: "0:05", label: "Stop"});
+  f.flush();
+  assert.equal(time(), "0:05");
+  const afterFirstPaint = attempts;
+
+  // The 250 ms tick repaints three times per displayed second.
+  for (let i = 0; i < 3; i += 1) f.injector.setView({time: "0:05"});
+  const idle = f.flush();
+  assert.equal(idle.steps, 0);
+  assert.equal(attempts, afterFirstPaint);
+
+  f.injector.setView({time: "0:06"});
+  f.flush();
+  assert.equal(time(), "0:06");
+  assert.equal(attempts, afterFirstPaint + 1);
 });

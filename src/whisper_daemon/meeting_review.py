@@ -6,6 +6,7 @@ import re
 import secrets
 import shutil
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -13,6 +14,10 @@ from whisper_daemon.formats import FORMATTERS
 from whisper_daemon.meeting_manifest import publish_revision
 from whisper_daemon.recording_store import atomic_json
 from whisper_daemon import supervisor
+
+# The page reports unsaved edits every 20 s; Chrome may throttle a hidden tab's
+# timers to once a minute, so a report stays valid well beyond that.
+UNSAVED_EDITS_TTL_SEC = 150.0
 
 
 def prepare_review(directory):
@@ -40,13 +45,13 @@ def prepare_review(directory):
             'audio': [name for name in ('recording.wav', 'mic.wav', 'browser.wav') if (path / name).is_file()]}
 
 
-def save_review(directory, changes):
+def save_review(directory: Path | str, changes: dict) -> dict:
     """Persist one complete review revision without racing a forced restart."""
     with supervisor.activity_transition():
         return _save_review(directory, changes)
 
 
-def _save_review(directory, changes):
+def _save_review(directory: Path | str, changes: dict) -> dict:
     if not isinstance(changes, dict): raise ValueError('Expected an object')
     path = Path(directory)
     data = prepare_review(path)
@@ -108,6 +113,7 @@ class ReviewServer(ThreadingHTTPServer):
         self.directory = Path(directory).resolve()
         self.token = secrets.token_urlsafe(32)
         self.lock = threading.RLock()
+        self._unsaved_until = 0.0
         prepare_review(self.directory)
         super().__init__(('127.0.0.1', port), ReviewHandler)
         self.url = f'http://127.0.0.1:{self.server_port}/{self.token}/'
@@ -115,6 +121,13 @@ class ReviewServer(ThreadingHTTPServer):
     def start(self):
         threading.Thread(target=self.serve_forever, name='meeting-review', daemon=True).start()
         return self.url
+
+    def report_presence(self, dirty: bool) -> None:
+        self._unsaved_until = time.monotonic() + UNSAVED_EDITS_TTL_SEC if dirty else 0.0
+
+    def has_unsaved_edits(self) -> bool:
+        """True while an open page recently reported edits it has not saved."""
+        return time.monotonic() < self._unsaved_until
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
@@ -182,13 +195,19 @@ class ReviewHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError): pass
 
     def do_POST(self):
-        if self._route() != 'save': self.send_error(403); return
+        route = self._route()
+        if route not in ('save', 'presence'): self.send_error(403); return
         expected = f'http://127.0.0.1:{self.server.server_port}'
         if self.headers.get('Origin') != expected: self.send_error(403); return
         try:
             size = int(self.headers.get('Content-Length', 0))
             if not 0 < size <= 1_000_000: raise ValueError('Invalid request size')
             data = json.loads(self.rfile.read(size))
+            if route == 'presence':
+                if not isinstance(data, dict) or not isinstance(data.get('dirty'), bool): raise ValueError('Invalid presence')
+                self.server.report_presence(data['dirty'])
+                self._json({'ok': True})
+                return
             with self.server.lock: result = save_review(self.server.directory, data)
             self._json(result)
         except (ValueError, TypeError, KeyError) as exc:

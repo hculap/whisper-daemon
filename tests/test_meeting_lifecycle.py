@@ -264,3 +264,56 @@ def test_failed_chunk_marks_meeting_failed_and_never_ready(tmp_path):
     assert failed['transcription_errors'] == ['RuntimeError: decoder failed']
     assert list((folder / 'chunks').glob('*.npz'))  # the job is still recoverable
     assert [n[1] for n in notes] == ['Meeting interrupted']
+
+
+def test_frame_racing_the_session_end_is_not_stranded_in_staging():
+    import threading
+    bridge = SimpleNamespace(session_id='session-12345678', send_json_str=lambda text: None)
+    obj = SimpleNamespace(_browser_recorder=None, _meeting_phase='idle', _browser_bridge=bridge,
+        _browser_audio_lock=threading.RLock(), _browser_prebuffer=[], _browser_prebuffer_bytes=0)
+    on_audio = method('_on_browser_audio', BROWSER_PREBUFFER_MAX_BYTES=1 << 20)
+    on_audio(obj, b'\0' * 8, 0)  # a pending start owns this startup tail
+    assert obj._browser_prebuffer_bytes == 8
+    obj._browser_prebuffer, obj._browser_prebuffer_bytes = [], 0
+    bridge.session_id = None  # _reset_meeting_ui ended the session first
+    on_audio(obj, b'\0' * 8, 2)
+    assert obj._browser_prebuffer == [] and obj._browser_prebuffer_bytes == 0
+
+
+def test_format_toggle_returns_a_new_list_and_never_empties():
+    tree = ast.parse(Path('src/whisper_daemon/menubar.py').read_text())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_toggle_format')
+    space = {}
+    exec(compile(ast.Module(body=[fn], type_ignores=[]), 'menubar.py', 'exec'), space)
+    toggle = space['_toggle_format']
+    formats = ['txt']
+    assert toggle(formats, 'srt') == ['txt', 'srt']
+    assert toggle(['txt', 'srt'], 'txt') == ['srt']
+    kept = toggle(formats, 'txt')
+    assert kept == ['txt'] and kept is not formats
+    assert formats == ['txt']
+
+
+def test_diarized_file_batch_keeps_the_pipeline_until_the_end(tmp_path, monkeypatch):
+    from whisper_daemon import transcriber
+    files = []
+    for name in ('a.wav', 'b.wav', 'c.wav'):
+        (tmp_path / name).write_bytes(b'')
+        files.append(str(tmp_path / name))
+    calls = []
+    monkeypatch.setattr(transcriber, 'transcribe_file', lambda path, model: {'text': path, 'segments': []})
+
+    def diarize(path, result, *, release=True):
+        calls.append(('diarize', release))
+        return result
+
+    settings = SimpleNamespace(transcription_diarize=True, transcription_output_dir_path=tmp_path / 'out',
+        transcription_formats=['txt'])
+    obj = SimpleNamespace(_daemon=SimpleNamespace(_model='test'), _settings=settings, _meeting_phase='idle',
+        _set_icon_safe=lambda state: None, _set_status_safe=lambda text: None,
+        _finish_file_ui=lambda: calls.append('finish'))
+    worker = method('_transcribe_paths_worker', Path=Path, State=SimpleNamespace(TRANSCRIBING='transcribing'),
+        AUDIO_VIDEO_EXTENSIONS={'wav'}, _notify=lambda *args: None, _diarize_transcript=diarize,
+        _release_diarizer=lambda: calls.append('release'))
+    worker(obj, files)
+    assert calls == [('diarize', False)] * 3 + ['release', 'finish']

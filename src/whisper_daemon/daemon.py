@@ -146,8 +146,8 @@ class Daemon:
     def _handle_toggle(self) -> None:
         if self._state == State.IDLE:
             with supervisor.activity_transition():
-                # The memory guard may have waited for this gate.  Recheck in
-                # case another event changed state before we acquired it.
+                # Recheck in case another event changed state before this
+                # transition began.
                 if self._state != State.IDLE:
                     return
                 self._paste_target = capture_target()
@@ -390,7 +390,8 @@ class Daemon:
             if self._settings is not None:
                 tts_lang = getattr(self._settings, "tts_language", "auto")
             logger.info("Speak clipboard: %d chars (lang=%s)", len(text), tts_lang)
-            speak_text(str(text), language=tts_lang)
+            with supervisor.activity_transition():
+                speak_text(str(text), language=tts_lang)
         else:
             logger.info("Clipboard empty, nothing to speak")
 

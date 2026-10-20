@@ -226,7 +226,7 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
         raise SystemExit(0)
     PID_FILE.write_text(str(os.getpid()))
 
-    from whisper_daemon import audio_system, permissions, supervisor
+    from whisper_daemon import audio_system, permissions, supervisor, tts
     from whisper_daemon.daemon import Daemon, State
     from whisper_daemon.events import Event
     from whisper_daemon.hotkey import HotkeyListener
@@ -248,7 +248,7 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     menubar_delegate = None
 
     def _memory_restart_safe() -> bool:
-        if daemon._state is not State.IDLE:
+        if daemon._state is not State.IDLE or tts.is_speaking():
             return False
         if not no_menubar:
             if menubar_delegate is None or not menubar_delegate.memory_restart_safe():

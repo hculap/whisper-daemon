@@ -37,8 +37,10 @@ SILENT_CHUNK_RECOVERY_STREAK = 6
 # The microphone is read in PortAudio's blocking mode by a reader thread, never
 # by a callback: Python on CoreAudio's real-time thread loses audio whenever it
 # waits ~30 ms for the GIL or the store's lock. PortAudio's buffer (sized by
-# this latency) holds the audio while the reader is busy.
-READ_LATENCY = 1.0
+# this latency) holds the audio while the reader is busy. CoreAudio buffers
+# about twice the latency (measured: 1.0 → 2.05 s, 4.0 → 8.2 s). A real meeting
+# lost up to 2.9 s at 1.0, i.e. the reader stalled for ~5 s.
+READ_LATENCY = 4.0
 READ_POLL_SEC = 0.01
 READER_JOIN_SEC = 2.0
 # Falling this far behind the wall clock means device audio was lost: move the

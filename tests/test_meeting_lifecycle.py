@@ -5,10 +5,15 @@ from types import SimpleNamespace
 
 
 def method(name, **globals):
+    from whisper_daemon import supervisor
+
     tree = ast.parse(Path('src/whisper_daemon/menubar.py').read_text())
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'MenuBarDelegate')
     fn = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == name)
-    space = {'logger': SimpleNamespace(info=lambda *args: None)}
+    space = {
+        'logger': SimpleNamespace(info=lambda *args: None),
+        'supervisor': supervisor,
+    }
     space.update(globals)
     exec(compile(ast.Module(body=[fn], type_ignores=[]), 'menubar.py', 'exec'), space)
     return space[name]
@@ -87,6 +92,84 @@ def test_stop_during_worker_startup_preserves_acknowledged_pcm():
     method('_on_browser_disconnect',AppHelper=helper)(obj, 'test-session')
     assert not obj._meeting_active
     assert obj._browser_prebuffer == [(b'audio',0)]
+
+
+def test_stop_closes_microphone_while_speaker_model_probe_is_still_blocked(tmp_path):
+    """Model warmup may delay finalization, but it must never extend capture."""
+    import concurrent.futures, datetime, logging, queue, re, sys, threading, time, types
+    from dataclasses import dataclass
+    import numpy as np
+    from whisper_daemon.bridge_protocol import build_status_message
+    from whisper_daemon.config import Settings
+
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    mic_started = threading.Event()
+    mic_stopped = threading.Event()
+
+    def diarization_status(**kwargs):
+        probe_started.set()
+        assert release_probe.wait(5)
+        return {'available': False, 'message': 'test model unavailable'}
+
+    @dataclass(frozen=True)
+    class AudioChunk:
+        audio: np.ndarray
+        start_time: float
+        duration: float
+        source: str = 'mic'
+        job_id: str = ''
+
+    class Recorder:
+        error, needs_recovery, _source_label = None, False, 'mic'
+        def __init__(self, *args, **kwargs): pass
+        def start(self): mic_started.set()
+        def stop(self): mic_stopped.set()
+        def abort(self): pass
+        def check_liveness(self, now): return False
+
+    modules = {
+        'whisper_daemon.meeting_recorder': types.SimpleNamespace(MeetingRecorder=Recorder, AudioChunk=AudioChunk),
+        'whisper_daemon.screen_capture': types.SimpleNamespace(ScreenCapture=None),
+        'whisper_daemon.transcriber': types.SimpleNamespace(transcribe_full=lambda *args: None),
+        'whisper_daemon.model_policy': types.SimpleNamespace(diarization_status=diarization_status),
+    }
+    tree = ast.parse(Path('src/whisper_daemon/menubar.py').read_text())
+    write_partial = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_write_partial')
+    space = {'Path': Path}
+    exec(compile(ast.Module(body=[write_partial], type_ignores=[]), 'menubar.py', 'exec'), space)
+    worker = method('_meeting_worker', re=re, datetime=datetime.datetime, timedelta=datetime.timedelta,
+        concurrent=concurrent, np=np, time=time, queue=queue, logger=logging.getLogger('test'),
+        _notify=lambda *args: None, _write_partial=space['_write_partial'],
+        build_status_message=build_status_message)
+    now = time.monotonic()
+    obj = SimpleNamespace(_settings=Settings(recording_dir=str(tmp_path), capture_mic=True,
+            capture_tab=False, capture_screenshots=False, diarize=True),
+        _daemon=SimpleNamespace(_model='model'), _meeting_active=True, _meeting_paused=False,
+        _meeting_start=now, _meeting_stopped_at=None, _meeting_session_id='session-12345678',
+        _browser_bridge=SimpleNamespace(send_json_str=lambda text: None), _browser_audio_lock=threading.RLock(),
+        _browser_prebuffer=[], _browser_prebuffer_bytes=0, _browser_recorder=None,
+        _meeting_store=None, _last_meeting_dir=None, _diarization_status=None,
+        _meeting_phase='recording', _meeting_chunk_count=0,
+        _attach_recording_store=lambda store: None, _send_results_to_browser=lambda *args: None,
+        _reset_meeting_ui=lambda: None)
+    real_modules = {name: sys.modules.get(name) for name in modules}
+    sys.modules.update(modules)
+    thread = threading.Thread(target=worker, args=(obj, False, 'Daily', False))
+    try:
+        thread.start()
+        assert mic_started.wait(2)
+        assert probe_started.wait(2)
+        obj._meeting_active = False
+        obj._meeting_stopped_at = time.monotonic()
+        assert mic_stopped.wait(1), 'Stop waited for the speaker-model probe'
+    finally:
+        release_probe.set()
+        thread.join(5)
+        for name, module in real_modules.items():
+            if module is None: sys.modules.pop(name, None)
+            else: sys.modules[name] = module
+    assert not thread.is_alive()
 
 
 def run_worker(tmp_path, transcribe):

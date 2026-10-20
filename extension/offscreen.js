@@ -62,6 +62,10 @@ let stopPromise = null;
 let stoppedSession = null; // retain undelivered PCM until Stop can reach daemon
 const recoveryTails = [];
 
+function captureStartedMessage() {
+  return { type: "CAPTURE_STARTED", elapsed: pcmPosition / 16000 };
+}
+
 // --- Message handling ---
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
@@ -139,7 +143,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 async function startCaptureFromStream(streamId) {
   if (capturing || sessionStarting) {
     console.warn("START_CAPTURE while already capturing — ignoring");
-    chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
+    chrome.runtime.sendMessage(captureStartedMessage());
     return;
   }
   const gen = prepareSession(false);
@@ -191,7 +195,7 @@ async function startCaptureFromStream(streamId) {
 
 async function startExternal() {
   if (capturing || sessionStarting) {
-    chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
+    chrome.runtime.sendMessage(captureStartedMessage());
     return;
   }
   const gen = prepareSession(true);
@@ -292,7 +296,7 @@ async function beginSession(gen) {
     }
   }, PING_INTERVAL_MS);
 
-  chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
+  chrome.runtime.sendMessage(captureStartedMessage());
   return true;
 }
 
@@ -691,7 +695,7 @@ async function reconnectLoop(gen) {
       flushPcmBuffer();
       streamReady = true;
       reconnecting = false;
-      chrome.runtime.sendMessage({ type: "CAPTURE_STARTED" });
+      chrome.runtime.sendMessage(captureStartedMessage());
       return;
     }
     await sleep(RECONNECT_INTERVAL_MS);

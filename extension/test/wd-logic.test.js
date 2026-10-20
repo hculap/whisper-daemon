@@ -5,10 +5,14 @@ const assert = require("node:assert/strict");
 
 const {
   captionsReducer,
+  captureStartedElapsed,
   controlView,
   diffSettings,
+  displayDaemonState,
   formatElapsed,
+  interpolatedElapsed,
   isColdSetting,
+  isMeetToolbarRect,
   sourceView,
 } = require("../wd-logic.js");
 
@@ -85,6 +89,32 @@ test("formatElapsed clamps negative and invalid to 00:00", () => {
   assert.equal(formatElapsed(-5), "00:00");
   assert.equal(formatElapsed(NaN), "00:00");
   assert.equal(formatElapsed(undefined), "00:00");
+});
+
+test("isMeetToolbarRect accepts visible bottom controls and rejects page-header controls", () => {
+  const viewport = { width: 2048, height: 1152 };
+  assert.equal(isMeetToolbarRect({ left: 900, top: 1090, width: 48, height: 48 }, viewport), true);
+  assert.equal(isMeetToolbarRect({ left: 20, top: 8, width: 48, height: 48 }, viewport), false);
+  assert.equal(isMeetToolbarRect({ left: 900, top: 1090, width: 0, height: 48 }, viewport), false);
+});
+
+test("interpolatedElapsed advances a confirmed recording between daemon status pushes", () => {
+  assert.equal(interpolatedElapsed(0, 1_000, 1_000, true), 0);
+  assert.equal(interpolatedElapsed(0, 1_000, 2_250, true), 1.25);
+  assert.equal(interpolatedElapsed(44.2, 10_000, 10_800, true), 45);
+  assert.equal(interpolatedElapsed(44.2, 10_000, 12_000, false), 44.2);
+});
+
+test("displayDaemonState keeps an optimistic stop in saving until it expires", () => {
+  assert.equal(displayDaemonState("recording", 5_000, 4_999), "transcribing");
+  assert.equal(displayDaemonState("recording", 5_000, 5_000), "recording");
+  assert.equal(displayDaemonState("idle", 5_000, 4_999), "idle");
+});
+
+test("captureStartedElapsed preserves a running timer and accepts initial buffered time", () => {
+  assert.equal(captureStartedElapsed("recording", 44.8, 0), 44.8);
+  assert.equal(captureStartedElapsed("recording", 44.8, 45.1), 45.1);
+  assert.equal(captureStartedElapsed("idle", 0, 2.75), 2.75);
 });
 
 test("isColdSetting marks cold keys", () => {

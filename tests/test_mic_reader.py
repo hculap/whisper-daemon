@@ -106,6 +106,8 @@ def test_stream_is_opened_for_blocking_reads_with_a_deep_buffer(tmp_path, device
     kwargs = device.streams[-1].kwargs
     assert "callback" not in kwargs
     assert kwargs["latency"] == mod.READ_LATENCY
+    # Real meetings stalled the reader for ~5 s; the device must buffer that.
+    assert mod.READ_LATENCY >= 4.0
 
 
 def test_a_stalled_reader_loses_no_audio(tmp_path, device, monkeypatch):

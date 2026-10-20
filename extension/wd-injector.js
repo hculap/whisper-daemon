@@ -136,11 +136,7 @@
    * node is present's cell.
    * @returns {{parent: Element, before: Element} | null}
    */
-  function findRowInsertion() {
-    const present = document.querySelector(PRESENT_SELECTOR);
-    const camera = document.querySelector(CAMERA_SELECTOR);
-    if (!present || !camera) return null;
-
+  function insertionFor(present, camera) {
     let cell = present;
     while (cell.parentElement && !cell.parentElement.contains(camera)) {
       cell = cell.parentElement;
@@ -150,6 +146,26 @@
     // walked all the way to <body>.
     if (!parent || cell.contains(camera) || parent === document.body) return null;
     return { parent, before: cell };
+  }
+
+  function findRowInsertion() {
+    const viewport = { width: window.innerWidth, height: window.innerHeight };
+    const visible = (button) => WD.logic.isMeetToolbarRect(button.getBoundingClientRect(), viewport);
+    const presents = [...document.querySelectorAll(PRESENT_SELECTOR)].filter(visible);
+    const cameras = [...document.querySelectorAll(CAMERA_SELECTOR)].filter(visible);
+    let best = null;
+    for (const present of presents) {
+      for (const camera of cameras) {
+        const spot = insertionFor(present, camera);
+        if (!spot) continue;
+        const p = present.getBoundingClientRect();
+        const c = camera.getBoundingClientRect();
+        const distance = Math.abs((p.left + p.width / 2) - (c.left + c.width / 2));
+        if (distance > Math.max(600, viewport.width * 0.4)) continue;
+        if (!best || distance < best.distance) best = { ...spot, distance };
+      }
+    }
+    return best && { parent: best.parent, before: best.before };
   }
 
   // --- Tooltip ---
@@ -236,7 +252,10 @@
       main.innerHTML = (CONTENT[view.mode] || CONTENT.idle)();
     }
     const time = main.querySelector(".wd-time");
-    if (time) time.textContent = view.time;
+    // A text write replaces the text node: a childList mutation that wakes the
+    // body observer (layout read, and a reinject in the fallback slot). The
+    // timer view refreshes four times a second, so write only real changes.
+    if (time && time.textContent !== view.time) time.textContent = view.time;
     main.setAttribute("aria-label", view.label);
     main.setAttribute("aria-busy", String(view.mode === "starting" || view.mode === "saving"));
     control.dataset.menu = menuOpen ? "open" : "closed";
@@ -257,19 +276,36 @@
    */
   function injectControl(onToggle, onChevron) {
     try {
-      const existing = document.getElementById(CONTROL_ID);
-      if (existing) return existing;
-
       ensureStyle();
-      const control = buildControl(onToggle, onChevron);
-
       const spot = findRowInsertion();
-      if (spot) spot.parent.insertBefore(control, spot.before);
-      else {
-        // Fallback: the official end slot (still inside the toolbar region).
+      const existing = document.getElementById(CONTROL_ID);
+      const viewport = { width: window.innerWidth, height: window.innerHeight };
+      const control = existing || buildControl(onToggle, onChevron);
+      if (spot) {
+        if (control.parentElement !== spot.parent || control.nextElementSibling !== spot.before) {
+          spot.parent.insertBefore(control, spot.before);
+        }
+      } else if (existing && WD.logic.isMeetToolbarRect(existing.getBoundingClientRect(), viewport)) {
+        // A bottom fallback remains usable while Meet finishes rendering. The
+        // observer keeps retrying so it can be promoted to the preferred row.
+        return existing;
+      } else {
+        if (existing) existing.remove();
+        // Meet has moved this nominal "end" slot into its page header in some
+        // layouts. Append provisionally, then validate the rendered control —
+        // an empty but valid flex slot may itself have zero width.
         const slot = document.getElementById(FALLBACK_SLOT_ID);
         if (!slot) return null;
         slot.appendChild(control);
+        if (!WD.logic.isMeetToolbarRect(control.getBoundingClientRect(), viewport)) {
+          control.remove();
+          // Appending/removing the provisional control queues child-list
+          // records synchronously.  Drop only those self-generated records so
+          // the observer does not schedule the same rejected probe forever;
+          // later Meet mutations remain observable.
+          if (observer) observer.takeRecords();
+          return null;
+        }
       }
       paint(control);
       return control;
@@ -286,7 +322,12 @@
     let scheduled = false;
     const run = () => {
       scheduled = false;
-      if (!document.getElementById(CONTROL_ID)) {
+      const control = document.getElementById(CONTROL_ID);
+      const viewport = { width: window.innerWidth, height: window.innerHeight };
+      // A surviving node can still be stranded in a recycled header container.
+      // Re-resolve its anchor whenever it leaves the bottom toolbar band.
+      const provisional = control && control.parentElement?.id === FALLBACK_SLOT_ID;
+      if (!control || provisional || !WD.logic.isMeetToolbarRect(control.getBoundingClientRect(), viewport)) {
         try {
           reinject();
         } catch (err) {

@@ -5,10 +5,12 @@ multiple phantom icons appear, and @clicked decorators silently fail.
 """
 
 import concurrent.futures
+import dataclasses
 import logging
 import os
 import queue
 import re
+import sys
 import threading
 import time
 import wave
@@ -104,10 +106,13 @@ class MenuBarDelegate(NSObject):
         self._results_sent_count = 0
         self._last_state = State.IDLE
         self._last_history = ()
+        self._file_jobs = 0
+        self._file_jobs_lock = threading.Lock()
         # Guards cross-thread access to self._settings: set_settings applies on
         # the bridge/worker thread while native menu toggles mutate on the main
         # thread (F14).
         self._settings_lock = threading.Lock()
+        self._settings_jobs = 0
         self._settings = load_settings()
         self._daemon._settings = self._settings
 
@@ -408,9 +413,7 @@ class MenuBarDelegate(NSObject):
 
         paths = [str(url.path()) for url in panel.URLs()]
         if paths:
-            threading.Thread(
-                target=self._transcribe_paths_worker, args=(paths,), daemon=True
-            ).start()
+            self._launch_file_transcription(paths)
 
     @objc.typedSelector(b"v@:@")
     def onTranscribeFolder_(self, sender):
@@ -427,9 +430,7 @@ class MenuBarDelegate(NSObject):
 
         folder = str(panel.URLs()[0].path())
         if folder:
-            threading.Thread(
-                target=self._transcribe_paths_worker, args=([folder],), daemon=True
-            ).start()
+            self._launch_file_transcription([folder])
 
     @objc.typedSelector(b"v@:@")
     def onQuit_(self, sender):
@@ -537,19 +538,29 @@ class MenuBarDelegate(NSObject):
         alert.addButtonWithTitle_("Cancel")
         return str(field.stringValue()) if alert.runModal() == 1000 else None
 
-    def _save_dictation_settings(self):
-        self._daemon._settings = self._settings
-        save_settings(self._settings)
+    def _update_settings(self, update: Callable[[Settings], Settings]) -> Settings:
+        """Replace and persist native settings as one restart-safe transaction.
+
+        ``update`` must return a new object: a running meeting worker keeps
+        the previous one as its snapshot, so cold settings apply next time.
+        """
+        with supervisor.activity_transition():
+            with self._settings_lock:
+                self._settings = update(self._settings)
+                self._daemon._settings = self._settings
+                save_settings(self._settings)
+                return self._settings
 
     def onConfirmDictation_(self, sender):
-        self._settings.dictation_confirm = not self._settings.dictation_confirm
-        sender.setState_(1 if self._settings.dictation_confirm else 0)
-        self._save_dictation_settings()
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(current, dictation_confirm=not current.dictation_confirm)
+        )
+        sender.setState_(1 if settings.dictation_confirm else 0)
 
     def onDictationLanguage_(self, sender):
-        self._settings.dictation_language = ("auto", "pl", "en")[sender.tag()]
-        self._save_dictation_settings()
-        _notify("whisper-daemon", "Dictation language", self._settings.dictation_language)
+        language = ("auto", "pl", "en")[sender.tag()]
+        self._update_settings(lambda current: dataclasses.replace(current, dictation_language=language))
+        _notify("whisper-daemon", "Dictation language", language)
 
     def onDictationSilence_(self, sender):
         value = self._ask_text("Silence before stop", str(self._settings.dictation_silence), "Seconds, from 0 to 30. Use 0 to stop only with the shortcut.")
@@ -557,19 +568,17 @@ class MenuBarDelegate(NSObject):
         try:
             seconds = float(value)
             if not 0 <= seconds <= 30: raise ValueError()
-            self._settings.dictation_silence = seconds
-            self._save_dictation_settings()
+            self._update_settings(lambda current: dataclasses.replace(current, dictation_silence=seconds))
         except ValueError:
             _notify("whisper-daemon", "Invalid silence duration", "Enter a number between 0 and 30.")
 
     def onDictationVocabulary_(self, sender):
         value = self._ask_text("Dictation vocabulary", ", ".join(self._settings.dictation_vocabulary), "Names and specialist words, separated by commas. Used as transcription hints.")
         if value is not None:
-            self._settings.dictation_vocabulary = [word.strip()[:100] for word in value.split(",") if word.strip()][:100]
-            self._save_dictation_settings()
+            vocabulary = [word.strip()[:100] for word in value.split(",") if word.strip()][:100]
+            self._update_settings(lambda current: dataclasses.replace(current, dictation_vocabulary=vocabulary))
 
     def onDictationShortcut_(self, sender):
-        import dataclasses
         from whisper_daemon.shortcuts import parse_shortcut
         action = ("record", "paste", "cancel", "accept", "speak")[sender.tag()]
         key = action + "_hotkey"
@@ -577,10 +586,11 @@ class MenuBarDelegate(NSObject):
         if value is None: return
         try:
             parse_shortcut(value)
-            changed = dataclasses.replace(self._settings, **{key: value.lower()})
-            self._hotkey.configure(changed)
-            self._settings = changed
-            self._save_dictation_settings()
+            def update(current: Settings) -> Settings:
+                changed = dataclasses.replace(current, **{key: value.lower()})
+                self._hotkey.configure(changed)
+                return changed
+            self._update_settings(update)
         except ValueError as exc:
             _notify("whisper-daemon", "Invalid shortcut", str(exc))
 
@@ -588,11 +598,11 @@ class MenuBarDelegate(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def onToggleSaveAudio_(self, sender):
-        with self._settings_lock:
-            self._settings.save_audio = not self._settings.save_audio
-        sender.setState_(1 if self._settings.save_audio else 0)
-        save_settings(self._settings)
-        logger.info("Save audio: %s", self._settings.save_audio)
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(current, save_audio=not current.save_audio)
+        )
+        sender.setState_(1 if settings.save_audio else 0)
+        logger.info("Save audio: %s", settings.save_audio)
 
     @objc.typedSelector(b"v@:@")
     def onToggleAutostart_(self, sender):
@@ -606,27 +616,27 @@ class MenuBarDelegate(NSObject):
 
     @objc.typedSelector(b"v@:@")
     def onToggleScreenshots_(self, sender):
-        with self._settings_lock:
-            self._settings.capture_screenshots = not self._settings.capture_screenshots
-        sender.setState_(1 if self._settings.capture_screenshots else 0)
-        save_settings(self._settings)
-        logger.info("Capture screenshots: %s", self._settings.capture_screenshots)
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(current, capture_screenshots=not current.capture_screenshots)
+        )
+        sender.setState_(1 if settings.capture_screenshots else 0)
+        logger.info("Capture screenshots: %s", settings.capture_screenshots)
 
     @objc.typedSelector(b"v@:@")
     def onToggleDiarize_(self, sender):
-        with self._settings_lock:
-            self._settings.diarize = not self._settings.diarize
-        sender.setState_(1 if self._settings.diarize else 0)
-        save_settings(self._settings)
-        logger.info("Speaker diarization: %s", self._settings.diarize)
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(current, diarize=not current.diarize)
+        )
+        sender.setState_(1 if settings.diarize else 0)
+        logger.info("Speaker diarization: %s", settings.diarize)
 
     @objc.typedSelector(b"v@:@")
     def onToggleAutoRecord_(self, sender):
-        with self._settings_lock:
-            self._settings.auto_record_meetings = not self._settings.auto_record_meetings
-        sender.setState_(1 if self._settings.auto_record_meetings else 0)
-        save_settings(self._settings)
-        logger.info("Auto-record meetings: %s", self._settings.auto_record_meetings)
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(current, auto_record_meetings=not current.auto_record_meetings)
+        )
+        sender.setState_(1 if settings.auto_record_meetings else 0)
+        logger.info("Auto-record meetings: %s", settings.auto_record_meetings)
 
     @objc.typedSelector(b"v@:@")
     def onSelectTTSLang_(self, sender):
@@ -634,9 +644,7 @@ class MenuBarDelegate(NSObject):
         for item in self._tts_lang_items.values():
             item.setState_(0)
         sender.setState_(1)
-        with self._settings_lock:
-            self._settings.tts_language = lang_code
-        save_settings(self._settings)
+        self._update_settings(lambda current: dataclasses.replace(current, tts_language=lang_code))
         logger.info("TTS language changed to: %s", lang_code)
 
     @objc.typedSelector(b"v@:@")
@@ -653,9 +661,7 @@ class MenuBarDelegate(NSObject):
             return
 
         path = str(panel.URLs()[0].path())
-        with self._settings_lock:
-            self._settings.recording_dir = path
-        save_settings(self._settings)
+        self._update_settings(lambda current: dataclasses.replace(current, recording_dir=path))
         self._rec_dir_item.setTitle_(
             self._format_dir_label("Recording Folder", path)
         )
@@ -663,15 +669,12 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleRecFmt_(self, sender):
         fmt = str(sender.title())
-        with self._settings_lock:
-            if fmt in self._settings.recording_formats:
-                if len(self._settings.recording_formats) > 1:
-                    self._settings.recording_formats.remove(fmt)
-                    sender.setState_(0)
-            else:
-                self._settings.recording_formats.append(fmt)
-                sender.setState_(1)
-        save_settings(self._settings)
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(
+                current, recording_formats=_toggle_format(current.recording_formats, fmt)
+            )
+        )
+        sender.setState_(1 if fmt in settings.recording_formats else 0)
 
     @objc.typedSelector(b"v@:@")
     def onChangeTransDir_(self, sender):
@@ -687,9 +690,9 @@ class MenuBarDelegate(NSObject):
             return
 
         path = str(panel.URLs()[0].path())
-        with self._settings_lock:
-            self._settings.transcription_output_dir = path
-        save_settings(self._settings)
+        self._update_settings(
+            lambda current: dataclasses.replace(current, transcription_output_dir=path)
+        )
         self._trans_dir_item.setTitle_(
             self._format_dir_label("Transcription Output", path)
         )
@@ -697,26 +700,23 @@ class MenuBarDelegate(NSObject):
     @objc.typedSelector(b"v@:@")
     def onToggleTransFmt_(self, sender):
         fmt = str(sender.title())
-        with self._settings_lock:
-            if fmt in self._settings.transcription_formats:
-                if len(self._settings.transcription_formats) > 1:
-                    self._settings.transcription_formats.remove(fmt)
-                    sender.setState_(0)
-            else:
-                self._settings.transcription_formats.append(fmt)
-                sender.setState_(1)
-        save_settings(self._settings)
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(
+                current, transcription_formats=_toggle_format(current.transcription_formats, fmt)
+            )
+        )
+        sender.setState_(1 if fmt in settings.transcription_formats else 0)
 
     @objc.typedSelector(b"v@:@")
     def onToggleTransDiarize_(self, sender):
-        with self._settings_lock:
-            self._settings.transcription_diarize = (
-                not self._settings.transcription_diarize
+        settings = self._update_settings(
+            lambda current: dataclasses.replace(
+                current, transcription_diarize=not current.transcription_diarize
             )
-        sender.setState_(1 if self._settings.transcription_diarize else 0)
-        save_settings(self._settings)
+        )
+        sender.setState_(1 if settings.transcription_diarize else 0)
         logger.info(
-            "Transcription diarization: %s", self._settings.transcription_diarize
+            "Transcription diarization: %s", settings.transcription_diarize
         )
 
     def _build_device_menu(self):
@@ -761,9 +761,7 @@ class MenuBarDelegate(NSObject):
             item.setState_(0)
         sender.setState_(1)
 
-        with self._settings_lock:
-            self._settings.recording_device = device_name
-        save_settings(self._settings)
+        self._update_settings(lambda current: dataclasses.replace(current, recording_device=device_name))
         logger.info("Recording device changed to: %s", device_name or "system default")
 
     @staticmethod
@@ -782,26 +780,28 @@ class MenuBarDelegate(NSObject):
         auto_record_meetings preference, which only governs fully-automatic
         starts and is intentionally not consulted here.
         """
-        if (self._meeting_phase != "idle" or self._browser_start_pending
-                or (self._meeting_thread and self._meeting_thread.is_alive())):
-            return False
-        with self._browser_audio_lock:
-            self._browser_prebuffer = []
-            self._browser_prebuffer_bytes = 0
-        self._browser_start_pending = session_id
+        with supervisor.activity_transition():
+            if (self._meeting_phase != "idle" or self._browser_start_pending
+                    or (self._meeting_thread and self._meeting_thread.is_alive())):
+                return False
+            with self._browser_audio_lock:
+                self._browser_prebuffer = []
+                self._browser_prebuffer_bytes = 0
+            self._browser_start_pending = session_id
         logger.info("Browser capture requested")
         def start_if_current():
             # Stop may arrive before Cocoa runs this callback. A cancelled
             # session must never open the microphone later. Staged audio means
             # the stop ended a delivered recording (e.g. a recovered tail sent
             # as start, PCM, stop): save that audio alone instead of dropping it.
-            self._browser_start_pending = None
-            if self._browser_bridge.session_id == session_id:
-                self._start_meeting(True, title, started_at, session_id)
-            elif self._browser_prebuffer:
-                logger.info("Browser session stopped before it started; saving its staged audio")
-                self._start_meeting(True, title, started_at, session_id, browser_only=True)
-                self._stop_meeting()
+            with supervisor.activity_transition():
+                self._browser_start_pending = None
+                if self._browser_bridge.session_id == session_id:
+                    self._start_meeting(True, title, started_at, session_id)
+                elif self._browser_prebuffer:
+                    logger.info("Browser session stopped before it started; saving its staged audio")
+                    self._start_meeting(True, title, started_at, session_id, browser_only=True)
+                    self._stop_meeting()
         AppHelper.callAfter(start_if_current)
 
     def _on_browser_audio(self, data: bytes, position: int) -> None:
@@ -811,6 +811,10 @@ class MenuBarDelegate(NSObject):
                 self._browser_recorder.feed_audio(np.frombuffer(data, dtype="<f4"), position=position)
                 return
             if self._meeting_phase == "transcribing": return
+            # A frame the bridge accepted just before _reset_meeting_ui ended its
+            # session has no owner left: staging it would strand bytes that
+            # only the next capture clears (and keep the memory backstop off).
+            if self._browser_bridge.session_id is None: return
             if self._browser_prebuffer_bytes + len(data) > BROWSER_PREBUFFER_MAX_BYTES:
                 self._browser_bridge.send_json_str('{"type":"error","message":"Audio startup buffer full; stop and retry"}')
                 AppHelper.callAfter(self._stop_meeting)
@@ -889,9 +893,14 @@ class MenuBarDelegate(NSObject):
     def _persist_and_push_settings(self) -> None:
         """Persist settings to disk and echo the snapshot (worker thread)."""
         try:
-            save_settings(self._settings)
+            with supervisor.activity_transition():
+                with self._settings_lock:
+                    save_settings(self._settings)
         except Exception:
             logger.exception("Failed to persist settings from extension")
+        finally:
+            with self._settings_lock:
+                self._settings_jobs -= 1
         self._push_settings_snapshot()
 
     def _on_browser_control(self, data: dict) -> None:
@@ -920,14 +929,25 @@ class MenuBarDelegate(NSObject):
             # deterministic. Disk persistence + device enumeration are offloaded.
             # Locked so a concurrent native menu toggle (main thread) can't
             # interleave its read-modify-write with this one (F14).
-            with self._settings_lock:
-                self._settings = apply_settings_patch(self._settings, patch)
-                self._daemon._settings = self._settings
+            with supervisor.activity_transition():
+                with self._settings_lock:
+                    self._settings_jobs += 1
+                    try:
+                        self._settings = apply_settings_patch(self._settings, patch)
+                        self._daemon._settings = self._settings
+                    except Exception:
+                        self._settings_jobs -= 1
+                        raise
             # COLD settings (mic/formats/dir/diarize/displays/capture_mic/tab)
             # take effect on the next recording — no live swap attempted. Hot
             # settings (live_captions is UI-only; capture_screenshots' local
             # capturer isn't reachable from here) also apply next recording.
-            self._run_off_bridge(self._persist_and_push_settings)
+            try:
+                self._run_off_bridge(self._persist_and_push_settings)
+            except Exception:
+                with self._settings_lock:
+                    self._settings_jobs -= 1
+                raise
             # Keep the native menu bar checkmarks/labels in sync (main thread).
             AppHelper.callAfter(self._sync_menu_from_settings)
 
@@ -973,31 +993,32 @@ class MenuBarDelegate(NSObject):
         # checks _meeting_active before the first one has run — so the check
         # there is not enough. A second concurrent meeting would open a
         # second mic stream and corrupt the chunk pipeline.
-        if self._meeting_phase != "idle" or (self._meeting_thread is not None and self._meeting_thread.is_alive()):
-            logger.info("Meeting already active — ignoring duplicate start")
-            return
-        self._meeting_active = True
-        self._meeting_browser_triggered = browser_triggered
-        self._meeting_start = time.monotonic() if started_at is None else started_at
-        self._meeting_stopped_at = None
-        self._meeting_session_id = session_id
-        self._meeting_paused = False
-        self._meeting_pause_events = []
-        self._meeting_phase = "recording"
-        self._meeting_chunk_count = 0
-        self._results_sent_count = 0
-        self._meeting_menu_item.setTitle_("Stop Recording (0:00)")
-        self._set_icon_by_name(MEETING_RECORDING_SYMBOL)
+        with supervisor.activity_transition():
+            if self._meeting_phase != "idle" or (self._meeting_thread is not None and self._meeting_thread.is_alive()):
+                logger.info("Meeting already active — ignoring duplicate start")
+                return
+            self._meeting_active = True
+            self._meeting_browser_triggered = browser_triggered
+            self._meeting_start = time.monotonic() if started_at is None else started_at
+            self._meeting_stopped_at = None
+            self._meeting_session_id = session_id
+            self._meeting_paused = False
+            self._meeting_pause_events = []
+            self._meeting_phase = "recording"
+            self._meeting_chunk_count = 0
+            self._results_sent_count = 0
+            self._meeting_menu_item.setTitle_("Stop Recording (0:00)")
+            self._set_icon_by_name(MEETING_RECORDING_SYMBOL)
 
-        trigger = "browser" if browser_triggered else "menu bar"
-        logger.info("Meeting recording started from %s", trigger)
+            trigger = "browser" if browser_triggered else "menu bar"
+            logger.info("Meeting recording started from %s", trigger)
 
-        self._meeting_thread = threading.Thread(
-            target=self._meeting_worker,
-            args=(browser_triggered, browser_title, browser_only),
-            daemon=False,
-        )
-        self._meeting_thread.start()
+            self._meeting_thread = threading.Thread(
+                target=self._meeting_worker,
+                args=(browser_triggered, browser_title, browser_only),
+                daemon=False,
+            )
+            self._meeting_thread.start()
 
     def _stop_meeting(self) -> None:
         if not self._meeting_active:
@@ -1038,18 +1059,13 @@ class MenuBarDelegate(NSObject):
         screens = None
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         pending = None
+        diarization_future = None
+        diarization_checked = False
         stopped = False
         failure = None
         language = None if settings.recording_language == "auto" else settings.recording_language
         try:
             diarize_ready = False
-            if settings.diarize:
-                from whisper_daemon.model_policy import diarization_status
-                self._diarization_status = diarization_status()
-                diarize_ready = self._diarization_status['available']
-                if not diarize_ready:
-                    _notify("whisper-daemon", "Speaker recognition unavailable", self._diarization_status['message'])
-                self._browser_bridge.send_json_str(__import__('json').dumps({"type": "capabilities", "diarization": self._diarization_status}))
             # browser_only: already-captured browser audio; never open devices for it.
             use_mic = settings.capture_mic and not browser_only
             use_tab = browser_triggered and (settings.capture_tab or browser_only)
@@ -1090,6 +1106,26 @@ class MenuBarDelegate(NSObject):
                     self._browser_recorder = browser
             if not recorders:
                 raise RuntimeError("No audio source is available")
+            # Open every audio source before probing the diarization model. The
+            # first model load can take tens of seconds; doing it earlier left
+            # a real gap at the beginning of the microphone track. Run it on
+            # the worker pool so Stop can still close live sources immediately.
+            if settings.diarize:
+                from whisper_daemon.model_policy import diarization_status
+                diarization_future = pool.submit(diarization_status, validate_load=False)
+
+            def finish_diarization_probe(wait=False):
+                nonlocal diarize_ready, diarization_checked
+                if (diarization_checked or diarization_future is None
+                        or (not wait and not diarization_future.done())):
+                    return
+                self._diarization_status = diarization_future.result()
+                diarize_ready = self._diarization_status['available']
+                if not diarize_ready:
+                    _notify("whisper-daemon", "Speaker recognition unavailable", self._diarization_status['message'])
+                self._browser_bridge.send_json_str(__import__('json').dumps({"type": "capabilities", "diarization": self._diarization_status}))
+                diarization_checked = True
+
             if settings.capture_screenshots and not browser_only and self._meeting_active:
                 screens = ScreenCapture(rec_dir, interval=settings.screenshot_interval,
                                         displays=settings.screenshot_displays, paused=lambda: self._meeting_paused)
@@ -1098,6 +1134,7 @@ class MenuBarDelegate(NSObject):
             last_recovery = 0.0
             while True:
                 now = time.monotonic()
+                finish_diarization_probe()
                 if not self._meeting_active and not stopped:
                     self._meeting_phase = "transcribing"
                     with self._browser_audio_lock:
@@ -1142,6 +1179,9 @@ class MenuBarDelegate(NSObject):
                     self._browser_bridge.send_json_str(__import__("json").dumps({
                         "type": "health", "sources": store.health(), "paused": self._meeting_paused}))
                 time.sleep(.05)
+            # Finalization may wait for speaker readiness, but capture has
+            # already stopped and all live sources are closed at this point.
+            finish_diarization_probe(wait=True)
             merged = merge_chunk_results(jobs.results())
             merged['duration'] = store.meta['duration']
             # The microphone is always the user; only the participants' track is
@@ -1249,9 +1289,12 @@ class MenuBarDelegate(NSObject):
         self._meeting_browser_triggered = False
         self._browser_bridge.end_session()
         self._meeting_phase = "idle"
-        self._browser_recorder = None
-        self._browser_prebuffer = []
-        self._browser_prebuffer_bytes = 0
+        # Under the staging lock and after end_session(): a frame racing this
+        # reset is either staged before the clear or refused for its session.
+        with self._browser_audio_lock:
+            self._browser_recorder = None
+            self._browser_prebuffer = []
+            self._browser_prebuffer_bytes = 0
 
         # Tell the extension the meeting is over so its in-bar button goes idle.
         try:
@@ -1274,6 +1317,54 @@ class MenuBarDelegate(NSObject):
         if self._meeting_phase == "idle":
             self._set_icon_safe(self._daemon._state)
             self._set_status_safe("Ready")
+
+    def memory_restart_safe(self) -> bool:
+        """True only when a watchdog restart cannot lose user work."""
+        with self._file_jobs_lock:
+            file_jobs = self._file_jobs
+        with self._settings_lock:
+            settings_jobs = self._settings_jobs
+        meeting_worker_alive = bool(
+            self._meeting_thread is not None and self._meeting_thread.is_alive()
+        )
+        # The review server lives in-process: a restart would make the page's
+        # next save fail and lose its edits.
+        review = self._review_server
+        return bool(
+            self._daemon._state is State.IDLE
+            and self._meeting_phase == "idle"
+            and not meeting_worker_alive
+            and self._browser_start_pending is None
+            and self._browser_prebuffer_bytes == 0
+            and file_jobs == 0
+            and settings_jobs == 0
+            and not (review is not None and review.has_unsaved_edits())
+        )
+
+    def _launch_file_transcription(self, paths: list[str]) -> None:
+        """Mark file work busy before starting its thread (no restart race)."""
+        with supervisor.activity_transition():
+            with self._file_jobs_lock:
+                self._file_jobs += 1
+            thread = threading.Thread(
+                target=self._run_file_transcription,
+                args=(paths,),
+                name="file-transcription",
+                daemon=True,
+            )
+            try:
+                thread.start()
+            except Exception:
+                with self._file_jobs_lock:
+                    self._file_jobs -= 1
+                raise
+
+    def _run_file_transcription(self, paths: list[str]) -> None:
+        try:
+            self._transcribe_paths_worker(paths)
+        finally:
+            with self._file_jobs_lock:
+                self._file_jobs -= 1
 
     def _open_review(self, directory):
         import webbrowser
@@ -1363,7 +1454,7 @@ class MenuBarDelegate(NSObject):
                     # fall through and write it without speaker labels.
                     self._set_status_safe(f"Diarizing {file_path.name}...")
                     try:
-                        result = _diarize_transcript(str(file_path), result)
+                        result = _diarize_transcript(str(file_path), result, release=False)
                     except Exception as exc:
                         diarize_error = str(exc) or exc.__class__.__name__
                         logger.exception("Diarization failed for %s", file_path)
@@ -1380,6 +1471,9 @@ class MenuBarDelegate(NSObject):
             except Exception as exc:
                 last_error = str(exc) or exc.__class__.__name__
                 logger.exception("Failed to transcribe %s", file_path)
+
+        if diarize:
+            _release_diarizer()
 
         # Surface the actual reason when nothing succeeded (e.g. missing ffmpeg)
         # instead of a bare "0/N" that reads like the format is unsupported.
@@ -1400,7 +1494,24 @@ class MenuBarDelegate(NSObject):
         self._finish_file_ui()
 
 
-def _diarize_transcript(path: str, result: dict) -> dict:
+def _release_diarizer() -> None:
+    """Drop the pyannote pipeline a diarized file batch kept loaded."""
+    # Only if a diarization actually imported it: never load torch to clean up.
+    diarizer = sys.modules.get("whisper_daemon.diarizer")
+    if diarizer is not None:
+        diarizer.release_models()
+
+
+def _toggle_format(formats: list[str], fmt: str) -> list[str]:
+    """Return a new format list with ``fmt`` toggled, never emptying it."""
+    if fmt not in formats:
+        return [*formats, fmt]
+    if len(formats) == 1:
+        return list(formats)
+    return [f for f in formats if f != fmt]
+
+
+def _diarize_transcript(path: str, result: dict, *, release: bool = True) -> dict:
     """Label a transcript's segments with speakers (pyannote; needs an HF token).
 
     Imported at call time — pyannote/torch load is seconds-slow and must not be
@@ -1409,7 +1520,7 @@ def _diarize_transcript(path: str, result: dict) -> dict:
     from whisper_daemon.diarize_merge import merge_speakers_with_transcript
     from whisper_daemon.diarizer import diarize_file
 
-    speaker_segments = diarize_file(path)
+    speaker_segments = diarize_file(path, release=release)
     if not speaker_segments:
         logger.warning("No speaker segments for %s — writing plain transcript", path)
         return result

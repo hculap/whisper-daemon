@@ -145,25 +145,30 @@ class Daemon:
 
     def _handle_toggle(self) -> None:
         if self._state == State.IDLE:
-            self._paste_target = capture_target()
-            if self._settings is not None:
-                self._recorder._silence_timeout = (self._silence_timeout_override if self._silence_timeout_override is not None
-                    else getattr(self._settings, 'dictation_silence', .7))
-            try:
-                self._recorder.start_recording()
-            except Exception as exc:
-                logger.error("Failed to open audio device: %s", exc)
-                play_error()
-                return
-            self._state = State.RECORDING
-            self._recording_started_at = time.monotonic()
-            self._pending_text = ""
-            self._pending_samples = 0
-            self._recording_gen += 1
-            self._reopen_attempts = 0
-            play_start()
-            telemetry.mark("record_start")
-            logger.info("State: IDLE -> RECORDING")
+            with supervisor.activity_transition():
+                # Recheck in case another event changed state before this
+                # transition began.
+                if self._state != State.IDLE:
+                    return
+                self._paste_target = capture_target()
+                if self._settings is not None:
+                    self._recorder._silence_timeout = (self._silence_timeout_override if self._silence_timeout_override is not None
+                        else getattr(self._settings, 'dictation_silence', .7))
+                try:
+                    self._recorder.start_recording()
+                except Exception as exc:
+                    logger.error("Failed to open audio device: %s", exc)
+                    play_error()
+                    return
+                self._state = State.RECORDING
+                self._recording_started_at = time.monotonic()
+                self._pending_text = ""
+                self._pending_samples = 0
+                self._recording_gen += 1
+                self._reopen_attempts = 0
+                play_start()
+                telemetry.mark("record_start")
+                logger.info("State: IDLE -> RECORDING")
         elif self._state == State.RECORDING:
             elapsed = time.monotonic() - self._recording_started_at
             if elapsed < 0.5:
@@ -385,7 +390,8 @@ class Daemon:
             if self._settings is not None:
                 tts_lang = getattr(self._settings, "tts_language", "auto")
             logger.info("Speak clipboard: %d chars (lang=%s)", len(text), tts_lang)
-            speak_text(str(text), language=tts_lang)
+            with supervisor.activity_transition():
+                speak_text(str(text), language=tts_lang)
         else:
             logger.info("Clipboard empty, nothing to speak")
 

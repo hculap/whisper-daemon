@@ -34,6 +34,8 @@
   // --- Local state (UI mirrors daemon; capture ownership is local) ---
   let daemonState = "idle"; // idle | recording | transcribing
   let lastElapsed = 0; // last elapsed seconds from a status push (for reinject)
+  let elapsedAnchoredAt = performance.now();
+  let elapsedTimer = null;
   let liveCaptionsOn = false;
   let captionLines = [];
   let currentSettings = null;
@@ -428,16 +430,32 @@
   }
 
   function refreshUi() {
-    const stopping = daemonState === "recording" && Date.now() < optimisticUntil;
-    const shownState = stopping ? "transcribing" : daemonState;
+    const shownState = logic.displayDaemonState(daemonState, optimisticUntil, Date.now());
+    const elapsed = displayedElapsed();
     injector.setView(logic.controlView({
       daemonState: shownState, starting: connecting, paused, warning: !!warning,
-      connection, elapsed: lastElapsed, shortcut: SHORTCUT,
+      connection, elapsed, shortcut: SHORTCUT,
     }));
     panel.update({
-      daemonState: shownState, starting: connecting, paused, elapsed: lastElapsed, health,
+      daemonState: shownState, starting: connecting, paused, elapsed, health,
       warning, connection, diarization, title: meetingMeta().title, shortcut: SHORTCUT,
     });
+  }
+
+  function anchorElapsed(value) {
+    lastElapsed = Number.isFinite(value) ? Math.max(0, value) : lastElapsed;
+    elapsedAnchoredAt = performance.now();
+  }
+
+  function displayedElapsed() {
+    return logic.interpolatedElapsed(
+      lastElapsed, elapsedAnchoredAt, performance.now(), daemonState === "recording"
+    );
+  }
+
+  function tickElapsed() {
+    if (daemonState !== "recording") return;
+    refreshUi();
   }
 
   function loudestLevel(sources) {
@@ -497,7 +515,7 @@
       refreshUi();
     } else if (msg.type === "WD_STATUS") {
       daemonState = msg.state || "idle";
-      lastElapsed = typeof msg.elapsed === "number" ? msg.elapsed : lastElapsed;
+      anchorElapsed(typeof msg.elapsed === "number" ? msg.elapsed : lastElapsed);
       connection = "connected";
       if (daemonState !== "idle") {
         clearTimeout(connectingTimer);
@@ -521,6 +539,15 @@
       }
       refreshUi();
       applyCaptionsVisibility();
+    } else if (msg.type === "WD_CAPTURE_STARTED") {
+      // The daemon has accepted the session. Paint recording immediately and
+      // start the local clock instead of waiting for its next 1 Hz status push.
+      const elapsed = logic.captureStartedElapsed(daemonState, displayedElapsed(), msg.elapsed);
+      daemonState = "recording";
+      anchorElapsed(elapsed);
+      clearTimeout(connectingTimer);
+      connecting = false;
+      refreshUi();
     } else if (msg.type === "WD_SETTINGS") {
       currentSettings = msg.settings || currentSettings;
       if (currentSettings && "live_captions" in currentSettings) {
@@ -610,6 +637,8 @@
     // ownership so a later re-join starts clean.
     sessionOwned = false;
     clearTimeout(connectingTimer);
+    clearInterval(elapsedTimer);
+    elapsedTimer = null;
     connecting = false;
     injector.teardown();
     panel.teardown();
@@ -654,6 +683,7 @@
     reinject();
     injector.startObserver(reinject);
     wdSend({ type: "WD_GET_SETTINGS" });
+    if (!elapsedTimer) elapsedTimer = setInterval(tickElapsed, 250);
   }
 
   // Re-join in the same tab: rebuild everything.

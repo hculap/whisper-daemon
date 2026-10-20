@@ -4,6 +4,7 @@ Three approaches — batch, realtime (embedding bank), and hybrid —
 so the user can benchmark quality vs speed and choose.
 """
 
+import gc
 import logging
 import threading
 import warnings
@@ -168,20 +169,32 @@ def diarize_batch(
 def diarize_file(
     path: str,
     num_speakers: int | None = None,
+    *,
+    release: bool = True,
 ) -> list[SpeakerSegment]:
-    """Run diarization on an audio/video file (ffmpeg decodes it)."""
+    """Run diarization on an audio/video file (ffmpeg decodes it).
+
+    ``release=False`` keeps the pipeline loaded for a batch of files; the
+    caller then calls ``release_models()`` once the batch is done.
+    """
     # Decode with the known ffmpeg executable, independently of torchcodec's
     # fragile shared-library ABI. A file-backed array avoids a second full copy.
     import tempfile
     import subprocess
     from whisper_daemon.ffmpeg_path import ensure_ffmpeg_on_path
     if ensure_ffmpeg_on_path() is None: raise RuntimeError("ffmpeg is required for diarization")
-    with tempfile.TemporaryFile() as file:
-        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-f", "f32le",
-                        "-ac", "1", "-ar", "16000", "pipe:1"], stdout=file, check=True)
-        if file.tell() == 0: return []
-        audio = np.memmap(file, dtype='<f4', mode='c', shape=(file.tell() // 4,))
-        return diarize_batch(audio, num_speakers=num_speakers)
+    try:
+        with tempfile.TemporaryFile() as file:
+            subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", path, "-f", "f32le",
+                            "-ac", "1", "-ar", "16000", "pipe:1"], stdout=file, check=True)
+            if file.tell() == 0: return []
+            audio = np.memmap(file, dtype='<f4', mode='c', shape=(file.tell() // 4,))
+            return diarize_batch(audio, num_speakers=num_speakers)
+    finally:
+        # Batch output has already been converted to small Python dataclasses;
+        # retaining the multi-GB MPS pipeline between meetings is unnecessary.
+        if release:
+            release_models()
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +202,27 @@ def diarize_file(
 # ---------------------------------------------------------------------------
 
 _embedding_model = None
+
+
+@serialized
+def release_models() -> None:
+    """Drop cached pyannote models and return their MPS buffers to macOS."""
+    global _pipeline, _embedding_model
+    had_models = _pipeline is not None or _embedding_model is not None
+    _embedding_model = None
+    _pipeline = None
+    gc.collect()
+    if torch.backends.mps.is_available():
+        try:
+            torch.mps.synchronize()
+        except Exception:
+            logger.debug("Could not synchronize MPS during cleanup", exc_info=True)
+        try:
+            torch.mps.empty_cache()
+        except Exception:
+            logger.exception("Could not clear pyannote MPS cache")
+    if had_models:
+        logger.info("Released pyannote pipeline and MPS cache")
 
 
 def _get_embedding_model():

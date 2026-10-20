@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 
+import mlx.core as mx
 import mlx_whisper
 import numpy as np
 
@@ -13,6 +14,7 @@ from whisper_daemon.text_cleanup import collapse_repetitions
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo-q4"
+MLX_CACHE_LIMIT_BYTES = 512 * 1024**2
 
 # MLX Metal calls are not concurrency-safe: two inferences at once
 # (dictation vs meeting chunk vs file transcription) can SIGABRT or hang
@@ -22,6 +24,7 @@ DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo-q4"
 MLX_LOCK = threading.RLock()
 
 _model_preloaded = False
+_mlx_memory_configured = False
 
 
 def _hang_watchdog(audio_sec: float, timeout_sec: float | None = None) -> threading.Timer:
@@ -52,6 +55,72 @@ def _hang_watchdog(audio_sec: float, timeout_sec: float | None = None) -> thread
     return timer
 
 
+def configure_mlx_memory() -> None:
+    """Bound MLX's free-buffer cache before the first model allocation.
+
+    MLX otherwise uses its full memory limit as the cache limit.  On the
+    16-GiB deployment machine that was about 15.2 GiB, allowing transient
+    meeting buffers to remain charged to the daemon for days.
+    """
+    global _mlx_memory_configured
+    with MLX_LOCK:
+        if _mlx_memory_configured:
+            return
+        previous = mx.set_cache_limit(MLX_CACHE_LIMIT_BYTES)
+        _mlx_memory_configured = True
+        logger.info(
+            "MLX cache limit: %.0f MiB (previously %.0f MiB)",
+            MLX_CACHE_LIMIT_BYTES / 1024**2,
+            previous / 1024**2,
+        )
+
+
+def _clear_mlx_cache_locked() -> None:
+    """Best-effort cache cleanup that cannot destroy a valid transcript."""
+    active = None
+    cached = None
+    try:
+        active = mx.get_active_memory()
+        cached = mx.get_cache_memory()
+    except Exception:
+        logger.debug("Could not read MLX memory counters", exc_info=True)
+    try:
+        mx.clear_cache()
+    except Exception:
+        logger.exception("Could not clear MLX cache")
+        return
+    if active is not None and cached is not None:
+        logger.debug(
+            "MLX memory after inference: active=%.1f MiB, released cache=%.1f MiB",
+            active / 1024**2,
+            cached / 1024**2,
+        )
+
+
+def release_unused_memory() -> None:
+    """Release unused MLX buffers while retaining the loaded Whisper model."""
+    with MLX_LOCK:
+        _clear_mlx_cache_locked()
+
+
+def _run_mlx_inference(
+    audio: np.ndarray,
+    kwargs: dict,
+    *,
+    audio_sec: float,
+    timeout_sec: float | None = None,
+) -> dict:
+    """Serialize one inference and always return its transient cache to macOS."""
+    with MLX_LOCK:
+        configure_mlx_memory()
+        watchdog = _hang_watchdog(audio_sec, timeout_sec=timeout_sec)
+        try:
+            return mlx_whisper.transcribe(audio, **kwargs)
+        finally:
+            watchdog.cancel()
+            _clear_mlx_cache_locked()
+
+
 def preload_model(model: str = DEFAULT_MODEL) -> None:
     """Download and load the model into GPU memory at startup."""
     global _model_preloaded
@@ -60,14 +129,14 @@ def preload_model(model: str = DEFAULT_MODEL) -> None:
     os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
     try:
         warmup_audio = np.zeros(16000, dtype=np.float32)
-        with MLX_LOCK:
-            # Includes a possible model download on first run — give it a
-            # generous fixed budget rather than the audio-length formula.
-            watchdog = _hang_watchdog(1.0, timeout_sec=600.0)
-            try:
-                mlx_whisper.transcribe(warmup_audio, path_or_hf_repo=model)
-            finally:
-                watchdog.cancel()
+        # Includes a possible model download on first run — give it a generous
+        # fixed budget rather than the audio-length formula.
+        _run_mlx_inference(
+            warmup_audio,
+            {"path_or_hf_repo": model},
+            audio_sec=1.0,
+            timeout_sec=600.0,
+        )
     finally:
         if old_hf_verbosity is None:
             os.environ.pop("HF_HUB_DISABLE_PROGRESS_BARS", None)
@@ -98,20 +167,18 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL, language: str | No
 
     try:
         logger.info("Transcribing %.1fs of audio...", len(audio) / 16000)
-        with MLX_LOCK:
-            watchdog = _hang_watchdog(len(audio) / 16000)
-            try:
-                result = mlx_whisper.transcribe(
-                    audio,
-                    path_or_hf_repo=model,
-                    temperature=0,
-                    condition_on_previous_text=False,
-                    word_timestamps=False,
-                    language=language,
-                    initial_prompt=initial_prompt,
-                )
-            finally:
-                watchdog.cancel()
+        result = _run_mlx_inference(
+            audio,
+            {
+                "path_or_hf_repo": model,
+                "temperature": 0,
+                "condition_on_previous_text": False,
+                "word_timestamps": False,
+                "language": language,
+                "initial_prompt": initial_prompt,
+            },
+            audio_sec=len(audio) / 16000,
+        )
         text = collapse_repetitions(result.get("text", "").strip())
         language = result.get("language", "unknown")
         logger.info("Transcription done — lang=%s, len=%d chars", language, len(text))
@@ -157,12 +224,11 @@ def transcribe_full(
 
     try:
         logger.info("Transcribing %.1fs of audio...", len(audio) / 16000)
-        with MLX_LOCK:
-            watchdog = _hang_watchdog(len(audio) / 16000)
-            try:
-                result = mlx_whisper.transcribe(audio, **kwargs)
-            finally:
-                watchdog.cancel()
+        result = _run_mlx_inference(
+            audio,
+            kwargs,
+            audio_sec=len(audio) / 16000,
+        )
         # Strip leading whitespace from segment texts
         for seg in result.get("segments", []):
             seg["text"] = collapse_repetitions(seg["text"].strip())
@@ -220,12 +286,7 @@ def transcribe_file(
     audio = mlx_whisper.audio.load_audio(path)
     audio_sec = len(audio) / 16000
 
-    with MLX_LOCK:
-        watchdog = _hang_watchdog(audio_sec)
-        try:
-            result = mlx_whisper.transcribe(audio, **kwargs)
-        finally:
-            watchdog.cancel()
+    result = _run_mlx_inference(audio, kwargs, audio_sec=audio_sec)
     for seg in result.get("segments", []):
         seg["text"] = collapse_repetitions(seg.get("text", "").strip())
     result["text"] = collapse_repetitions(result.get("text", "").strip())

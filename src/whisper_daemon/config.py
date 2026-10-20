@@ -170,7 +170,17 @@ def load_settings() -> Settings:
 
 
 def save_settings(settings: Settings) -> None:
-    """Save settings to config.toml."""
+    """Save settings atomically without racing a memory-pressure restart."""
+    # Import lazily so config parsing stays independent during lightweight CLI
+    # startup, while every actual persistence path shares the restart gate.
+    from whisper_daemon import supervisor
+
+    with supervisor.activity_transition():
+        _save_settings(settings)
+
+
+def _save_settings(settings: Settings) -> None:
+    """Serialize and atomically replace config.toml."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
     rec_formats = ", ".join(_toml_str(f) for f in settings.recording_formats)

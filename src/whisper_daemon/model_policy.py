@@ -22,11 +22,16 @@ def local_model(model):
         raise RuntimeError(f'Model is not installed locally: {model}. Run whisper-daemon models prepare.') from exc
 
 
-def diarization_status():
+def diarization_status(*, validate_load: bool = True):
     try:
         local_model("pyannote/speaker-diarization-community-1")
-        from whisper_daemon.diarizer import _get_pipeline
-        _get_pipeline()  # includes dependent models and actual load compatibility
-        return {'available': True, 'message': 'Speaker recognition ready (offline)'}
+        if validate_load:
+            from whisper_daemon.diarizer import _get_pipeline
+            _get_pipeline()
+            return {'available': True, 'message': 'Speaker recognition ready (offline)'}
+        # The menu-bar recorder only needs a non-blocking cache check here. The
+        # actual batch call still reports compatibility errors and releases the
+        # pipeline as soon as final speaker labels have been produced.
+        return {'available': True, 'message': 'Speaker recognition model cached offline'}
     except Exception:
         return {'available': False, 'message': 'Speaker recognition unavailable: install authorized models with whisper-daemon models prepare --diarization. Audio and transcript can still be recorded.'}

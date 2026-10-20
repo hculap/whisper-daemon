@@ -85,3 +85,87 @@ def test_review_edit_never_marks_an_unfinished_meeting_ready(tmp_path):
     make_transcript(tmp_path)
     save_review(tmp_path, {'names': {'1': 'Anna'}})
     assert not (tmp_path / 'meeting.ready.json').exists()
+
+
+def test_review_save_defers_memory_restart_without_blocking_watchdog(tmp_path, monkeypatch):
+    import threading
+    from whisper_daemon import meeting_review, supervisor
+
+    make_transcript(tmp_path)
+    prepare_review(tmp_path)
+    original_atomic_json = meeting_review.atomic_json
+    save_entered = threading.Event()
+    allow_save = threading.Event()
+    idle_probed = threading.Event()
+    restarted = threading.Event()
+
+    def blocking_atomic_json(path, data):
+        if path.name == 'transcript.json':
+            save_entered.set()
+            assert allow_save.wait(2)
+        return original_atomic_json(path, data)
+
+    monkeypatch.setattr(meeting_review, 'atomic_json', blocking_atomic_json)
+    monkeypatch.setattr(supervisor, 'request_restart', lambda reason: restarted.set())
+
+    save_thread = threading.Thread(
+        target=meeting_review.save_review,
+        args=(tmp_path, {'names': {'1': 'Anna'}}),
+    )
+    save_thread.start()
+    assert save_entered.wait(2)
+
+    def is_idle():
+        idle_probed.set()
+        return True
+
+    restart_thread = threading.Thread(
+        target=supervisor.request_restart_if_safe,
+        args=('test pressure', is_idle),
+    )
+    restart_thread.start()
+    try:
+        restart_thread.join(0.2)
+        assert not restart_thread.is_alive()
+        assert not idle_probed.wait(0.2)
+        assert not restarted.is_set()
+    finally:
+        allow_save.set()
+        save_thread.join(2)
+
+    assert not save_thread.is_alive()
+    assert supervisor.request_restart_if_safe('test pressure', is_idle)
+    assert idle_probed.is_set()
+    assert restarted.is_set()
+
+
+def test_open_page_with_unsaved_edits_reports_presence(tmp_path, monkeypatch):
+    import urllib.request
+    import urllib.error
+    from whisper_daemon import meeting_review
+    from whisper_daemon.meeting_review import ReviewServer
+    make_transcript(tmp_path)
+    server = ReviewServer(tmp_path)
+    url = server.start()
+    origin = f'http://127.0.0.1:{server.server_port}'
+
+    def presence(body, headers=None):
+        request = urllib.request.Request(url + 'presence', data=json.dumps(body).encode(),
+            headers=headers or {'Origin': origin, 'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(request) as response: return response.status
+        except urllib.error.HTTPError as error: return error.code
+    try:
+        assert not server.has_unsaved_edits()
+        assert presence({'dirty': True}) == 200 and server.has_unsaved_edits()
+        assert presence({'dirty': False}) == 200 and not server.has_unsaved_edits()
+        assert presence({'dirty': 'yes'}) == 400 and not server.has_unsaved_edits()
+        assert presence({'dirty': True}, {'Origin': 'https://evil.example'}) == 403
+        assert not server.has_unsaved_edits()
+        # A closed or crashed tab stops reporting: the busy state expires.
+        assert presence({'dirty': True}) == 200
+        now = meeting_review.time.monotonic()
+        monkeypatch.setattr(meeting_review.time, 'monotonic', lambda: now + meeting_review.UNSAVED_EDITS_TTL_SEC + 1)
+        assert not server.has_unsaved_edits()
+    finally:
+        server.shutdown(); server.server_close()

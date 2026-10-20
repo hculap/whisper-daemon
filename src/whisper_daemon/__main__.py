@@ -226,14 +226,14 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
         raise SystemExit(0)
     PID_FILE.write_text(str(os.getpid()))
 
-    from whisper_daemon import audio_system, permissions, supervisor
-    from whisper_daemon.daemon import Daemon
+    from whisper_daemon import audio_system, permissions, supervisor, tts
+    from whisper_daemon.daemon import Daemon, State
     from whisper_daemon.events import Event
     from whisper_daemon.hotkey import HotkeyListener
     from whisper_daemon.menubar import _start_exit_watchdog, run_with_menubar
     from whisper_daemon.config import load_settings
     from whisper_daemon.recorder import AudioRecorder
-    from whisper_daemon.transcriber import preload_model
+    from whisper_daemon.transcriber import MLX_LOCK, preload_model, release_unused_memory
 
     settings = load_settings()
     device = settings.recording_device or None
@@ -245,8 +245,31 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     recorder = AudioRecorder(event_queue, silence_timeout=effective_silence, device=device)
     hotkey = HotkeyListener(event_queue)
     daemon = Daemon(event_queue, recorder, model=model, settings=settings, silence_timeout=silence_timeout)
+    menubar_delegate = None
+
+    def _memory_restart_safe() -> bool:
+        if daemon._state is not State.IDLE or tts.is_speaking():
+            return False
+        if not no_menubar:
+            if menubar_delegate is None or not menubar_delegate.memory_restart_safe():
+                return False
+        # State checks cover known work; the non-blocking lock closes the small
+        # transition window around an MLX call.
+        if not MLX_LOCK.acquire(blocking=False):
+            return False
+        MLX_LOCK.release()
+        return True
+
+    def _reclaim_inference_memory() -> None:
+        release_unused_memory()
+        # Avoid importing torch/pyannote solely for cleanup.  If diarization
+        # ran, its module is already present and can release its own MPS cache.
+        diarizer = sys.modules.get("whisper_daemon.diarizer")
+        if diarizer is not None:
+            diarizer.release_models()
 
     audio_system.install_topology_listener()
+    supervisor.configure_memory_guard(_memory_restart_safe, _reclaim_inference_memory)
     supervisor.start()
 
     # Global hotkeys need Accessibility trust; warn loudly (and prompt) if
@@ -254,8 +277,6 @@ def run(model: str, silence_timeout: float, no_menubar: bool, verbose: bool) -> 
     permissions.check_and_warn()
 
     preload_model(model)
-
-    menubar_delegate = None
 
     def _signal_handler(sig: int, frame: object) -> None:
         logger.info("Received signal %s", signal.Signals(sig).name)

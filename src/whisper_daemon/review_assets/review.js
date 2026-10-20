@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-let data, assignments = {}, revision = 0;
+let data, assignments = {}, revision = 0, savedRevision = 0;
 const time = value => `${Math.floor(value / 60)}:${String(Math.floor(value % 60)).padStart(2,'0')}`;
 function element(tag, text, cls) { const node=document.createElement(tag); if(text!==undefined) node.textContent=text; if(cls) node.className=cls; return node; }
 function play(start) { $('audio').currentTime=start; $('audio').play().catch(() => {$('status').textContent='Wybierz dostępne źródło audio.';}); }
@@ -22,7 +22,9 @@ function renderTranscript() {
   }
   $('count').textContent=`${shown} / ${data.transcript.segments.length}`;
 }
-function dirty() {revision++;$('status').textContent='Niezapisane zmiany';}
+// The daemon defers its memory-pressure restart while this page holds unsaved edits.
+function reportPresence() {fetch('presence',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({dirty:revision!==savedRevision})}).catch(()=>{});}
+function dirty() {revision++;$('status').textContent='Niezapisane zmiany';if(revision===savedRevision+1)reportPresence();}
 function renderTasks() {
   $('tasks').replaceChildren();
   data.notes.tasks.forEach((task,index)=>{
@@ -65,6 +67,7 @@ $('save').onclick=async()=>{
     const names=Object.fromEntries(data.transcript.speakers.map(s=>[s.id,s.label]));
     const response=await fetch('save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({names,assignments,summary:$('summary').value,tasks:data.notes.tasks})});
     const saved=await response.json();if(!response.ok)throw new Error(saved.error||'Nie udało się zapisać');
+    savedRevision=savingRevision;reportPresence();
     if(revision===savingRevision) {
       data=saved;assignments={};
       // Bind inputs to the newly returned objects, without resetting playback.
@@ -76,6 +79,7 @@ $('save').onclick=async()=>{
     }
   } catch(error) {$('status').textContent=error.message;} finally {$('save').disabled=false;}
 };
+setInterval(()=>{if(revision!==savedRevision)reportPresence();},20000);
 fetch('data').then(r=>{if(!r.ok)throw new Error('Brak dostępu do spotkania');return r.json();}).then(value=>{data=value;render();}).catch(error=>{$('status').textContent=error.message;});
 
 $('addSpeaker').onclick=()=>{const id=Math.max(-1,...data.transcript.speakers.map(s=>s.id))+1;data.transcript.speakers.push({id,label:'Nowy mówca'});renderSpeakers();renderTranscript();dirty();};

@@ -91,6 +91,10 @@ def test_stop_before_the_main_thread_starts_the_meeting_saves_its_audio(start_ha
     state = settled(harness)
     assert [r["frames"] for r in state["recordings"]] == [{"browser": 8000}]
     assert state["recordings"][0]["gaps"] == []
+    # The harness transcribes no speech: the meeting fails readiness and stays in
+    # the local capture; nothing unfinished reaches the synced folder.
+    assert not state["recordings"][0]["published"]
+    assert not list(harness.recordings.iterdir())
 
 
 def test_a_start_while_saving_is_busy_not_closed_and_succeeds_once_idle(start_harness):

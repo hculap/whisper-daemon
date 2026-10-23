@@ -9,12 +9,21 @@ import mlx_whisper
 import numpy as np
 
 from whisper_daemon.ffmpeg_path import ensure_ffmpeg_on_path
-from whisper_daemon.text_cleanup import collapse_repetitions
+from whisper_daemon.text_cleanup import clean_segments, collapse_repetitions
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo-q4"
 MLX_CACHE_LIMIT_BYTES = 512 * 1024**2
+
+# Greedy decoding can lock into a loop: meetings got "że to jest to," x43 up
+# to the 224-token limit (compression ratio 16-29; Whisper's own limit is 2.4).
+# Such a chunk is decoded again at low temperatures, which recovered the real
+# speech in most of them; higher ones produced new nonsense. A retry that is
+# repetitive itself is discarded, so the worst case stays the greedy text, whose
+# loop clean_segments collapses.
+RETRY_TEMPERATURES = (0.2, 0.4)
+COMPRESSION_RATIO_LIMIT = 2.4
 
 # MLX Metal calls are not concurrency-safe: two inferences at once
 # (dictation vs meeting chunk vs file transcription) can SIGABRT or hang
@@ -229,10 +238,18 @@ def transcribe_full(
             kwargs,
             audio_sec=len(audio) / 16000,
         )
-        # Strip leading whitespace from segment texts
-        for seg in result.get("segments", []):
-            seg["text"] = collapse_repetitions(seg["text"].strip())
-        result["text"] = collapse_repetitions(result.get("text", "").strip())
+        if _repetitive(result):
+            retry = _run_mlx_inference(
+                audio,
+                {**kwargs, "temperature": RETRY_TEMPERATURES,
+                 "compression_ratio_threshold": COMPRESSION_RATIO_LIMIT,
+                 "logprob_threshold": None, "no_speech_threshold": None},
+                audio_sec=len(audio) / 16000,
+            )
+            kept = not _repetitive(retry)
+            logger.info("Repetitive transcription; %s", "replaced by a retry" if kept else "retry repetitive too, keeping it collapsed")
+            result = retry if kept else result
+        result = clean_segments(result)
 
         logger.info(
             "Transcription done — lang=%s, %d chars, %d segments",
@@ -244,6 +261,10 @@ def transcribe_full(
     except Exception:
         logger.exception("Transcription failed")
         raise
+
+
+def _repetitive(result: dict) -> bool:
+    return any(seg.get("compression_ratio", 0) > COMPRESSION_RATIO_LIMIT for seg in result.get("segments", []))
 
 
 def transcribe_file(
@@ -286,10 +307,7 @@ def transcribe_file(
     audio = mlx_whisper.audio.load_audio(path)
     audio_sec = len(audio) / 16000
 
-    result = _run_mlx_inference(audio, kwargs, audio_sec=audio_sec)
-    for seg in result.get("segments", []):
-        seg["text"] = collapse_repetitions(seg.get("text", "").strip())
-    result["text"] = collapse_repetitions(result.get("text", "").strip())
+    result = clean_segments(_run_mlx_inference(audio, kwargs, audio_sec=audio_sec))
     language_detected = result.get("language", "unknown")
     text_len = len(result.get("text", ""))
     segments_count = len(result.get("segments", []))

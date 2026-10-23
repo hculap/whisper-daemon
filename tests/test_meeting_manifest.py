@@ -86,4 +86,59 @@ class ManifestTests(unittest.TestCase):
             self.assertFalse((root / 'meeting.ready.json').exists())
 
 
+class TargetTests(unittest.TestCase):
+    """A meeting captured locally is published to a separate (synced) folder."""
+    result = {'text': 'Oferta', 'segments': [{'start': 0, 'end': 2, 'text': 'Oferta'}]}
+
+    def capture(self, tmp):
+        from whisper_daemon.meeting_manifest import begin_meeting
+        capture, target = Path(tmp) / 'capture' / 'recording_x', Path(tmp) / 'Sync' / 'recording_x'
+        identity = begin_meeting(capture, 'CRM')
+        for name in ('recording.wav', 'mic.f32', 'chunks/1.json', 'screenshots/1.jpg', 'transcript_live.txt'):
+            (capture / name).parent.mkdir(exist_ok=True)
+            (capture / name).write_bytes(name.encode())
+        return capture, target, identity
+
+    def test_only_published_files_reach_the_target_and_the_capture_is_removed(self):
+        from whisper_daemon.meeting_manifest import finalize_meeting
+        with tempfile.TemporaryDirectory() as tmp:
+            capture, target, identity = self.capture(tmp)
+            manifest = finalize_meeting(capture, identity, self.result, [], target=target)
+            self.assertFalse(capture.exists())
+            self.assertEqual(sorted(p.relative_to(target).as_posix() for p in target.rglob('*') if p.is_file()),
+                             ['meeting.ready.json', 'recording.wav', 'screenshots/1.jpg', 'transcript.json'])
+            for file in manifest['files']:
+                self.assertEqual(file['sha256'], hashlib.sha256((target / file['path']).read_bytes()).hexdigest())
+            self.assertEqual(json.loads((target / 'meeting.ready.json').read_text()), manifest)
+
+    def test_a_failed_meeting_stays_in_the_capture(self):
+        from whisper_daemon.meeting_manifest import finalize_meeting
+        with tempfile.TemporaryDirectory() as tmp:
+            capture, target, identity = self.capture(tmp)
+            self.assertIsNone(finalize_meeting(capture, identity, {'text': '', 'segments': []}, [], target=target))
+            self.assertFalse(target.exists())
+            self.assertTrue((capture / 'meeting.failed.json').exists() and (capture / 'mic.f32').exists())
+
+    def test_an_existing_target_is_never_merged_into(self):
+        from whisper_daemon.meeting_manifest import finalize_meeting
+        with tempfile.TemporaryDirectory() as tmp:
+            capture, target, identity = self.capture(tmp)
+            target.mkdir(parents=True)
+            with self.assertRaises(FileExistsError):
+                finalize_meeting(capture, identity, self.result, [], target=target)
+            self.assertEqual(list(target.iterdir()), [])
+            self.assertTrue((capture / 'mic.f32').exists())
+
+    def test_a_partial_copy_is_removed_and_the_capture_kept(self):
+        from unittest import mock
+        from whisper_daemon import meeting_manifest
+        with tempfile.TemporaryDirectory() as tmp:
+            capture, target, identity = self.capture(tmp)
+            with mock.patch.object(meeting_manifest.shutil, 'copyfile', side_effect=OSError('disk full')):
+                with self.assertRaises(OSError):
+                    meeting_manifest.finalize_meeting(capture, identity, self.result, [], target=target)
+            self.assertFalse(target.exists())
+            self.assertTrue((capture / 'recording.wav').exists() and (capture / 'mic.f32').exists())
+
+
 if __name__ == '__main__': unittest.main()

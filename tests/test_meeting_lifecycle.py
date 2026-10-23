@@ -143,7 +143,7 @@ def test_stop_closes_microphone_while_speaker_model_probe_is_still_blocked(tmp_p
         _notify=lambda *args: None, _write_partial=space['_write_partial'],
         build_status_message=build_status_message)
     now = time.monotonic()
-    obj = SimpleNamespace(_settings=Settings(recording_dir=str(tmp_path), capture_mic=True,
+    obj = SimpleNamespace(_settings=Settings(recording_dir=str(tmp_path), capture_dir=str(tmp_path / 'capture'), capture_mic=True,
             capture_tab=False, capture_screenshots=False, diarize=True),
         _daemon=SimpleNamespace(_model='model'), _meeting_active=True, _meeting_paused=False,
         _meeting_start=now, _meeting_stopped_at=None, _meeting_session_id='session-12345678',
@@ -212,7 +212,8 @@ def run_worker(tmp_path, transcribe):
         _notify=lambda *parts: notes.append(parts), _write_partial=space['_write_partial'],
         build_status_message=build_status_message)
     now = time.monotonic()
-    obj = SimpleNamespace(_settings=Settings(recording_dir=str(tmp_path), capture_mic=False, capture_screenshots=False),
+    obj = SimpleNamespace(_settings=Settings(recording_dir=str(tmp_path), capture_dir=str(tmp_path / 'capture'),
+            capture_mic=False, capture_screenshots=False),
         _daemon=SimpleNamespace(_model='model'), _meeting_active=False, _meeting_paused=False,
         _meeting_start=now - 5, _meeting_stopped_at=now, _meeting_session_id='session-12345678',
         _browser_bridge=SimpleNamespace(send_json_str=lambda text: None), _browser_audio_lock=threading.RLock(),
@@ -228,14 +229,18 @@ def run_worker(tmp_path, transcribe):
         for name, module in real_modules.items():
             if module is None: sys.modules.pop(name, None)
             else: sys.modules[name] = module
-    return next(tmp_path.glob('recording_*')), notes
+    return notes
 
 
 def test_finished_meeting_publishes_ready_manifest_last(tmp_path):
     import hashlib, json, datetime
-    folder, notes = run_worker(tmp_path, lambda audio, model, language: {
+    notes = run_worker(tmp_path, lambda audio, model, language: {
         'text': 'Szymon wyśle ofertę.', 'language': 'pl',
         'segments': [{'start': 0, 'end': 1, 'text': 'Szymon wyśle ofertę.'}]})
+    folder = next(tmp_path.glob('recording_*'))
+    # Only published files reach the synced folder; the local capture is deleted.
+    assert not [p for p in folder.rglob('*') if p.suffix == '.f32' or p.name in ('chunks', 'transcript_live.txt')]
+    assert not list((tmp_path / 'capture').glob('recording_*'))
     manifest = json.loads((folder / 'meeting.ready.json').read_text())
     paths = {f['path']: f for f in manifest['files']}
     assert {'transcript.json', 'transcript.txt', 'notes.json', 'session.json', 'recording.wav', 'browser.wav'} <= set(paths)
@@ -258,7 +263,9 @@ def test_failed_chunk_marks_meeting_failed_and_never_ready(tmp_path):
     import json
     def broken(audio, model, language):
         raise RuntimeError('decoder failed')
-    folder, notes = run_worker(tmp_path, broken)
+    notes = run_worker(tmp_path, broken)
+    assert not list(tmp_path.glob('recording_*'))  # nothing unfinished reaches the synced folder
+    folder = next((tmp_path / 'capture').glob('recording_*'))
     assert not (folder / 'meeting.ready.json').exists()
     failed = json.loads((folder / 'meeting.failed.json').read_text())
     assert failed['transcription_errors'] == ['RuntimeError: decoder failed']

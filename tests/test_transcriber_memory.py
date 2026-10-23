@@ -128,3 +128,52 @@ def test_memory_stats_failure_does_not_skip_cache_cleanup(monkeypatch):
 
     assert transcriber.transcribe(np.ones(16000, dtype=np.float32), model="test") == "kept"
     assert "clear" in events
+
+
+
+LOOP = {"text": " że to jest to," * 43, "language": "pl", "segments": [
+    {"text": " Dziś," + " że to jest to," * 43, "start": 0, "end": 14.7, "compression_ratio": 20.85}]}
+SPEECH = {"text": " Dobra. Wszystkie prawa zastrzeżone.", "language": "pl", "segments": [
+    {"text": " Dobra.", "start": 0, "end": 1, "compression_ratio": 0.6},
+    {"text": " Wszystkie prawa zastrzeżone.", "start": 1, "end": 2, "compression_ratio": 0.9}]}
+
+
+def _decode(monkeypatch, *results):
+    calls, pending = [], list(results)
+    _install_fakes(monkeypatch, lambda audio, **kwargs: calls.append(kwargs) or pending.pop(0))
+    monkeypatch.setattr(transcriber, "ensure_ffmpeg_on_path", lambda: "/opt/ffmpeg")
+    monkeypatch.setattr(transcriber.mlx_whisper.audio, "load_audio", lambda path: np.ones(16000, dtype=np.float32))
+    return calls
+
+
+def test_a_clean_chunk_is_decoded_once_greedily_without_hallucinations(monkeypatch):
+    calls = _decode(monkeypatch, SPEECH)
+    result = transcriber.transcribe_full(np.ones(16000, dtype=np.float32), model="test")
+    assert [c["temperature"] for c in calls] == [0]
+    assert result["text"] == "Dobra." and [s["text"] for s in result["segments"]] == ["Dobra."]
+
+
+def test_a_looping_chunk_is_retried_at_low_temperatures(monkeypatch):
+    calls = _decode(monkeypatch, LOOP, SPEECH)
+    result = transcriber.transcribe_full(np.ones(16000, dtype=np.float32), model="test")
+    assert [c["temperature"] for c in calls] == [0, transcriber.RETRY_TEMPERATURES]
+    assert max(transcriber.RETRY_TEMPERATURES) <= 0.4  # higher ones invent words
+    assert calls[1]["compression_ratio_threshold"] == 2.4 and calls[1]["logprob_threshold"] is None
+    assert result["text"] == "Dobra."
+
+
+def test_a_looping_retry_keeps_the_greedy_text_collapsed(monkeypatch):
+    calls = _decode(monkeypatch, LOOP, {**LOOP, "segments": [{**LOOP["segments"][0], "text": " laborator" * 60}]})
+    result = transcriber.transcribe_full(np.ones(16000, dtype=np.float32), model="test")
+    assert len(calls) == 2
+    assert result["text"] == "Dziś, że to jest to,"
+
+
+@pytest.mark.parametrize("entrypoint", ["transcribe", "transcribe_file"])
+def test_dictation_and_files_stay_greedy(monkeypatch, entrypoint):
+    calls = _decode(monkeypatch, LOOP)
+    audio = "example.wav" if entrypoint == "transcribe_file" else np.ones(16000, dtype=np.float32)
+    result = getattr(transcriber, entrypoint)(audio, model="test")
+    assert [c["temperature"] for c in calls] == [0]
+    if entrypoint == "transcribe_file":
+        assert result["text"] == "Dziś, że to jest to,"

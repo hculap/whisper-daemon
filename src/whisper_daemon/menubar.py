@@ -1052,7 +1052,9 @@ class MenuBarDelegate(NSObject):
 
         settings = self._settings
         slug = re.sub(r"[^A-Za-z0-9_-]", "", browser_title.replace(" ", "_"))[:30]
-        rec_dir = settings.recording_dir_path / f"recording_{slug}_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
+        name = f"recording_{slug}_{datetime.now():%Y%m%d_%H%M%S}_{uuid.uuid4().hex[:6]}"
+        # Capture locally; only a finished meeting's published files reach recording_dir.
+        rec_dir, final_dir = settings.capture_dir_path / name, settings.recording_dir_path / name
         store = None
         identity = None
         recorders = []
@@ -1212,12 +1214,14 @@ class MenuBarDelegate(NSObject):
             # Orbit readiness goes last: every chunk is acknowledged, audio exports,
             # screenshots, transcript.json, formats, notes and session.json are final.
             try:
-                if finalize_meeting(rec_dir, identity, None, []) is None:
-                    _notify("whisper-daemon", "Not sent for analysis", "Transcript is empty or incomplete; see meeting.failed.json.")
+                if finalize_meeting(rec_dir, identity, None, [], target=final_dir) is None:
+                    _notify("whisper-daemon", "Not sent for analysis", f"Transcript is empty or incomplete; kept locally: {rec_dir}")
+                else:
+                    self._last_meeting_dir = final_dir
             except Exception:
                 logger.exception("Meeting saved, but its readiness manifest failed")
-                _notify("whisper-daemon", "Sync pending", "Could not publish the meeting manifest.")
-            _notify("whisper-daemon", "Meeting saved", str(rec_dir))
+                _notify("whisper-daemon", "Sync pending", f"Could not publish the meeting; kept locally: {rec_dir}")
+            _notify("whisper-daemon", "Meeting saved", str(self._last_meeting_dir))
         except Exception as exc:
             failure = exc
             logger.exception("Meeting failed; source audio and pending jobs remain recoverable")

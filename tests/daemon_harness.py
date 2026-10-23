@@ -140,15 +140,16 @@ class BlockableBridge(BrowserAudioBridge):
             loop.call_soon_threadsafe(lambda: loop.create_task(ws.close(1012, "harness drop")))
 
 
-def _recordings(root: Path) -> list[dict]:
+def _recordings(*roots: Path) -> list[dict]:
+    """Meetings still in the local capture folder and those published to recordings."""
     result = []
-    for directory in sorted(root.glob("recording_*"), key=lambda d: d.stat().st_birthtime):
+    directories = [d for root in roots for d in root.glob("recording_*")]
+    for directory in sorted(directories, key=lambda d: d.stat().st_birthtime):
         meta_path = directory / "session.json"
         meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
-        frames = {source: (directory / f"{source}.f32").stat().st_size // 4
-                  for source in ("mic", "browser") if (directory / f"{source}.f32").exists()}
         result.append({"dir": directory.name, "state": meta.get("state"), "gaps": meta.get("gaps", []),
-                       "duration": meta.get("duration"), "frames": frames})
+                       "duration": meta.get("duration"), "frames": meta.get("sources", {}),
+                       "published": (directory / "meeting.ready.json").exists()})
     return result
 
 
@@ -159,6 +160,7 @@ class Harness:
                  main_latency: float = 0.0, patch=setattr) -> None:
         self.recordings = workdir / "recordings"
         self.recordings.mkdir(parents=True, exist_ok=True)
+        self.capture = workdir / "capture"
         self.pairing = (json.loads(pairing_path.read_text()) if pairing_path.exists()
                         else pair(EXTENSION_ID, pairing_path))
         self.timing = timing
@@ -180,7 +182,7 @@ class Harness:
 
         patch(transcriber, "transcribe_full", fake_transcribe)
         patch(meeting_review, "prepare_review", slow_prepare_review)
-        settings = Settings(recording_dir=str(self.recordings), capture_mic=False, capture_tab=True,
+        settings = Settings(recording_dir=str(self.recordings), capture_dir=str(self.capture), capture_mic=False, capture_tab=True,
                             diarize=False, capture_screenshots=False, server_port=port)
 
         def bridge_factory(daemon: HeadlessDaemon) -> BlockableBridge:
@@ -205,7 +207,7 @@ class Harness:
                 "start_pending": daemon._browser_start_pending,
                 "closed_sessions": sorted(bridge._closed_sessions),
                 "worker_alive": bool(daemon._meeting_thread and daemon._meeting_thread.is_alive()),
-                "recordings": _recordings(self.recordings), "notifications": self.notifications}
+                "recordings": _recordings(self.capture, self.recordings), "notifications": self.notifications}
 
 
 def emit(event: str, **payload) -> None:

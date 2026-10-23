@@ -9,12 +9,25 @@ import mlx_whisper
 import numpy as np
 
 from whisper_daemon.ffmpeg_path import ensure_ffmpeg_on_path
-from whisper_daemon.text_cleanup import collapse_repetitions
+from whisper_daemon.text_cleanup import clean_segments, collapse_repetitions
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-turbo-q4"
 MLX_CACHE_LIMIT_BYTES = 512 * 1024**2
+
+# Greedy decoding alone accepts a degenerate window: meetings got "że to jest
+# to," x43 up to the 224-token limit (compression ratio 16-29). Such a window
+# is decoded again at rising temperatures, which recovered the real speech in
+# most of them. Only repetition triggers it: large-v3-turbo's no_speech_prob is
+# ~0 on every meeting chunk, and a low-confidence window is kept, not resampled.
+DECODE_OPTIONS = {
+    "temperature": (0.0, 0.2, 0.4, 0.6, 0.8, 1.0),
+    "compression_ratio_threshold": 2.4,
+    "logprob_threshold": None,
+    "no_speech_threshold": None,
+    "condition_on_previous_text": False,
+}
 
 # MLX Metal calls are not concurrency-safe: two inferences at once
 # (dictation vs meeting chunk vs file transcription) can SIGABRT or hang
@@ -171,8 +184,7 @@ def transcribe(audio: np.ndarray, model: str = DEFAULT_MODEL, language: str | No
             audio,
             {
                 "path_or_hf_repo": model,
-                "temperature": 0,
-                "condition_on_previous_text": False,
+                **DECODE_OPTIONS,
                 "word_timestamps": False,
                 "language": language,
                 "initial_prompt": initial_prompt,
@@ -215,8 +227,7 @@ def transcribe_full(
 
     kwargs: dict = {
         "path_or_hf_repo": model,
-        "temperature": 0,
-        "condition_on_previous_text": False,
+        **DECODE_OPTIONS,
         "word_timestamps": True,
     }
     if language:
@@ -229,10 +240,7 @@ def transcribe_full(
             kwargs,
             audio_sec=len(audio) / 16000,
         )
-        # Strip leading whitespace from segment texts
-        for seg in result.get("segments", []):
-            seg["text"] = collapse_repetitions(seg["text"].strip())
-        result["text"] = collapse_repetitions(result.get("text", "").strip())
+        result = clean_segments(result)
 
         logger.info(
             "Transcription done — lang=%s, %d chars, %d segments",
@@ -264,8 +272,7 @@ def transcribe_file(
     logger.info("Transcribing file: %s", path)
     kwargs: dict = {
         "path_or_hf_repo": model,
-        "temperature": 0,
-        "condition_on_previous_text": False,
+        **DECODE_OPTIONS,
         "word_timestamps": True,
     }
     if language is not None:
@@ -286,10 +293,7 @@ def transcribe_file(
     audio = mlx_whisper.audio.load_audio(path)
     audio_sec = len(audio) / 16000
 
-    result = _run_mlx_inference(audio, kwargs, audio_sec=audio_sec)
-    for seg in result.get("segments", []):
-        seg["text"] = collapse_repetitions(seg.get("text", "").strip())
-    result["text"] = collapse_repetitions(result.get("text", "").strip())
+    result = clean_segments(_run_mlx_inference(audio, kwargs, audio_sec=audio_sec))
     language_detected = result.get("language", "unknown")
     text_len = len(result.get("text", ""))
     segments_count = len(result.get("segments", []))

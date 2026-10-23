@@ -128,3 +128,28 @@ def test_memory_stats_failure_does_not_skip_cache_cleanup(monkeypatch):
 
     assert transcriber.transcribe(np.ones(16000, dtype=np.float32), model="test") == "kept"
     assert "clear" in events
+
+
+@pytest.mark.parametrize("entrypoint", ["transcribe", "transcribe_full", "transcribe_file"])
+def test_a_repetitive_window_is_decoded_again_and_hallucinations_are_dropped(monkeypatch, entrypoint):
+    calls = []
+
+    def infer(audio, **kwargs):
+        calls.append(kwargs)
+        return {"text": " Dobra. Wszystkie prawa zastrzeżone.", "language": "pl", "segments": [
+            {"text": " Dobra.", "start": 0, "end": 1}, {"text": " Wszystkie prawa zastrzeżone.", "start": 1, "end": 2}]}
+
+    _install_fakes(monkeypatch, infer)
+    monkeypatch.setattr(transcriber, "ensure_ffmpeg_on_path", lambda: "/opt/ffmpeg")
+    monkeypatch.setattr(transcriber.mlx_whisper.audio, "load_audio", lambda path: np.ones(16000, dtype=np.float32))
+    audio = "example.wav" if entrypoint == "transcribe_file" else np.ones(16000, dtype=np.float32)
+
+    result = getattr(transcriber, entrypoint)(audio, model="test")
+
+    # Greedy first, then rising temperatures only when the text is too repetitive.
+    assert calls[0]["temperature"][0] == 0.0 and len(calls[0]["temperature"]) > 1
+    assert calls[0]["compression_ratio_threshold"] == 2.4
+    assert calls[0]["logprob_threshold"] is None and not calls[0]["condition_on_previous_text"]
+    if entrypoint != "transcribe":
+        assert result["text"] == "Dobra."
+        assert [s["text"] for s in result["segments"]] == ["Dobra."]

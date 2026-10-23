@@ -71,6 +71,9 @@ def _toml_str(value: str) -> str:
 @dataclass
 class Settings:
     recording_dir: str = "~/Desktop"
+    # Local, never synced: raw sources and the job spool live here while a
+    # meeting records; only finished files are copied to recording_dir.
+    capture_dir: str = "~/.config/whisper-daemon/capture"
     recording_formats: list[str] = field(default_factory=lambda: ["txt"])
     recording_device: str = ""  # empty = system default
     capture_mic: bool = True  # capture local microphone during meetings
@@ -108,6 +111,10 @@ class Settings:
         return Path(self.recording_dir).expanduser()
 
     @property
+    def capture_dir_path(self) -> Path:
+        return Path(self.capture_dir).expanduser()
+
+    @property
     def transcription_output_dir_path(self) -> Path | None:
         if not self.transcription_output_dir:
             return None
@@ -130,6 +137,7 @@ def load_settings() -> Settings:
 
         return Settings(
             recording_dir=rec.get("dir", "~/Desktop"),
+            capture_dir=rec.get("capture_dir", Settings.capture_dir),
             recording_formats=_validate_formats(rec.get("formats", ["txt"])),
             recording_device=rec.get("device", ""),
             capture_mic=rec.get("capture_mic", True),
@@ -189,6 +197,7 @@ def _save_settings(settings: Settings) -> None:
     lines = [
         "[recording]",
         f"dir = {_toml_str(settings.recording_dir)}",
+        f"capture_dir = {_toml_str(settings.capture_dir)}",
         f"formats = [{rec_formats}]",
         f"device = {_toml_str(settings.recording_device)}",
         f'capture_mic = {"true" if settings.capture_mic else "false"}',

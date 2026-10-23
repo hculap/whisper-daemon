@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import shutil
 import tempfile
 from uuid import uuid4
 from zoneinfo import ZoneInfo
@@ -69,10 +70,13 @@ def begin_meeting(folder: Path, title: str, *, started_at=None, timezone_name=No
     return value
 
 
-def finalize_meeting(folder: Path, identity, result, errors):
+def finalize_meeting(folder: Path, identity, result, errors, *, target: Path | None = None):
     """Publish meeting.ready.json last, or meeting.failed.json if anything is missing.
 
     ``result=None`` means the pipeline already wrote the final transcript.json.
+    With ``target``, ``folder`` is a local capture folder: only the published
+    files are copied to the new ``target`` and ``folder`` (raw sources, job
+    spool) is deleted afterwards. A failed meeting stays in ``folder``.
     """
     if (folder / 'meeting.ready.json').exists():
         raise FileExistsError('Meeting already finalized; never change a published revision')
@@ -91,10 +95,21 @@ def finalize_meeting(folder: Path, identity, result, errors):
     if failures:
         fail_meeting(folder, identity, failures)
         return None
-    manifest = dict(identity, transcription_complete=True, transcription_errors=[], files=_published_files(folder))
-    atomic_json(folder / 'meeting.ready.json', manifest)  # last published file
-    (folder / 'meeting.in-progress.json').unlink(missing_ok=True)
-    (folder / 'meeting.failed.json').unlink(missing_ok=True)
+    if target is None or Path(target).resolve() == folder.resolve():
+        published = folder
+    else:
+        published = Path(target)
+        _copy_published(folder, published)
+    manifest = dict(identity, transcription_complete=True, transcription_errors=[], files=_published_files(published))
+    atomic_json(published / 'meeting.ready.json', manifest)  # last published file
+    if published == folder:
+        (folder / 'meeting.in-progress.json').unlink(missing_ok=True)
+        (folder / 'meeting.failed.json').unlink(missing_ok=True)
+    else:
+        try:
+            shutil.rmtree(folder)
+        except OSError:
+            logging.getLogger(__name__).warning('Published %s, but could not remove the capture folder %s', published, folder)
     return manifest
 
 
@@ -121,8 +136,7 @@ def fail_meeting(folder: Path, identity, errors):
                 dict(identity, transcription_complete=False, transcription_errors=list(errors)))
 
 
-def _published_files(folder: Path):
-    files = []
+def _publishable(folder: Path):
     for path in sorted(folder.rglob('*')):
         if path.is_symlink():
             raise ValueError('Symlinks cannot be published in a recording')
@@ -131,6 +145,28 @@ def _published_files(folder: Path):
             continue
         if path.name in UNPUBLISHED_NAMES or path.name.endswith(UNPUBLISHED_SUFFIXES):
             continue
+        yield path
+
+
+def _copy_published(folder: Path, target: Path):
+    """Copy the published files into a new ``target``; a partial copy is removed."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.mkdir(mode=0o700)  # never merge into an existing meeting
+    try:
+        for path in _publishable(folder):
+            destination = target / path.relative_to(folder)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(path, destination)
+            with destination.open('rb') as stream:
+                os.fsync(stream.fileno())
+    except BaseException:
+        shutil.rmtree(target, ignore_errors=True)
+        raise
+
+
+def _published_files(folder: Path):
+    files = []
+    for path in _publishable(folder):
         digest = hashlib.sha256()
         count = 0
         with path.open('rb') as stream:
